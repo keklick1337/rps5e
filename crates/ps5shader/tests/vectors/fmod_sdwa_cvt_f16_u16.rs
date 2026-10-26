@@ -1,0 +1,7 @@
+// RustPS5Emu (RPS5E)
+// Copyright (C) 2026 Vladislav Tislenko aka keklick1337
+// SPDX-License-Identifier: GPL-2.0-only
+
+// Reference program: v_cvt_f16_u16 with SDWA byte source selects.
+#[allow(dead_code)]
+const SDWA_CODE: [u32; 30] = [0x34020082, 0x34060082, 0xe0302000, 0x80000401, 0x7e1402ff, 0xabcd1234, 0x7e1602ff, 0xabcd1234, 0x7e1802ff, 0xabcd1234, 0x7e1a02ff, 0xabcd1234, 0xbf8c3f70, 0x7e14a0f9, 0x00031404, 0x7e16a0f9, 0x00000604, 0x7e18a0f9, 0x00011504, 0x7e1aa0f9, 0x00020604, 0xe0702000, 0x80010a03, 0xe0702004, 0x80010b03, 0xe0702008, 0x80010c03, 0xe070200c, 0x80010d03, 0xbf810000];

@@ -1,0 +1,352 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 696" width="1000" height="696" role="img" aria-label="rps5e implementation progress">
+<style>
+.bg{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mute{fill:#898781}
+.track{fill:#e1e0d9}.s1{fill:#2a78d6}.s2{fill:#eb6834}.s2l{fill:#f5b398}.rule{stroke:#e1e0d9}
+@media (prefers-color-scheme: dark){
+.bg{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.track{fill:#2c2c2a}
+.s1{fill:#3987e5}.s2{fill:#d95926}.s2l{fill:#7a3a20}.rule{stroke:#2c2c2a}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+.num{font-variant-numeric:tabular-nums}
+</style>
+<rect class="bg" x="0" y="0" width="1000" height="696" rx="8"/>
+<g><title>Firmware 3.20 functions: 3264 / 31275</title>
+<text class="ink2 num" x="16.0" y="34" font-size="13" text-anchor="start">Firmware 3.20 functions</text>
+<text class="ink num" x="16.0" y="70" font-size="30" text-anchor="start" font-weight="600">10.4%</text>
+<text class="mute num" x="16.0" y="92" font-size="11.5" text-anchor="start">3,264 / 31,275 with an HLE implementation</text>
+<rect class="track" x="16.0" y="104" width="230.0" height="6" rx="3"/>
+<rect class="s1" x="16.0" y="104" width="24.0" height="6" rx="3"/>
+</g>
+<g><title>Functions our games import: 1472 HLE + 293 game's own modules of 1765</title>
+<text class="ink2 num" x="262.0" y="34" font-size="13" text-anchor="start">Functions our games import</text>
+<text class="ink num" x="262.0" y="70" font-size="30" text-anchor="start" font-weight="600">100.0%</text>
+<text class="mute num" x="262.0" y="92" font-size="11.5" text-anchor="start">1,472 HLE + 293 own modules, 0 stubs</text>
+<rect class="track" x="262.0" y="104" width="230.0" height="6" rx="3"/>
+<rect class="s2" x="262.0" y="104" width="191.8" height="6" rx="3"/>
+<rect class="s2l" x="455.8" y="104" width="36.2" height="6" rx="3"/>
+</g>
+<g><title>System libraries: 117 / 275</title>
+<text class="ink2 num" x="508.0" y="34" font-size="13" text-anchor="start">System libraries</text>
+<text class="ink num" x="508.0" y="70" font-size="30" text-anchor="start" font-weight="600">117 / 275</text>
+<text class="mute num" x="508.0" y="92" font-size="11.5" text-anchor="start">with at least one function</text>
+<rect class="track" x="508.0" y="104" width="230.0" height="6" rx="3"/>
+<rect class="s1" x="508.0" y="104" width="97.9" height="6" rx="3"/>
+</g>
+<g><title>RDNA instructions: 1166 / 1166</title>
+<text class="ink2 num" x="754.0" y="34" font-size="13" text-anchor="start">RDNA instructions</text>
+<text class="ink num" x="754.0" y="70" font-size="30" text-anchor="start" font-weight="600">100.0%</text>
+<text class="mute num" x="754.0" y="92" font-size="11.5" text-anchor="start">1,166 / 1,166 decoded (RDNA 1 + 2 list)</text>
+<rect class="track" x="754.0" y="104" width="230.0" height="6" rx="3"/>
+<rect class="s1" x="754.0" y="104" width="230.0" height="6" rx="3"/>
+</g>
+<line class="rule" x1="16" x2="984" y1="128" y2="128" stroke-width="1"/>
+<text class="ink num" x="16" y="154" font-size="13" text-anchor="start" font-weight="600">Libraries our games import (most imported first)</text>
+<rect class="s1" x="16" y="160" width="10" height="10" rx="2"/>
+<text class="ink2 num" x="30" y="169" font-size="11" text-anchor="start">of the library&#x27;s firmware functions</text>
+<rect class="s2" x="220" y="160" width="10" height="10" rx="2"/>
+<text class="ink2 num" x="234" y="169" font-size="11" text-anchor="start">of the imports: HLE</text>
+<rect class="s2l" x="342" y="160" width="10" height="10" rx="2"/>
+<text class="ink2 num" x="356" y="169" font-size="11" text-anchor="start">game&#x27;s own module</text>
+<g><title>libSceLibcInternal: 273/2271 functions implemented; games import 346, 53 in HLE, 293 from the game's own modules</title>
+<text class="ink num" x="16" y="201" font-size="12" text-anchor="start">libSceLibcInternal</text>
+<rect class="track" x="184" y="190" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="190" width="30.1" height="6" rx="3"/>
+<rect class="track" x="184" y="198" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="198" width="38.3" height="6" rx="3"/>
+<rect class="s2l" x="224.3" y="198" width="209.7" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="196" font-size="10.5" text-anchor="start">12% of 2271</text>
+<text class="ink2 num" x="442" y="206" font-size="10.5" text-anchor="start">15% + 85% of 346 imported</text>
+</g>
+<g><title>libkernel: 663/1116 functions implemented; games import 302, 302 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="225" font-size="12" text-anchor="start">libkernel</text>
+<rect class="track" x="184" y="214" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="214" width="148.5" height="6" rx="3"/>
+<rect class="track" x="184" y="222" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="222" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="220" font-size="10.5" text-anchor="start">59% of 1116</text>
+<text class="ink2 num" x="442" y="230" font-size="10.5" text-anchor="start">100% of 302 imported</text>
+</g>
+<g><title>libSceAgc: 190/196 functions implemented; games import 174, 174 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="249" font-size="12" text-anchor="start">libSceAgc</text>
+<rect class="track" x="184" y="238" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="238" width="242.3" height="6" rx="3"/>
+<rect class="track" x="184" y="246" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="246" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="244" font-size="10.5" text-anchor="start">97% of 196</text>
+<text class="ink2 num" x="442" y="254" font-size="10.5" text-anchor="start">100% of 174 imported</text>
+</g>
+<g><title>libSceFont: 125/136 functions implemented; games import 52, 52 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="273" font-size="12" text-anchor="start">libSceFont</text>
+<rect class="track" x="184" y="262" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="262" width="229.8" height="6" rx="3"/>
+<rect class="track" x="184" y="270" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="270" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="268" font-size="10.5" text-anchor="start">92% of 136</text>
+<text class="ink2 num" x="442" y="278" font-size="10.5" text-anchor="start">100% of 52 imported</text>
+</g>
+<g><title>libSceJson2: 132/215 functions implemented; games import 51, 51 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="297" font-size="12" text-anchor="start">libSceJson2</text>
+<rect class="track" x="184" y="286" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="286" width="153.5" height="6" rx="3"/>
+<rect class="track" x="184" y="294" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="294" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="292" font-size="10.5" text-anchor="start">61% of 215</text>
+<text class="ink2 num" x="442" y="302" font-size="10.5" text-anchor="start">100% of 51 imported</text>
+</g>
+<g><title>libSceAmpr: 91/91 functions implemented; games import 46, 46 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="321" font-size="12" text-anchor="start">libSceAmpr</text>
+<rect class="track" x="184" y="310" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="310" width="250.0" height="6" rx="3"/>
+<rect class="track" x="184" y="318" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="318" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="316" font-size="10.5" text-anchor="start">100% of 91</text>
+<text class="ink2 num" x="442" y="326" font-size="10.5" text-anchor="start">100% of 46 imported</text>
+</g>
+<g><title>libSceNet: 67/211 functions implemented; games import 37, 37 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="345" font-size="12" text-anchor="start">libSceNet</text>
+<rect class="track" x="184" y="334" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="334" width="79.4" height="6" rx="3"/>
+<rect class="track" x="184" y="342" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="342" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="340" font-size="10.5" text-anchor="start">32% of 211</text>
+<text class="ink2 num" x="442" y="350" font-size="10.5" text-anchor="start">100% of 37 imported</text>
+</g>
+<g><title>libSceNpUniversalDataSystem: 41/84 functions implemented; games import 37, 37 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="369" font-size="12" text-anchor="start">libSceNpUniversalDataSyst…</text>
+<rect class="track" x="184" y="358" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="358" width="122.0" height="6" rx="3"/>
+<rect class="track" x="184" y="366" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="366" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="364" font-size="10.5" text-anchor="start">49% of 84</text>
+<text class="ink2 num" x="442" y="374" font-size="10.5" text-anchor="start">100% of 37 imported</text>
+</g>
+<g><title>libSceAgcDriver: 49/95 functions implemented; games import 36, 36 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="393" font-size="12" text-anchor="start">libSceAgcDriver</text>
+<rect class="track" x="184" y="382" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="382" width="128.9" height="6" rx="3"/>
+<rect class="track" x="184" y="390" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="390" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="388" font-size="10.5" text-anchor="start">52% of 95</text>
+<text class="ink2 num" x="442" y="398" font-size="10.5" text-anchor="start">100% of 36 imported</text>
+</g>
+<g><title>libSceJson: 40/88 functions implemented; games import 32, 32 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="417" font-size="12" text-anchor="start">libSceJson</text>
+<rect class="track" x="184" y="406" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="406" width="113.6" height="6" rx="3"/>
+<rect class="track" x="184" y="414" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="414" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="412" font-size="10.5" text-anchor="start">45% of 88</text>
+<text class="ink2 num" x="442" y="422" font-size="10.5" text-anchor="start">100% of 32 imported</text>
+</g>
+<g><title>libSceHttp: 78/115 functions implemented; games import 31, 31 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="441" font-size="12" text-anchor="start">libSceHttp</text>
+<rect class="track" x="184" y="430" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="430" width="169.6" height="6" rx="3"/>
+<rect class="track" x="184" y="438" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="438" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="436" font-size="10.5" text-anchor="start">68% of 115</text>
+<text class="ink2 num" x="442" y="446" font-size="10.5" text-anchor="start">100% of 31 imported</text>
+</g>
+<g><title>libSceAudioOut: 59/123 functions implemented; games import 30, 30 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="465" font-size="12" text-anchor="start">libSceAudioOut</text>
+<rect class="track" x="184" y="454" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="454" width="119.9" height="6" rx="3"/>
+<rect class="track" x="184" y="462" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="462" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="460" font-size="10.5" text-anchor="start">48% of 123</text>
+<text class="ink2 num" x="442" y="470" font-size="10.5" text-anchor="start">100% of 30 imported</text>
+</g>
+<g><title>libSceHttp2: 37/56 functions implemented; games import 28, 28 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="489" font-size="12" text-anchor="start">libSceHttp2</text>
+<rect class="track" x="184" y="478" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="478" width="165.2" height="6" rx="3"/>
+<rect class="track" x="184" y="486" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="486" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="484" font-size="10.5" text-anchor="start">66% of 56</text>
+<text class="ink2 num" x="442" y="494" font-size="10.5" text-anchor="start">100% of 28 imported</text>
+</g>
+<g><title>libSceAvPlayer: 27/27 functions implemented; games import 24, 24 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="513" font-size="12" text-anchor="start">libSceAvPlayer</text>
+<rect class="track" x="184" y="502" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="502" width="250.0" height="6" rx="3"/>
+<rect class="track" x="184" y="510" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="510" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="508" font-size="10.5" text-anchor="start">100% of 27</text>
+<text class="ink2 num" x="442" y="518" font-size="10.5" text-anchor="start">100% of 24 imported</text>
+</g>
+<g><title>libSceNpManager: 44/391 functions implemented; games import 24, 24 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="537" font-size="12" text-anchor="start">libSceNpManager</text>
+<rect class="track" x="184" y="526" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="526" width="28.1" height="6" rx="3"/>
+<rect class="track" x="184" y="534" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="534" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="532" font-size="10.5" text-anchor="start">11% of 391</text>
+<text class="ink2 num" x="442" y="542" font-size="10.5" text-anchor="start">100% of 24 imported</text>
+</g>
+<g><title>libSceNpWebApi2: 32/39 functions implemented; games import 24, 24 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="561" font-size="12" text-anchor="start">libSceNpWebApi2</text>
+<rect class="track" x="184" y="550" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="550" width="205.1" height="6" rx="3"/>
+<rect class="track" x="184" y="558" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="558" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="556" font-size="10.5" text-anchor="start">82% of 39</text>
+<text class="ink2 num" x="442" y="566" font-size="10.5" text-anchor="start">100% of 24 imported</text>
+</g>
+<g><title>libSceVideoOut: 41/164 functions implemented; games import 23, 23 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="585" font-size="12" text-anchor="start">libSceVideoOut</text>
+<rect class="track" x="184" y="574" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="574" width="62.5" height="6" rx="3"/>
+<rect class="track" x="184" y="582" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="582" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="580" font-size="10.5" text-anchor="start">25% of 164</text>
+<text class="ink2 num" x="442" y="590" font-size="10.5" text-anchor="start">100% of 23 imported</text>
+</g>
+<g><title>libSceAudioPropagation: 28/28 functions implemented; games import 21, 21 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="609" font-size="12" text-anchor="start">libSceAudioPropagation</text>
+<rect class="track" x="184" y="598" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="598" width="250.0" height="6" rx="3"/>
+<rect class="track" x="184" y="606" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="606" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="604" font-size="10.5" text-anchor="start">100% of 28</text>
+<text class="ink2 num" x="442" y="614" font-size="10.5" text-anchor="start">100% of 21 imported</text>
+</g>
+<g><title>libScePad: 26/100 functions implemented; games import 19, 19 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="633" font-size="12" text-anchor="start">libScePad</text>
+<rect class="track" x="184" y="622" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="622" width="65.0" height="6" rx="3"/>
+<rect class="track" x="184" y="630" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="630" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="628" font-size="10.5" text-anchor="start">26% of 100</text>
+<text class="ink2 num" x="442" y="638" font-size="10.5" text-anchor="start">100% of 19 imported</text>
+</g>
+<g><title>libSceSystemService: 53/504 functions implemented; games import 18, 18 in HLE, 0 from the game's own modules</title>
+<text class="ink num" x="16" y="657" font-size="12" text-anchor="start">libSceSystemService</text>
+<rect class="track" x="184" y="646" width="250" height="6" rx="3"/>
+<rect class="s1" x="184" y="646" width="26.3" height="6" rx="3"/>
+<rect class="track" x="184" y="654" width="250" height="6" rx="3"/>
+<rect class="s2" x="184" y="654" width="250.0" height="6" rx="3"/>
+<text class="ink2 num" x="442" y="652" font-size="10.5" text-anchor="start">11% of 504</text>
+<text class="ink2 num" x="442" y="662" font-size="10.5" text-anchor="start">100% of 18 imported</text>
+</g>
+<text class="ink num" x="610" y="154" font-size="13" text-anchor="start" font-weight="600">RDNA instructions decoded, per encoding</text>
+<g><title>DS: 123/123</title>
+<text class="ink num" x="610" y="201" font-size="12" text-anchor="start">DS</text>
+<rect class="track" x="674" y="193" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="193" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="201" font-size="10.5" text-anchor="start">123/123</text>
+</g>
+<g><title>EXP: 1/1</title>
+<text class="ink num" x="610" y="225" font-size="12" text-anchor="start">EXP</text>
+<rect class="track" x="674" y="217" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="217" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="225" font-size="10.5" text-anchor="start">1/1</text>
+</g>
+<g><title>FLAT: 54/54</title>
+<text class="ink num" x="610" y="249" font-size="12" text-anchor="start">FLAT</text>
+<rect class="track" x="674" y="241" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="241" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="249" font-size="10.5" text-anchor="start">54/54</text>
+</g>
+<g><title>GLOBAL: 57/57</title>
+<text class="ink num" x="610" y="273" font-size="12" text-anchor="start">GLOBAL</text>
+<rect class="track" x="674" y="265" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="265" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="273" font-size="10.5" text-anchor="start">57/57</text>
+</g>
+<g><title>MIMG: 130/130</title>
+<text class="ink num" x="610" y="297" font-size="12" text-anchor="start">MIMG</text>
+<rect class="track" x="674" y="289" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="289" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="297" font-size="10.5" text-anchor="start">130/130</text>
+</g>
+<g><title>MTBUF: 16/16</title>
+<text class="ink num" x="610" y="321" font-size="12" text-anchor="start">MTBUF</text>
+<rect class="track" x="674" y="313" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="313" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="321" font-size="10.5" text-anchor="start">16/16</text>
+</g>
+<g><title>MUBUF: 75/75</title>
+<text class="ink num" x="610" y="345" font-size="12" text-anchor="start">MUBUF</text>
+<rect class="track" x="674" y="337" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="337" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="345" font-size="10.5" text-anchor="start">75/75</text>
+</g>
+<g><title>SCRATCH: 22/22</title>
+<text class="ink num" x="610" y="369" font-size="12" text-anchor="start">SCRATCH</text>
+<rect class="track" x="674" y="361" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="361" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="369" font-size="10.5" text-anchor="start">22/22</text>
+</g>
+<g><title>SMEM: 20/20</title>
+<text class="ink num" x="610" y="393" font-size="12" text-anchor="start">SMEM</text>
+<rect class="track" x="674" y="385" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="385" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="393" font-size="10.5" text-anchor="start">20/20</text>
+</g>
+<g><title>SOP1: 65/65</title>
+<text class="ink num" x="610" y="417" font-size="12" text-anchor="start">SOP1</text>
+<rect class="track" x="674" y="409" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="409" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="417" font-size="10.5" text-anchor="start">65/65</text>
+</g>
+<g><title>SOP2: 51/51</title>
+<text class="ink num" x="610" y="441" font-size="12" text-anchor="start">SOP2</text>
+<rect class="track" x="674" y="433" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="433" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="441" font-size="10.5" text-anchor="start">51/51</text>
+</g>
+<g><title>SOPC: 18/18</title>
+<text class="ink num" x="610" y="465" font-size="12" text-anchor="start">SOPC</text>
+<rect class="track" x="674" y="457" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="457" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="465" font-size="10.5" text-anchor="start">18/18</text>
+</g>
+<g><title>SOPK: 27/27</title>
+<text class="ink num" x="610" y="489" font-size="12" text-anchor="start">SOPK</text>
+<rect class="track" x="674" y="481" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="481" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="489" font-size="10.5" text-anchor="start">27/27</text>
+</g>
+<g><title>SOPP: 37/37</title>
+<text class="ink num" x="610" y="513" font-size="12" text-anchor="start">SOPP</text>
+<rect class="track" x="674" y="505" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="505" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="513" font-size="10.5" text-anchor="start">37/37</text>
+</g>
+<g><title>VINTRP: 3/3</title>
+<text class="ink num" x="610" y="537" font-size="12" text-anchor="start">VINTRP</text>
+<rect class="track" x="674" y="529" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="529" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="537" font-size="10.5" text-anchor="start">3/3</text>
+</g>
+<g><title>VOP1: 81/81</title>
+<text class="ink num" x="610" y="561" font-size="12" text-anchor="start">VOP1</text>
+<rect class="track" x="674" y="553" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="553" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="561" font-size="10.5" text-anchor="start">81/81</text>
+</g>
+<g><title>VOP2: 51/51</title>
+<text class="ink num" x="610" y="585" font-size="12" text-anchor="start">VOP2</text>
+<rect class="track" x="674" y="577" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="577" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="585" font-size="10.5" text-anchor="start">51/51</text>
+</g>
+<g><title>VOP3: 116/116</title>
+<text class="ink num" x="610" y="609" font-size="12" text-anchor="start">VOP3</text>
+<rect class="track" x="674" y="601" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="601" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="609" font-size="10.5" text-anchor="start">116/116</text>
+</g>
+<g><title>VOP3P: 29/29</title>
+<text class="ink num" x="610" y="633" font-size="12" text-anchor="start">VOP3P</text>
+<rect class="track" x="674" y="625" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="625" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="633" font-size="10.5" text-anchor="start">29/29</text>
+</g>
+<g><title>VOPC: 190/190</title>
+<text class="ink num" x="610" y="657" font-size="12" text-anchor="start">VOPC</text>
+<rect class="track" x="674" y="649" width="250" height="8" rx="4"/>
+<rect class="s1" x="674" y="649" width="250.0" height="8" rx="4"/>
+<text class="ink2 num" x="932" y="657" font-size="10.5" text-anchor="start">190/190</text>
+</g>
+<text class="mute num" x="16" y="682" font-size="10.5" text-anchor="start">Generated by progress/progress.py (make stats). Function list: firmware 3.20 stub libraries (named exports only). Implemented = real HLE callback, not a 0x80020002 stub.</text>
+</svg>

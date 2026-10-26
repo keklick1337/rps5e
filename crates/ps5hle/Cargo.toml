@@ -1,0 +1,41 @@
+[package]
+name = "ps5hle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ps5vm.workspace = true
+ps5cpu.workspace = true
+ps5nid.workspace = true
+ps5gpu.workspace = true
+ps5pkg.workspace = true
+libc.workspace = true
+log.workspace = true
+thiserror.workspace = true
+cpal = "0.15"
+libloading = "0.8"
+symphonia-core = "0.5"
+symphonia-bundle-mp3 = "0.5"
+miniz_oxide = "0.9"
+zune-core = "0.5"
+zune-jpeg = "0.5"
+ttf-parser = "0.25"
+ab_glyph_rasterizer = "0.1"
+openssl = "0.10"
+openssl-sys = "0.9"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[dev-dependencies]
+sha1 = "0.10"
+base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+openssl = { version = "0.10", features = ["vendored"] }
+encoding_rs = "0.8"

@@ -1,0 +1,11 @@
+name: Feature request
+description: Suggest an improvement to the emulator or the launcher.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you would like
+      description: The problem it solves and how you imagine it working.
+    validations:
+      required: true

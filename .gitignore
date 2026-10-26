@@ -1,0 +1,19 @@
+# Everything that belongs to one machine: game paths, notes, scratch files,
+# logs, captures, local scripts (see AGENTS.md).
+/local/
+
+# Build output
+/target
+/dist
+**/*.rs.bk
+
+# Editors and OS files
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+__pycache__/

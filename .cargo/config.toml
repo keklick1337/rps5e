@@ -1,0 +1,10 @@
+# Windows builds target the PS5's CPU generation (AVX2, FMA, BMI2): guest
+# code needs it anyway, and it keeps rounding and fused multiply-add in
+# native instructions instead of the C runtime's math library, whose
+# versions differ from glibc's (e.g. roundf, fma). Linux builds keep the
+# default target.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -1,0 +1,15 @@
+[package]
+name = "ps5pkg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PS4/PS5 package containers (fake PKG, PFS, PFSC): metadata, listing, reading and extraction"
+
+[dependencies]
+flate2.workspace = true
+serde_json = "1"
+aes = "0.8"
+sha2 = "0.10"
+hmac = "0.12"

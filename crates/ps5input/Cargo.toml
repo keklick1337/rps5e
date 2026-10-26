@@ -1,0 +1,18 @@
+[package]
+name = "ps5input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ps5hle.workspace = true
+ps5gpu.workspace = true
+ps5vm.workspace = true
+log.workspace = true
+libloading = "0.8"
+toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

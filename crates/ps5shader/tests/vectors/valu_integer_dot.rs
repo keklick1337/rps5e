@@ -1,0 +1,36 @@
+// RustPS5Emu (RPS5E)
+// Copyright (C) 2026 Vladislav Tislenko aka keklick1337
+// SPDX-License-Identifier: GPL-2.0-only
+
+// IntegerDot: hardware-measured reference rows (raw RDNA code and tables).
+#[allow(dead_code)]
+mod tables {
+    pub const THREADS: u32 = 64;
+    pub const INPUTS: u32 = 4;
+    pub const RESULTS: u32 = 16;
+    pub const LITERAL: u32 = 0x80ff7f01;
+    pub const EDGES: [[u32; 3]; 12] = [
+        [0x80008000, 0x80008000, 0],
+        [0x80008000, 0x80008000, 0x80000000],
+        [0xffffffff, 0xffffffff, 1],
+        [0xffffffff, 0xffffffff, 0xffffffff],
+        [0x80808080, 0x80808080, 0x7fffffff],
+        [0x7f7f7f7f, 0x80808080, 0x80000000],
+        [0x88888888, 0x88888888, 0x7ffffe00],
+        [0x77777777, 0x88888888, 0x12345678],
+        [0x7fff8000, 0x80007fff, 0xffff0000],
+        [0, 0xffffffff, 0xdeadbeef],
+        [0x01020304, 0xfffefdfc, 0],
+        [0x0001ffff, 0xffff0001, 0x00010000],
+    ];
+    pub const DOT_CODE: [u32; 51] = [
+        0x34020082, 0x34060084, 0xe0302000, 0x80000401, 0xe0302004, 0x80000501, 0xe0302008, 0x80000601,
+        0xbf8c3f70, 0xcc14400a, 0x1c1a0b04, 0xcc15400b, 0x1c1a0b04, 0xcc16400c, 0x1c1a0b04, 0xcc17400d,
+        0x1c1a0b04, 0xcc18400e, 0x1c1a0b04, 0xcc19400f, 0x1c1a0b04, 0x7e200306, 0x1a200b04, 0xcc144811,
+        0x141a0b04, 0xcc174012, 0x1c19ff04, LITERAL, 0xcc184013, 0x1c1a0ac1, 0xe0702000, 0x80010a03,
+        0xe0702004, 0x80010b03, 0xe0702008, 0x80010c03, 0xe070200c, 0x80010d03, 0xe0702010, 0x80010e03,
+        0xe0702014, 0x80010f03, 0xe0702018, 0x80011003, 0xe070201c, 0x80011103, 0xe0702020, 0x80011203,
+        0xe0702024, 0x80011303, 0xbf810000,
+    ];
+}
+use tables::*;

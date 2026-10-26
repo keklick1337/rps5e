@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=RustPS5Emu
+GenericName=PlayStation 5 Emulator
+Comment=Run PlayStation 5 games (RPS5E launcher)
+Exec=rps5e
+Icon=rps5e
+Terminal=false
+Categories=Game;Emulator;
+Keywords=PS5;PlayStation;emulator;
+StartupWMClass=rps5e

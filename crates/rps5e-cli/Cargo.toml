@@ -1,0 +1,39 @@
+[package]
+name = "rps5e-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "rps5e_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rps5e-cli"
+path = "src/main.rs"
+
+# The same program; started without arguments it opens the launcher.
+[[bin]]
+name = "rps5e"
+path = "src/bin/rps5e.rs"
+
+[dependencies]
+ps5elf.workspace = true
+ps5core.workspace = true
+ps5cpu.workspace = true
+ps5vm.workspace = true
+ps5hle.workspace = true
+ps5input.workspace = true
+ps5gpu.workspace = true
+ps5pkg.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+log.workspace = true
+libc.workspace = true
+rps5e-gui = { path = "../rps5e-gui" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

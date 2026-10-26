@@ -1,0 +1,58 @@
+name: Game issue
+description: A game crashes, hangs, renders wrong or runs slowly. The launcher's "Report issue" button fills most of this in.
+labels: ["game"]
+body:
+  - type: markdown
+    attributes:
+      value: One issue per game and problem, please. Only games you dumped yourself; do not post links to game files.
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Title, title ID (PPSAxxxxx / CUSAxxxxx) and game version.
+      placeholder: "SILENT HILL: The Short Message, PPSA10112, 01.000.001"
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What goes wrong
+      options:
+        - Does not start
+        - Crashes
+        - Hangs / freezes
+        - Graphical glitches
+        - Audio problems
+        - Input / controller problems
+        - Slow / stutter
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what you saw. Screenshots or a short video help a lot.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Emulator version
+      description: Shown in the launcher (About) or by `rps5e-cli --version`; a commit hash for your own build.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: OS, CPU, GPU and driver version.
+      placeholder: "Arch Linux, Ryzen 7 7800X3D, RX 7900 XTX (Mesa 25.2)"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The last part of the run log (launcher log panel, or ~/.local/share/rps5e/logs/ / %LOCALAPPDATA%\rps5e\logs\). Attach the full file if it is long.
+      render: text

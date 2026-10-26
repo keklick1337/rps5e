@@ -1,0 +1,21 @@
+[package]
+name = "ps5cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ps5vm.workspace = true
+iced-x86.workspace = true
+log.workspace = true
+libc.workspace = true
+
+# The red-zone rewrite (used on Windows) is unit-tested on every host.
+[dev-dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info", "intel"] }

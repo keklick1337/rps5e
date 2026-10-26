@@ -1,0 +1,31 @@
+[package]
+name = "ps5gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ps5vm.workspace = true
+ps5shader.workspace = true
+libc.workspace = true
+log.workspace = true
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+winit = "0.30"
+rspirv = "0.13"
+ab_glyph = "0.2"
+epaint_default_fonts = "0.31"
+egui = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["wayland", "x11"] }
+rustc-hash = "2"
+smallvec = { version = "1", features = ["const_generics"] }
+png = "0.17"
+
+[dev-dependencies]
+env_logger.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

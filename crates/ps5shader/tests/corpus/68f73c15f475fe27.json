@@ -1,0 +1,20 @@
+{
+  "hash": "68f73c15f475fe27",
+  "type": 1,
+  "stage": "ps",
+  "header_address": 8735212800,
+  "code_address": 8735210496,
+  "header_size": 368,
+  "code_size": 2176,
+  "embedded_cb_size_dqw": 0,
+  "target": 11,
+  "scratch_dw_per_thread": 0,
+  "special_sizes_bytes": 48,
+  "header_raw": "313233341800000020c6a8080200000000bca80802000000d8c5a80802000000a8c5a8080200000060c5a8080200000090c5a8080200000000000000000000007001000080080000000000000b00000006000000000000003000010906000000",
+  "cx_registers": [[452, 0], [453, 4], [435, 2818], [436, 2818], [438, 6], [440, 16777216], [515, 16], [143, 15], [784, 0]],
+  "sh_registers": [[8, 34121916], [9, 0], [6, 553650256], [6, 936208467], [10, 36438212], [11, 4]],
+  "specials": {"ge_cntl": [0, 0], "vgt_shader_stages_en": [0, 0], "dispatch_modifier": 0, "user_data_range": [0, 2], "draw_modifier": 0, "vgt_gs_out_prim_type": [0, 0], "ge_user_vgpr_en": [0, 0]},
+  "user_data": {"raw": "58c6a8080200000070c6a8080200000070c6a8080200000070c6a8080200000070c6a80802000000000002000b000000000000000000", "eud_size_dw": 0, "srt_size_dw": 2, "direct_resource_count": 11, "direct_resource_offsets": [65535, 0, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535], "sharp_resource_counts": [0, 0, 0, 0], "sharp_resource_offsets": [[], [], [], []]},
+  "input_semantics": [15, 16, 17, 4194322, 4194323, 4194325],
+  "output_semantics": []
+}

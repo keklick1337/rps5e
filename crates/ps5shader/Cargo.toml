@@ -1,0 +1,15 @@
+[package]
+name = "ps5shader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PS5 (gfx10) shader front-end: decoder, program model and analyses"
+
+[dependencies]
+smallvec = "1"
+
+[[bin]]
+name = "ps5shader-dis"
+path = "src/bin/ps5shader-dis.rs"

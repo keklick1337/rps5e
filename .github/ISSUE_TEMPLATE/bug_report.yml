@@ -1,0 +1,29 @@
+name: Emulator bug
+description: A problem with the launcher, settings, build or the emulator itself (not specific to one game).
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Steps to reproduce, what you expected and what you saw.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Emulator version
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: OS, CPU, GPU and driver version.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or build output
+      render: text

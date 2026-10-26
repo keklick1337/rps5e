@@ -1,0 +1,2558 @@
+{
+ "games": [
+  {
+   "game": "ASTRO BOT (PPSA21567)",
+   "hle": 856,
+   "lle": 957,
+   "stub": 1,
+   "total": 1814
+  },
+  {
+   "game": "Demon's Souls (PPSA01342)",
+   "hle": 940,
+   "lle": 316,
+   "stub": 9,
+   "total": 1265
+  },
+  {
+   "game": "Grand Theft Auto V (PPSA04263)",
+   "hle": 901,
+   "lle": 601,
+   "stub": 10,
+   "total": 1512
+  },
+  {
+   "game": "Marvel's Spider-Man 2 (PPSA08338)",
+   "hle": 706,
+   "lle": 412,
+   "stub": 0,
+   "total": 1118
+  },
+  {
+   "game": "SILENT HILL: The Short Message (PPSA10112)",
+   "hle": 1007,
+   "lle": 1109,
+   "stub": 1,
+   "total": 2117
+  },
+  {
+   "game": "Terminator 2D: NO FATE (PPSA25872)",
+   "hle": 581,
+   "lle": 139,
+   "stub": 6,
+   "total": 726
+  }
+ ],
+ "opcodes": [
+  {
+   "encoding": "DS",
+   "implemented": 123,
+   "total": 123
+  },
+  {
+   "encoding": "EXP",
+   "implemented": 1,
+   "total": 1
+  },
+  {
+   "encoding": "FLAT",
+   "implemented": 54,
+   "total": 54
+  },
+  {
+   "encoding": "GLOBAL",
+   "implemented": 57,
+   "total": 57
+  },
+  {
+   "encoding": "MIMG",
+   "implemented": 130,
+   "total": 130
+  },
+  {
+   "encoding": "MTBUF",
+   "implemented": 16,
+   "total": 16
+  },
+  {
+   "encoding": "MUBUF",
+   "implemented": 75,
+   "total": 75
+  },
+  {
+   "encoding": "SCRATCH",
+   "implemented": 22,
+   "total": 22
+  },
+  {
+   "encoding": "SMEM",
+   "implemented": 20,
+   "total": 20
+  },
+  {
+   "encoding": "SOP1",
+   "implemented": 65,
+   "total": 65
+  },
+  {
+   "encoding": "SOP2",
+   "implemented": 51,
+   "total": 51
+  },
+  {
+   "encoding": "SOPC",
+   "implemented": 18,
+   "total": 18
+  },
+  {
+   "encoding": "SOPK",
+   "implemented": 27,
+   "total": 27
+  },
+  {
+   "encoding": "SOPP",
+   "implemented": 37,
+   "total": 37
+  },
+  {
+   "encoding": "VINTRP",
+   "implemented": 3,
+   "total": 3
+  },
+  {
+   "encoding": "VOP1",
+   "implemented": 81,
+   "total": 81
+  },
+  {
+   "encoding": "VOP2",
+   "implemented": 51,
+   "total": 51
+  },
+  {
+   "encoding": "VOP3",
+   "implemented": 116,
+   "total": 116
+  },
+  {
+   "encoding": "VOP3P",
+   "implemented": 29,
+   "total": 29
+  },
+  {
+   "encoding": "VOPC",
+   "implemented": 190,
+   "total": 190
+  }
+ ],
+ "opcodes_missing": {},
+ "firmware": {
+  "dir": "PS5-3.20_Libs",
+  "total": {
+   "implemented": 3264,
+   "total": 31275,
+   "modules": 275,
+   "entries": 39158,
+   "modules_touched": 117,
+   "modules_complete": 33,
+   "implemented_outside": {
+    "DbgAddressSanitizer": 7,
+    "libKernel": 20,
+    "libSceAcm": 6,
+    "libSceAgc": 38,
+    "libSceAgcDriver": 29,
+    "libSceAmpr": 25,
+    "libSceAudioOut2": 1,
+    "libSceAudioPropagation": 11,
+    "libSceAvPlayer": 1,
+    "libSceCesCs": 14,
+    "libSceCoredump": 2,
+    "libSceDiscMap": 2,
+    "libSceHmd2": 210,
+    "libSceHttp2": 1,
+    "libSceJobManager": 8,
+    "libSceLibcInternal": 4,
+    "libSceLoginDialog": 1,
+    "libSceNpAuth": 1,
+    "libSceNpCommerce": 1,
+    "libSceNpCppWebApi": 1,
+    "libSceNpEntitlementAccess": 1,
+    "libScePad": 5,
+    "libScePsml": 30,
+    "libSceSaveData": 2,
+    "libSceSharePlay": 1,
+    "libSceShareUtility": 4,
+    "libSceSystemService": 2,
+    "libSceTextToSpeech2": 4,
+    "libSceUserService": 2,
+    "libSceVideoOut": 14,
+    "libSceVideoOutVrrStatus": 1,
+    "libSceVoiceQoS": 2,
+    "libSceVrSetupDialog": 7,
+    "libSceVrTracker2": 104,
+    "libc": 2,
+    "libfmod": 1,
+    "libkernel_write_throttling": 1
+   }
+  },
+  "libraries": [
+   {
+    "library": "libkernel_sys",
+    "implemented": 682,
+    "stub": 567,
+    "total": 1249
+   },
+   {
+    "library": "libkernel",
+    "implemented": 663,
+    "stub": 453,
+    "total": 1116
+   },
+   {
+    "library": "libkernel_web",
+    "implemented": 649,
+    "stub": 441,
+    "total": 1090
+   },
+   {
+    "library": "libSceLibcInternal",
+    "implemented": 273,
+    "stub": 1998,
+    "total": 2271
+   },
+   {
+    "library": "libSceAgc",
+    "implemented": 190,
+    "stub": 6,
+    "total": 196
+   },
+   {
+    "library": "libSceAgcVsh",
+    "implemented": 190,
+    "stub": 6,
+    "total": 196
+   },
+   {
+    "library": "libSceJson2",
+    "implemented": 132,
+    "stub": 83,
+    "total": 215
+   },
+   {
+    "library": "libSceFont",
+    "implemented": 125,
+    "stub": 11,
+    "total": 136
+   },
+   {
+    "library": "libSceFont.native",
+    "implemented": 125,
+    "stub": 11,
+    "total": 136
+   },
+   {
+    "library": "libSceAmpr",
+    "implemented": 91,
+    "stub": 0,
+    "total": 91
+   },
+   {
+    "library": "libSceHttp",
+    "implemented": 78,
+    "stub": 37,
+    "total": 115
+   },
+   {
+    "library": "libSceNet",
+    "implemented": 67,
+    "stub": 144,
+    "total": 211
+   },
+   {
+    "library": "libSceAudioOut",
+    "implemented": 59,
+    "stub": 64,
+    "total": 123
+   },
+   {
+    "library": "libSceUlt",
+    "implemented": 55,
+    "stub": 9,
+    "total": 64
+   },
+   {
+    "library": "libSceSystemService",
+    "implemented": 53,
+    "stub": 451,
+    "total": 504
+   },
+   {
+    "library": "libSceAgcDriver",
+    "implemented": 49,
+    "stub": 46,
+    "total": 95
+   },
+   {
+    "library": "libSceSpSysCallWrapper",
+    "implemented": 48,
+    "stub": 0,
+    "total": 48
+   },
+   {
+    "library": "libSceNetCtl",
+    "implemented": 47,
+    "stub": 48,
+    "total": 95
+   },
+   {
+    "library": "libSceRtc",
+    "implemented": 46,
+    "stub": 1,
+    "total": 47
+   },
+   {
+    "library": "libSceNpManager",
+    "implemented": 44,
+    "stub": 347,
+    "total": 391
+   },
+   {
+    "library": "libSceSaveData",
+    "implemented": 44,
+    "stub": 53,
+    "total": 97
+   },
+   {
+    "library": "libSceNgs2.native",
+    "implemented": 42,
+    "stub": 23,
+    "total": 65
+   },
+   {
+    "library": "libSceVideoOut",
+    "implemented": 41,
+    "stub": 123,
+    "total": 164
+   },
+   {
+    "library": "libSceNpUniversalDataSystem",
+    "implemented": 41,
+    "stub": 43,
+    "total": 84
+   },
+   {
+    "library": "libSceJson",
+    "implemented": 40,
+    "stub": 48,
+    "total": 88
+   },
+   {
+    "library": "libSceUsbd",
+    "implemented": 40,
+    "stub": 21,
+    "total": 61
+   },
+   {
+    "library": "libSceNgs2",
+    "implemented": 39,
+    "stub": 8,
+    "total": 47
+   },
+   {
+    "library": "libSceHttp2",
+    "implemented": 37,
+    "stub": 19,
+    "total": 56
+   },
+   {
+    "library": "libSceAjm.native",
+    "implemented": 34,
+    "stub": 4,
+    "total": 38
+   },
+   {
+    "library": "libSceSaveData.native",
+    "implemented": 34,
+    "stub": 0,
+    "total": 34
+   },
+   {
+    "library": "libSceNpWebApi2",
+    "implemented": 32,
+    "stub": 7,
+    "total": 39
+   },
+   {
+    "library": "libSceSsl",
+    "implemented": 31,
+    "stub": 23,
+    "total": 54
+   },
+   {
+    "library": "libSceCesCs",
+    "implemented": 29,
+    "stub": 244,
+    "total": 273
+   },
+   {
+    "library": "libSceAvPlayer.native",
+    "implemented": 29,
+    "stub": 0,
+    "total": 29
+   },
+   {
+    "library": "libSceAudioPropagation",
+    "implemented": 28,
+    "stub": 0,
+    "total": 28
+   },
+   {
+    "library": "libSceRudp",
+    "implemented": 27,
+    "stub": 7,
+    "total": 34
+   },
+   {
+    "library": "libSceAvPlayer",
+    "implemented": 27,
+    "stub": 0,
+    "total": 27
+   },
+   {
+    "library": "libScePad",
+    "implemented": 26,
+    "stub": 74,
+    "total": 100
+   },
+   {
+    "library": "libSceNpUtility",
+    "implemented": 26,
+    "stub": 70,
+    "total": 96
+   },
+   {
+    "library": "libSceVoice",
+    "implemented": 24,
+    "stub": 10,
+    "total": 34
+   },
+   {
+    "library": "libSceSystemGesture",
+    "implemented": 23,
+    "stub": 0,
+    "total": 23
+   },
+   {
+    "library": "libSceHmd",
+    "implemented": 22,
+    "stub": 145,
+    "total": 167
+   },
+   {
+    "library": "libSceRazorCpu",
+    "implemented": 21,
+    "stub": 14,
+    "total": 35
+   },
+   {
+    "library": "libSceVoiceChat",
+    "implemented": 21,
+    "stub": 9,
+    "total": 30
+   },
+   {
+    "library": "libSceUserService",
+    "implemented": 19,
+    "stub": 437,
+    "total": 456
+   },
+   {
+    "library": "libSceAudio3d",
+    "implemented": 19,
+    "stub": 12,
+    "total": 31
+   },
+   {
+    "library": "libSceNpEntitlementAccess",
+    "implemented": 19,
+    "stub": 5,
+    "total": 24
+   },
+   {
+    "library": "libSceContentSearch",
+    "implemented": 19,
+    "stub": 4,
+    "total": 23
+   },
+   {
+    "library": "libScePlayGo",
+    "implemented": 19,
+    "stub": 2,
+    "total": 21
+   },
+   {
+    "library": "libSceNpTrophy2",
+    "implemented": 17,
+    "stub": 24,
+    "total": 41
+   },
+   {
+    "library": "libSceAppContent",
+    "implemented": 17,
+    "stub": 16,
+    "total": 33
+   },
+   {
+    "library": "libSceAjm",
+    "implemented": 17,
+    "stub": 5,
+    "total": 22
+   },
+   {
+    "library": "libSceVdecsw",
+    "implemented": 17,
+    "stub": 1,
+    "total": 18
+   },
+   {
+    "library": "libSceVoiceQoS",
+    "implemented": 16,
+    "stub": 7,
+    "total": 23
+   },
+   {
+    "library": "libSceAjmi",
+    "implemented": 16,
+    "stub": 5,
+    "total": 21
+   },
+   {
+    "library": "libSceIme",
+    "implemented": 15,
+    "stub": 37,
+    "total": 52
+   },
+   {
+    "library": "libSceNpParty",
+    "implemented": 15,
+    "stub": 11,
+    "total": 26
+   },
+   {
+    "library": "libSceFiber",
+    "implemented": 15,
+    "stub": 0,
+    "total": 15
+   },
+   {
+    "library": "libScePosixForWebKit",
+    "implemented": 13,
+    "stub": 23,
+    "total": 36
+   },
+   {
+    "library": "libSceNpSessionSignaling",
+    "implemented": 13,
+    "stub": 13,
+    "total": 26
+   },
+   {
+    "library": "libSceFontFt",
+    "implemented": 13,
+    "stub": 7,
+    "total": 20
+   },
+   {
+    "library": "libSceNpAuth",
+    "implemented": 13,
+    "stub": 0,
+    "total": 13
+   },
+   {
+    "library": "libSceShare.native",
+    "implemented": 13,
+    "stub": 0,
+    "total": 13
+   },
+   {
+    "library": "libSceWebBrowserDialog",
+    "implemented": 13,
+    "stub": 0,
+    "total": 13
+   },
+   {
+    "library": "libSceVideodec2",
+    "implemented": 12,
+    "stub": 6,
+    "total": 18
+   },
+   {
+    "library": "libSceMove",
+    "implemented": 11,
+    "stub": 10,
+    "total": 21
+   },
+   {
+    "library": "libSceOpusDec",
+    "implemented": 11,
+    "stub": 3,
+    "total": 14
+   },
+   {
+    "library": "libSceSysmodule",
+    "implemented": 10,
+    "stub": 6,
+    "total": 16
+   },
+   {
+    "library": "libSceContentExport",
+    "implemented": 10,
+    "stub": 4,
+    "total": 14
+   },
+   {
+    "library": "libSceVideoRecording",
+    "implemented": 10,
+    "stub": 4,
+    "total": 14
+   },
+   {
+    "library": "libSceImeDialog",
+    "implemented": 10,
+    "stub": 3,
+    "total": 13
+   },
+   {
+    "library": "libSceNpCommerce",
+    "implemented": 10,
+    "stub": 1,
+    "total": 11
+   },
+   {
+    "library": "libSceAcm",
+    "implemented": 10,
+    "stub": 0,
+    "total": 10
+   },
+   {
+    "library": "libSceMsgDialog",
+    "implemented": 10,
+    "stub": 0,
+    "total": 10
+   },
+   {
+    "library": "libSceSaveDataDialog",
+    "implemented": 10,
+    "stub": 0,
+    "total": 10
+   },
+   {
+    "library": "libSceSaveDataDialog.native",
+    "implemented": 10,
+    "stub": 0,
+    "total": 10
+   },
+   {
+    "library": "libSceAudioIn",
+    "implemented": 9,
+    "stub": 35,
+    "total": 44
+   },
+   {
+    "library": "libSceVideoRecording.native",
+    "implemented": 9,
+    "stub": 9,
+    "total": 18
+   },
+   {
+    "library": "libSceOpusCeltDec",
+    "implemented": 9,
+    "stub": 2,
+    "total": 11
+   },
+   {
+    "library": "libSceErrorDialog",
+    "implemented": 8,
+    "stub": 0,
+    "total": 8
+   },
+   {
+    "library": "libSceMbus",
+    "implemented": 7,
+    "stub": 113,
+    "total": 120
+   },
+   {
+    "library": "libSceCdlgG2P",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceCdlgPlayerReview",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceGameUpdate",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceLoginDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceNetCtlApDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libScePlayGoDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libScePlayerInvitationDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libScePlayerSelectionDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceSigninDialog",
+    "implemented": 7,
+    "stub": 0,
+    "total": 7
+   },
+   {
+    "library": "libSceKeyboard",
+    "implemented": 6,
+    "stub": 16,
+    "total": 22
+   },
+   {
+    "library": "libSceAudiodec.native",
+    "implemented": 6,
+    "stub": 14,
+    "total": 20
+   },
+   {
+    "library": "libSceBluetoothHid",
+    "implemented": 6,
+    "stub": 11,
+    "total": 17
+   },
+   {
+    "library": "libSceNpGameIntent",
+    "implemented": 6,
+    "stub": 8,
+    "total": 14
+   },
+   {
+    "library": "libSceAudiodec",
+    "implemented": 6,
+    "stub": 3,
+    "total": 9
+   },
+   {
+    "library": "libSceGameLiveStreaming",
+    "implemented": 5,
+    "stub": 42,
+    "total": 47
+   },
+   {
+    "library": "libSceJpegDec",
+    "implemented": 5,
+    "stub": 1,
+    "total": 6
+   },
+   {
+    "library": "libScePngDec",
+    "implemented": 5,
+    "stub": 1,
+    "total": 6
+   },
+   {
+    "library": "libSceCompanionUtil",
+    "implemented": 5,
+    "stub": 0,
+    "total": 5
+   },
+   {
+    "library": "libSceZlib",
+    "implemented": 5,
+    "stub": 0,
+    "total": 5
+   },
+   {
+    "library": "libSceSharePlay",
+    "implemented": 4,
+    "stub": 15,
+    "total": 19
+   },
+   {
+    "library": "libSceMouse",
+    "implemented": 4,
+    "stub": 10,
+    "total": 14
+   },
+   {
+    "library": "libSceVideodec",
+    "implemented": 4,
+    "stub": 3,
+    "total": 7
+   },
+   {
+    "library": "libSceContentDelete",
+    "implemented": 4,
+    "stub": 0,
+    "total": 4
+   },
+   {
+    "library": "libSceHmd2",
+    "implemented": 4,
+    "stub": 0,
+    "total": 4
+   },
+   {
+    "library": "libSceJpegEnc",
+    "implemented": 4,
+    "stub": 0,
+    "total": 4
+   },
+   {
+    "library": "libScePngEnc",
+    "implemented": 4,
+    "stub": 0,
+    "total": 4
+   },
+   {
+    "library": "libSceVrTracker2",
+    "implemented": 4,
+    "stub": 0,
+    "total": 4
+   },
+   {
+    "library": "libSceRemoteplay",
+    "implemented": 3,
+    "stub": 39,
+    "total": 42
+   },
+   {
+    "library": "libSceConvertKeycode",
+    "implemented": 3,
+    "stub": 1,
+    "total": 4
+   },
+   {
+    "library": "libSceHttpCache",
+    "implemented": 2,
+    "stub": 21,
+    "total": 23
+   },
+   {
+    "library": "libSceMoveTracker",
+    "implemented": 2,
+    "stub": 16,
+    "total": 18
+   },
+   {
+    "library": "libSceCommonDialog",
+    "implemented": 2,
+    "stub": 14,
+    "total": 16
+   },
+   {
+    "library": "libSceLoginService",
+    "implemented": 2,
+    "stub": 1,
+    "total": 3
+   },
+   {
+    "library": "libSceDipsw",
+    "implemented": 1,
+    "stub": 8,
+    "total": 9
+   },
+   {
+    "library": "libSceDiscMap",
+    "implemented": 1,
+    "stub": 1,
+    "total": 2
+   },
+   {
+    "library": "libSceRandom",
+    "implemented": 1,
+    "stub": 0,
+    "total": 1
+   },
+   {
+    "library": "libSceNKWebKit",
+    "implemented": 0,
+    "stub": 11938,
+    "total": 11938
+   },
+   {
+    "library": "libSceJsc",
+    "implemented": 0,
+    "stub": 4114,
+    "total": 4114
+   },
+   {
+    "library": "libicu",
+    "implemented": 0,
+    "stub": 1698,
+    "total": 1698
+   },
+   {
+    "library": "libmonosgen-2.0",
+    "implemented": 0,
+    "stub": 963,
+    "total": 963
+   },
+   {
+    "library": "libSceNpCommon",
+    "implemented": 0,
+    "stub": 752,
+    "total": 752
+   },
+   {
+    "library": "libSceIcu",
+    "implemented": 0,
+    "stub": 661,
+    "total": 661
+   },
+   {
+    "library": "libSceLibreSsl3",
+    "implemented": 0,
+    "stub": 488,
+    "total": 488
+   },
+   {
+    "library": "libSceLibreSsl",
+    "implemented": 0,
+    "stub": 399,
+    "total": 399
+   },
+   {
+    "library": "mscorlib.dll",
+    "implemented": 0,
+    "stub": 375,
+    "total": 375
+   },
+   {
+    "library": "libSceFreeTypeOl",
+    "implemented": 0,
+    "stub": 344,
+    "total": 344
+   },
+   {
+    "library": "libSceFreeTypeOt",
+    "implemented": 0,
+    "stub": 341,
+    "total": 341
+   },
+   {
+    "library": "libSceGLSlimVSH",
+    "implemented": 0,
+    "stub": 203,
+    "total": 203
+   },
+   {
+    "library": "libSceXml",
+    "implemented": 0,
+    "stub": 183,
+    "total": 183
+   },
+   {
+    "library": "libSceFsInternalForVsh",
+    "implemented": 0,
+    "stub": 176,
+    "total": 176
+   },
+   {
+    "library": "libfreetype",
+    "implemented": 0,
+    "stub": 169,
+    "total": 169
+   },
+   {
+    "library": "libSceFios2",
+    "implemented": 0,
+    "stub": 168,
+    "total": 168
+   },
+   {
+    "library": "libSceGnmDriver",
+    "implemented": 0,
+    "stub": 163,
+    "total": 163
+   },
+   {
+    "library": "libSceGnmDriverForNeoMode",
+    "implemented": 0,
+    "stub": 163,
+    "total": 163
+   },
+   {
+    "library": "libcairo",
+    "implemented": 0,
+    "stub": 161,
+    "total": 161
+   },
+   {
+    "library": "libmdbg_syscore",
+    "implemented": 0,
+    "stub": 143,
+    "total": 143
+   },
+   {
+    "library": "libSceNpTus",
+    "implemented": 0,
+    "stub": 142,
+    "total": 142
+   },
+   {
+    "library": "libSceFacebook.Yoga",
+    "implemented": 0,
+    "stub": 135,
+    "total": 135
+   },
+   {
+    "library": "libSceNKWebKitRequirements",
+    "implemented": 0,
+    "stub": 133,
+    "total": 133
+   },
+   {
+    "library": "libSceCamera",
+    "implemented": 0,
+    "stub": 117,
+    "total": 117
+   },
+   {
+    "library": "libSceAbstractStorage",
+    "implemented": 0,
+    "stub": 110,
+    "total": 110
+   },
+   {
+    "library": "libSceAppInstUtil",
+    "implemented": 0,
+    "stub": 104,
+    "total": 104
+   },
+   {
+    "library": "libSceAvSetting",
+    "implemented": 0,
+    "stub": 104,
+    "total": 104
+   },
+   {
+    "library": "libSceNpTrophy",
+    "implemented": 0,
+    "stub": 97,
+    "total": 97
+   },
+   {
+    "library": "libSceIpmi",
+    "implemented": 0,
+    "stub": 94,
+    "total": 94
+   },
+   {
+    "library": "libpng16",
+    "implemented": 0,
+    "stub": 93,
+    "total": 93
+   },
+   {
+    "library": "libSceBgft",
+    "implemented": 0,
+    "stub": 89,
+    "total": 89
+   },
+   {
+    "library": "libcurl",
+    "implemented": 0,
+    "stub": 85,
+    "total": 85
+   },
+   {
+    "library": "libScePlayReady4",
+    "implemented": 0,
+    "stub": 84,
+    "total": 84
+   },
+   {
+    "library": "libSceComposite",
+    "implemented": 0,
+    "stub": 78,
+    "total": 78
+   },
+   {
+    "library": "libSceCompositeExt",
+    "implemented": 0,
+    "stub": 78,
+    "total": 78
+   },
+   {
+    "library": "libSceAbstractYoutube",
+    "implemented": 0,
+    "stub": 76,
+    "total": 76
+   },
+   {
+    "library": "libSceSysCore",
+    "implemented": 0,
+    "stub": 72,
+    "total": 72
+   },
+   {
+    "library": "libSceAbstractLocal",
+    "implemented": 0,
+    "stub": 70,
+    "total": 70
+   },
+   {
+    "library": "libSceNpMatching2",
+    "implemented": 0,
+    "stub": 69,
+    "total": 69
+   },
+   {
+    "library": "libReactNative.Modules.Vsh",
+    "implemented": 0,
+    "stub": 68,
+    "total": 68
+   },
+   {
+    "library": "libSceAbstractTwitter",
+    "implemented": 0,
+    "stub": 68,
+    "total": 68
+   },
+   {
+    "library": "libScePsm",
+    "implemented": 0,
+    "stub": 65,
+    "total": 65
+   },
+   {
+    "library": "libSceRegMgr",
+    "implemented": 0,
+    "stub": 63,
+    "total": 63
+   },
+   {
+    "library": "libSceDataTransfer",
+    "implemented": 0,
+    "stub": 60,
+    "total": 60
+   },
+   {
+    "library": "libSceNpWebApi",
+    "implemented": 0,
+    "stub": 56,
+    "total": 56
+   },
+   {
+    "library": "libSceVisionManager",
+    "implemented": 0,
+    "stub": 56,
+    "total": 56
+   },
+   {
+    "library": "libScePlayReady2",
+    "implemented": 0,
+    "stub": 55,
+    "total": 55
+   },
+   {
+    "library": "libfontconfig",
+    "implemented": 0,
+    "stub": 53,
+    "total": 53
+   },
+   {
+    "library": "libSceNpScoreRanking",
+    "implemented": 0,
+    "stub": 51,
+    "total": 51
+   },
+   {
+    "library": "libScePlayReady",
+    "implemented": 0,
+    "stub": 50,
+    "total": 50
+   },
+   {
+    "library": "libReactNative.Modules.Vsh.WebAppLauncher",
+    "implemented": 0,
+    "stub": 48,
+    "total": 48
+   },
+   {
+    "library": "libSceVideoCoreServerInterface",
+    "implemented": 0,
+    "stub": 47,
+    "total": 47
+   },
+   {
+    "library": "libReactNative.Modules.Vsh.Media",
+    "implemented": 0,
+    "stub": 46,
+    "total": 46
+   },
+   {
+    "library": "libSceUpdateService",
+    "implemented": 0,
+    "stub": 40,
+    "total": 40
+   },
+   {
+    "library": "libSceMetadataReaderWriter",
+    "implemented": 0,
+    "stub": 39,
+    "total": 39
+   },
+   {
+    "library": "libSceDepth",
+    "implemented": 0,
+    "stub": 38,
+    "total": 38
+   },
+   {
+    "library": "libNativeExtensions",
+    "implemented": 0,
+    "stub": 37,
+    "total": 37
+   },
+   {
+    "library": "libharfbuzz",
+    "implemented": 0,
+    "stub": 37,
+    "total": 37
+   },
+   {
+    "library": "libSceAvPlayerStreaming",
+    "implemented": 0,
+    "stub": 33,
+    "total": 33
+   },
+   {
+    "library": "libSceBemp2sys",
+    "implemented": 0,
+    "stub": 31,
+    "total": 31
+   },
+   {
+    "library": "libSceLoginMgrServer",
+    "implemented": 0,
+    "stub": 30,
+    "total": 30
+   },
+   {
+    "library": "libSceVrTracker",
+    "implemented": 0,
+    "stub": 30,
+    "total": 30
+   },
+   {
+    "library": "libSceRnpsAppMgr",
+    "implemented": 0,
+    "stub": 27,
+    "total": 27
+   },
+   {
+    "library": "libSceSdma",
+    "implemented": 0,
+    "stub": 27,
+    "total": 27
+   },
+   {
+    "library": "libSceNpSignaling",
+    "implemented": 0,
+    "stub": 24,
+    "total": 24
+   },
+   {
+    "library": "libSceNpSns",
+    "implemented": 0,
+    "stub": 24,
+    "total": 24
+   },
+   {
+    "library": "libSceSysUtil",
+    "implemented": 0,
+    "stub": 24,
+    "total": 24
+   },
+   {
+    "library": "libSceVdecCore.native",
+    "implemented": 0,
+    "stub": 24,
+    "total": 24
+   },
+   {
+    "library": "libSceHidControl",
+    "implemented": 0,
+    "stub": 23,
+    "total": 23
+   },
+   {
+    "library": "libSceShareUtility",
+    "implemented": 0,
+    "stub": 22,
+    "total": 22
+   },
+   {
+    "library": "libSceUsbStorage",
+    "implemented": 0,
+    "stub": 21,
+    "total": 21
+   },
+   {
+    "library": "libSceVdecCore",
+    "implemented": 0,
+    "stub": 20,
+    "total": 20
+   },
+   {
+    "library": "libSceEsvmEngine",
+    "implemented": 0,
+    "stub": 19,
+    "total": 19
+   },
+   {
+    "library": "libSceBeisobmf",
+    "implemented": 0,
+    "stub": 18,
+    "total": 18
+   },
+   {
+    "library": "libSceCustomMusicCore",
+    "implemented": 0,
+    "stub": 18,
+    "total": 18
+   },
+   {
+    "library": "libSceCompanionHttpd",
+    "implemented": 0,
+    "stub": 17,
+    "total": 17
+   },
+   {
+    "library": "libSceM4aacEnc",
+    "implemented": 0,
+    "stub": 17,
+    "total": 17
+   },
+   {
+    "library": "libSceMusicFrameworkInterface",
+    "implemented": 0,
+    "stub": 17,
+    "total": 17
+   },
+   {
+    "library": "gaikai-player",
+    "implemented": 0,
+    "stub": 16,
+    "total": 16
+   },
+   {
+    "library": "libSceBackupRestoreUtil",
+    "implemented": 0,
+    "stub": 16,
+    "total": 16
+   },
+   {
+    "library": "libSceOpusSilkEnc",
+    "implemented": 0,
+    "stub": 14,
+    "total": 14
+   },
+   {
+    "library": "libSceScreenShot",
+    "implemented": 0,
+    "stub": 14,
+    "total": 14
+   },
+   {
+    "library": "libSceVenc",
+    "implemented": 0,
+    "stub": 14,
+    "total": 14
+   },
+   {
+    "library": "libScePatchCheckerClient",
+    "implemented": 0,
+    "stub": 12,
+    "total": 12
+   },
+   {
+    "library": "libSceVideoStreamingEngine",
+    "implemented": 0,
+    "stub": 12,
+    "total": 12
+   },
+   {
+    "library": "libSceVideoStreamingEngine_sys",
+    "implemented": 0,
+    "stub": 12,
+    "total": 12
+   },
+   {
+    "library": "libSceCdlgUtilServer",
+    "implemented": 0,
+    "stub": 11,
+    "total": 11
+   },
+   {
+    "library": "libSceOpusCeltEnc",
+    "implemented": 0,
+    "stub": 11,
+    "total": 11
+   },
+   {
+    "library": "libSceSocialScreen",
+    "implemented": 0,
+    "stub": 11,
+    "total": 11
+   },
+   {
+    "library": "libSceVdecwrap",
+    "implemented": 0,
+    "stub": 11,
+    "total": 11
+   },
+   {
+    "library": "libSceDepth2",
+    "implemented": 0,
+    "stub": 10,
+    "total": 10
+   },
+   {
+    "library": "libSceNpRemotePlaySessionSignaling",
+    "implemented": 0,
+    "stub": 10,
+    "total": 10
+   },
+   {
+    "library": "libSceTEEClient",
+    "implemented": 0,
+    "stub": 10,
+    "total": 10
+   },
+   {
+    "library": "libSceTextToSpeech",
+    "implemented": 0,
+    "stub": 10,
+    "total": 10
+   },
+   {
+    "library": "libSceEditMp4",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceGameCustomDataDialog",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceInvitationDialog",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceNpEulaDialog",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceNpFriendListDialog",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceSrcUtl",
+    "implemented": 0,
+    "stub": 9,
+    "total": 9
+   },
+   {
+    "library": "libSceAudiodecCpu",
+    "implemented": 0,
+    "stub": 8,
+    "total": 8
+   },
+   {
+    "library": "libSceIdu",
+    "implemented": 0,
+    "stub": 8,
+    "total": 8
+   },
+   {
+    "library": "libSceNpProfileDialog",
+    "implemented": 0,
+    "stub": 8,
+    "total": 8
+   },
+   {
+    "library": "libSceSulphaDrv",
+    "implemented": 0,
+    "stub": 8,
+    "total": 8
+   },
+   {
+    "library": "libSceAc3Enc",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceDtsEnc",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceHmdSetupDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceNpSnsFacebookDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceNpSnsYouTubeDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libScePs2EmuMenuDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceSocialScreenDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceUsbStorageDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceVdecShevc",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceVdecShevc.native",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceVrServiceDialog",
+    "implemented": 0,
+    "stub": 7,
+    "total": 7
+   },
+   {
+    "library": "libSceAutoMounterClient",
+    "implemented": 0,
+    "stub": 6,
+    "total": 6
+   },
+   {
+    "library": "libScePadTracker",
+    "implemented": 0,
+    "stub": 6,
+    "total": 6
+   },
+   {
+    "library": "libSceShareFactoryUtil",
+    "implemented": 0,
+    "stub": 6,
+    "total": 6
+   },
+   {
+    "library": "libSceShellUIUtil",
+    "implemented": 0,
+    "stub": 6,
+    "total": 6
+   },
+   {
+    "library": "libSceWkFontConfig",
+    "implemented": 0,
+    "stub": 6,
+    "total": 6
+   },
+   {
+    "library": "libReactNative.Modules.Vsh.MediaPlayer.Contents",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceAt9Enc",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceCustomMusicAudioOut",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceGvMp4Parser",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceJpegParser",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceSystemLogger2",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceSystemLogger2NativeQueueClient",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceSystemTts",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceVideoNativeExtEssential",
+    "implemented": 0,
+    "stub": 5,
+    "total": 5
+   },
+   {
+    "library": "libSceDseehx",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceJxr",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libScePSNowGkp",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libScePsmUtil",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceS3da",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceSystemLogger2Delivery",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceUrlConfigResolver",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceVdecSavc",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceVdecSavc2",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceVdecSavc2.native",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceVideoDecoderArbitration",
+    "implemented": 0,
+    "stub": 4,
+    "total": 4
+   },
+   {
+    "library": "libSceFreeTypeOptOl",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceHubAppUtil",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceNKWeb",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceNpTcs",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceSystemLogger",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceVideoArbitration",
+    "implemented": 0,
+    "stub": 3,
+    "total": 3
+   },
+   {
+    "library": "libSceAudioSystem",
+    "implemented": 0,
+    "stub": 2,
+    "total": 2
+   },
+   {
+    "library": "libSceDiscId",
+    "implemented": 0,
+    "stub": 2,
+    "total": 2
+   },
+   {
+    "library": "libSceKbEmulate",
+    "implemented": 0,
+    "stub": 2,
+    "total": 2
+   },
+   {
+    "library": "libmono-profiler-log",
+    "implemented": 0,
+    "stub": 2,
+    "total": 2
+   },
+   {
+    "library": "WebAppBundle",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceCustomMusicSysCallWrapper",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceGic",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceNKWebCdlgInjectedBundle",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceNotification",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceNpPartner001",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceRnpsNKInjectedBundle",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   },
+   {
+    "library": "libSceVideoCoreInterface",
+    "implemented": 0,
+    "stub": 1,
+    "total": 1
+   }
+  ],
+  "source": {
+   "entries": 39158,
+   "verified": 39158,
+   "unique_nids": 31275,
+   "catalog": 76323,
+   "catalog_in_fw": 31275,
+   "fw_not_in_catalog": 0,
+   "fw_reexports_elsewhere": 7883,
+   "catalog_not_in_fw": {
+    "named export the 3.20 list does not have (newer firmware)": 943,
+    "library name that is no firmware module (aliases, game modules)": 44098,
+    "NID is not SHA1(name): placeholder or wrong name": 7
+   }
+  }
+ },
+ "game_libraries": [
+  {
+   "library": "libSceLibcInternal",
+   "imported": 346,
+   "hle": 53,
+   "lle": 293,
+   "stub": 0,
+   "implemented": 273,
+   "total": 2271
+  },
+  {
+   "library": "libkernel",
+   "imported": 302,
+   "hle": 302,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 663,
+   "total": 1116
+  },
+  {
+   "library": "libSceAgc",
+   "imported": 174,
+   "hle": 174,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 190,
+   "total": 196
+  },
+  {
+   "library": "libSceFont",
+   "imported": 52,
+   "hle": 52,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 125,
+   "total": 136
+  },
+  {
+   "library": "libSceJson2",
+   "imported": 51,
+   "hle": 51,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 132,
+   "total": 215
+  },
+  {
+   "library": "libSceAmpr",
+   "imported": 46,
+   "hle": 46,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 91,
+   "total": 91
+  },
+  {
+   "library": "libSceNet",
+   "imported": 37,
+   "hle": 37,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 67,
+   "total": 211
+  },
+  {
+   "library": "libSceNpUniversalDataSystem",
+   "imported": 37,
+   "hle": 37,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 41,
+   "total": 84
+  },
+  {
+   "library": "libSceAgcDriver",
+   "imported": 36,
+   "hle": 36,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 49,
+   "total": 95
+  },
+  {
+   "library": "libSceJson",
+   "imported": 32,
+   "hle": 32,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 40,
+   "total": 88
+  },
+  {
+   "library": "libSceHttp",
+   "imported": 31,
+   "hle": 31,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 78,
+   "total": 115
+  },
+  {
+   "library": "libSceAudioOut",
+   "imported": 30,
+   "hle": 30,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 59,
+   "total": 123
+  },
+  {
+   "library": "libSceHttp2",
+   "imported": 28,
+   "hle": 28,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 37,
+   "total": 56
+  },
+  {
+   "library": "libSceAvPlayer",
+   "imported": 24,
+   "hle": 24,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 27,
+   "total": 27
+  },
+  {
+   "library": "libSceNpManager",
+   "imported": 24,
+   "hle": 24,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 44,
+   "total": 391
+  },
+  {
+   "library": "libSceNpWebApi2",
+   "imported": 24,
+   "hle": 24,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 32,
+   "total": 39
+  },
+  {
+   "library": "libSceVideoOut",
+   "imported": 23,
+   "hle": 23,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 41,
+   "total": 164
+  },
+  {
+   "library": "libSceAudioPropagation",
+   "imported": 21,
+   "hle": 21,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 28,
+   "total": 28
+  },
+  {
+   "library": "libScePad",
+   "imported": 19,
+   "hle": 19,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 26,
+   "total": 100
+  },
+  {
+   "library": "libSceSystemService",
+   "imported": 18,
+   "hle": 18,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 53,
+   "total": 504
+  },
+  {
+   "library": "libSceVoiceChat",
+   "imported": 17,
+   "hle": 17,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 21,
+   "total": 30
+  },
+  {
+   "library": "libScePlayGo",
+   "imported": 16,
+   "hle": 16,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 19,
+   "total": 21
+  },
+  {
+   "library": "libSceNpEntitlementAccess",
+   "imported": 15,
+   "hle": 15,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 19,
+   "total": 24
+  },
+  {
+   "library": "libSceVoice",
+   "imported": 15,
+   "hle": 15,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 24,
+   "total": 34
+  },
+  {
+   "library": "libSceAjm",
+   "imported": 14,
+   "hle": 14,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 17,
+   "total": 22
+  },
+  {
+   "library": "libSceRtc",
+   "imported": 14,
+   "hle": 14,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 46,
+   "total": 47
+  },
+  {
+   "library": "libSceSaveData",
+   "imported": 14,
+   "hle": 14,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 44,
+   "total": 97
+  },
+  {
+   "library": "libSceNgs2",
+   "imported": 13,
+   "hle": 13,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 39,
+   "total": 47
+  },
+  {
+   "library": "libSceSsl",
+   "imported": 13,
+   "hle": 13,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 31,
+   "total": 54
+  },
+  {
+   "library": "libSceUserService",
+   "imported": 13,
+   "hle": 13,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 19,
+   "total": 456
+  },
+  {
+   "library": "libSceAjm.native",
+   "imported": 12,
+   "hle": 12,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 34,
+   "total": 38
+  },
+  {
+   "library": "libSceRudp",
+   "imported": 12,
+   "hle": 12,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 27,
+   "total": 34
+  },
+  {
+   "library": "libSceVoiceQoS",
+   "imported": 12,
+   "hle": 12,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 16,
+   "total": 23
+  },
+  {
+   "library": "libSceNpTrophy2",
+   "imported": 11,
+   "hle": 11,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 17,
+   "total": 41
+  },
+  {
+   "library": "libSceFiber",
+   "imported": 9,
+   "hle": 9,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 15,
+   "total": 15
+  },
+  {
+   "library": "libSceNetCtl",
+   "imported": 9,
+   "hle": 9,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 47,
+   "total": 95
+  },
+  {
+   "library": "libSceNpSessionSignaling",
+   "imported": 9,
+   "hle": 9,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 13,
+   "total": 26
+  },
+  {
+   "library": "libSceSaveDataDialog",
+   "imported": 9,
+   "hle": 9,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 10
+  },
+  {
+   "library": "libSceSystemGesture",
+   "imported": 9,
+   "hle": 9,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 23,
+   "total": 23
+  },
+  {
+   "library": "libSceAppContent",
+   "imported": 8,
+   "hle": 8,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 17,
+   "total": 33
+  },
+  {
+   "library": "libSceShare.native",
+   "imported": 8,
+   "hle": 8,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 13,
+   "total": 13
+  },
+  {
+   "library": "libSceVideoRecording",
+   "imported": 8,
+   "hle": 8,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 14
+  },
+  {
+   "library": "libSceWebBrowserDialog",
+   "imported": 8,
+   "hle": 8,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 13,
+   "total": 13
+  },
+  {
+   "library": "libSceAcm",
+   "imported": 7,
+   "hle": 7,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 10
+  },
+  {
+   "library": "libSceContentExport",
+   "imported": 7,
+   "hle": 7,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 14
+  },
+  {
+   "library": "libSceContentSearch",
+   "imported": 7,
+   "hle": 7,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 19,
+   "total": 23
+  },
+  {
+   "library": "libSceNpCommerce",
+   "imported": 7,
+   "hle": 7,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 11
+  },
+  {
+   "library": "libSceSaveData.native",
+   "imported": 7,
+   "hle": 7,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 34,
+   "total": 34
+  },
+  {
+   "library": "libSceGameUpdate",
+   "imported": 6,
+   "hle": 6,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 7,
+   "total": 7
+  },
+  {
+   "library": "libSceImeDialog",
+   "imported": 6,
+   "hle": 6,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 13
+  },
+  {
+   "library": "libSceNpAuth",
+   "imported": 6,
+   "hle": 6,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 13,
+   "total": 13
+  },
+  {
+   "library": "libScePlayGoDialog",
+   "imported": 6,
+   "hle": 6,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 7,
+   "total": 7
+  },
+  {
+   "library": "libScePlayerInvitationDialog",
+   "imported": 6,
+   "hle": 6,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 7,
+   "total": 7
+  },
+  {
+   "library": "libSceAudioIn",
+   "imported": 5,
+   "hle": 5,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 9,
+   "total": 44
+  },
+  {
+   "library": "libSceIme",
+   "imported": 5,
+   "hle": 5,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 15,
+   "total": 52
+  },
+  {
+   "library": "libSceMsgDialog",
+   "imported": 5,
+   "hle": 5,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 10
+  },
+  {
+   "library": "libSceNpUtility",
+   "imported": 5,
+   "hle": 5,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 26,
+   "total": 96
+  },
+  {
+   "library": "libScePngDec",
+   "imported": 5,
+   "hle": 5,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 5,
+   "total": 6
+  },
+  {
+   "library": "libSceErrorDialog",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 8,
+   "total": 8
+  },
+  {
+   "library": "libSceGameLiveStreaming",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 5,
+   "total": 47
+  },
+  {
+   "library": "libSceJpegEnc",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 4,
+   "total": 4
+  },
+  {
+   "library": "libSceMouse",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 4,
+   "total": 14
+  },
+  {
+   "library": "libSceNpGameIntent",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 6,
+   "total": 14
+  },
+  {
+   "library": "libScePngEnc",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 4,
+   "total": 4
+  },
+  {
+   "library": "libSceSigninDialog",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 7,
+   "total": 7
+  },
+  {
+   "library": "libSceSysmodule",
+   "imported": 4,
+   "hle": 4,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 10,
+   "total": 16
+  },
+  {
+   "library": "libSceContentDelete",
+   "imported": 3,
+   "hle": 3,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 4,
+   "total": 4
+  },
+  {
+   "library": "libSceRemoteplay",
+   "imported": 3,
+   "hle": 3,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 3,
+   "total": 42
+  },
+  {
+   "library": "libSceAvPlayer.native",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 29,
+   "total": 29
+  },
+  {
+   "library": "libSceCommonDialog",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 2,
+   "total": 16
+  },
+  {
+   "library": "libSceConvertKeycode",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 3,
+   "total": 4
+  },
+  {
+   "library": "libSceFontFt",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 13,
+   "total": 20
+  },
+  {
+   "library": "libSceNgs2.native",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 42,
+   "total": 65
+  },
+  {
+   "library": "libSceSharePlay",
+   "imported": 2,
+   "hle": 2,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 4,
+   "total": 19
+  },
+  {
+   "library": "libScePlayerSelectionDialog",
+   "imported": 1,
+   "hle": 1,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 7,
+   "total": 7
+  },
+  {
+   "library": "libSceRandom",
+   "imported": 1,
+   "hle": 1,
+   "lle": 0,
+   "stub": 0,
+   "implemented": 1,
+   "total": 1
+  }
+ ],
+ "game_imports_outside_fw": {
+  "unnamed LLE": 121,
+  "named HLE": 93,
+  "named STUB": 14,
+  "named LLE": 1452,
+  "unnamed STUB": 3
+ }
+}

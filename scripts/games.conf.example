@@ -1,0 +1,12 @@
+# Settings of this machine for the tests that read real games and for the
+# progress statistics. Copy to local/games.conf (local/ is not in git) and
+# fill in your own path:
+#
+#   mkdir -p local && cp scripts/games.conf.example local/games.conf
+#
+# Bash syntax: the file is sourced by `make test` and read by progress/progress.py.
+
+# Folder with your game folders (each holding eboot.bin and sce_sys/). Tests
+# that need a specific game look for it here by title ID and skip without it;
+# progress/progress.py reads the imports of every eboot.bin under it.
+GAMES_DIR=""

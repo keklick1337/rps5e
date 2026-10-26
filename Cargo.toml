@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ps5elf",
+    "crates/ps5vm",
+    "crates/ps5cpu",
+    "crates/ps5nid",
+    "crates/ps5hle",
+    "crates/rps5e-gui",
+    "crates/rps5e-cli",
+    "crates/ps5core",
+    "crates/ps5gpu",
+    "crates/ps5shader",
+    "crates/ps5input",
+    "crates/ps5pkg",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "GPL-2.0-only"
+repository = "https://github.com/keklick1337/rps5e"
+homepage = "https://github.com/keklick1337/rps5e"
+authors = ["Vladislav Tislenko (keklick1337)"]
+
+[workspace.dependencies]
+ps5elf  = { path = "crates/ps5elf" }
+ps5vm   = { path = "crates/ps5vm" }
+ps5cpu  = { path = "crates/ps5cpu" }
+ps5nid  = { path = "crates/ps5nid" }
+ps5hle  = { path = "crates/ps5hle" }
+ps5core = { path = "crates/ps5core" }
+ps5gpu  = { path = "crates/ps5gpu" }
+ps5shader = { path = "crates/ps5shader" }
+ps5input = { path = "crates/ps5input" }
+ps5pkg  = { path = "crates/ps5pkg" }
+
+# logging
+log       = "0.4"
+env_logger = "0.11"
+anyhow    = "1"
+thiserror = "1"
+byteorder = "1"
+bytes     = "1"
+bytemuck  = { version = "1.16", features = ["derive"] }
+bitflags  = "2"
+flate2    = "1"
+memmap2   = "0.9"
+libc      = "0.2"
+clap      = { version = "4", features = ["derive"] }
+iced-x86  = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+# Windows host layer (memory placeholders, exceptions, threads, sockets).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+debug = true
+lto = "thin"
+
+# Release packages (scripts/package.sh): the release build without debug
+# info, so the binaries stay small.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
