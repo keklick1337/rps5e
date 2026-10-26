@@ -1027,3 +1027,68 @@ fn decoder_runs_ahead_into_every_buffer_but_the_shown_one() {
     assert_eq!(env.call(cb_close, &[h]), OK);
     assert_eq!(ALLOCS.load(Ordering::SeqCst) - allocs_before, FREES.load(Ordering::SeqCst) - frees_before, "close releases every buffer");
 }
+
+/// A fence the test moves by hand: tickets are `queued`, a ticket passed
+/// when `done` reached it.
+struct ManualFence {
+    queued: AtomicU64,
+    done: AtomicU64,
+}
+
+impl source::RecordFence for ManualFence {
+    fn ticket(&self) -> u64 {
+        self.queued.load(Ordering::SeqCst)
+    }
+    fn passed(&self, ticket: u64) -> bool {
+        self.done.load(Ordering::SeqCst) >= ticket
+    }
+}
+
+/// The buffer of a retired picture goes back to the decoder only after the
+/// GPU queue processed the commands queued while it was shown (they may
+/// sample it), so a command thread that lags the title never records parts
+/// of a later picture.
+#[test]
+fn retired_picture_is_kept_until_the_gpu_queue_processed_it() {
+    let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !host::available() {
+        return;
+    }
+    let Some(path) = mount_clip() else { return };
+    let fence = Arc::new(ManualFence { queued: AtomicU64::new(1), done: AtomicU64::new(0) });
+    source::set_record_fence(Some(fence.clone()));
+    let env = Env::new();
+    let ctx = env.ctx();
+    let h = init_ex(&env, 3);
+    assert_eq!(add_source_ex(&env, h, &path), OK);
+    assert_eq!(env.call(cb_set_av_sync_mode, &[h, SYNC_MODE_NONE as u64]), OK);
+    assert_eq!(env.call(cb_start, &[h]), OK);
+    let frame = env.scratch + 0x900;
+    let next_picture = || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while env.call(cb_get_video_data_ex, &[h, frame]) != 1 {
+            assert!(Instant::now() < deadline, "no picture");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ctx.read_u64(frame).unwrap()
+    };
+    // The luma plane: the clip's frame counter changes it every picture.
+    const LUMA: usize = 320 * 180;
+    let first = next_picture();
+    let pixels = ctx.read_bytes(first, LUMA).unwrap();
+    // The title moves on; the commands queued while `first` was shown are
+    // not processed yet.
+    let second = next_picture();
+    assert_ne!(second, first);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(ctx.read_bytes(first, LUMA).unwrap(), pixels, "the decoder reused a picture the GPU queue may still read");
+    // The command thread catches up: the buffer is decoded into again.
+    fence.done.store(1, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ctx.read_bytes(first, LUMA).unwrap() == pixels {
+        assert!(Instant::now() < deadline, "the processed picture never went back to the decoder");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(env.call(cb_close, &[h]), OK);
+    source::set_record_fence(None);
+}

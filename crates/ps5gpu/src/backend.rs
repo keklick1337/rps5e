@@ -3156,11 +3156,24 @@ impl BufferStore for FaultBuffers {
             if pages.watchers(page).0 && self.tracker.has_gpu_dirty_pages_in_fault(page, page_bytes) == Some(false) {
                 pages.remove_watch_in_fault(page, page_bytes, true);
             }
+            let (mut invalidated, mut marked) = (None, false);
             if write {
-                let _ = self.tracker.invalidate_region(addr, 8, true);
-                table.mark_cpu_write(addr, 8, true);
+                invalidated = self.tracker.invalidate_region(addr, 8, true);
+                marked = table.mark_cpu_write(addr, 8, true);
             }
-            pages.allows(addr, kind)
+            let ok = pages.allows(addr, kind);
+            if !ok {
+                static LOGGED: AtomicU64 = AtomicU64::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+                    log::warn!(
+                        "ps5gpu: settle of {addr:#x} ({kind:?}) left it watched: watchers {:?}, buffer page (cpu-dirty, gpu-dirty) {:?}, invalidate {invalidated:?}, image hit {marked}, images [{}]",
+                        pages.watchers(page),
+                        self.tracker.page_state(page),
+                        table.describe_page(page)
+                    );
+                }
+            }
+            ok
         })
     }
 
@@ -4492,7 +4505,7 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | retiles: {}", b.images.retile_top(40)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -4527,6 +4540,8 @@ fn summary_locked() -> Option<String> {
             GC_USAGE_MIB.load(Ordering::Relaxed),
             b.gc.images.trigger >> 20,
             i.superseded_writebacks,
+            i.kept_merges,
+            i.own_writebacks,
             i.readbacks,
             i.modified_bytes >> 20,
             i.bytes >> 20,

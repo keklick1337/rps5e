@@ -10,6 +10,12 @@
 //! as pictures are retired) and the ready-frame queues (drained by the
 //! GetVideoData / GetAudioData exports). Workers never call guest code.
 //!
+//! A retired picture may still be read by GPU commands the title queued
+//! while it was shown: the command thread reads the picture when it records
+//! them, which can lag the guest by frames. Its buffer is held (with a
+//! ticket of the GPU queue) until the command thread processed everything
+//! queued at retirement, and only then goes back to the decoder.
+//!
 //! Looping: at the end of the container the demuxer bumps a per-stream
 //! timestamp offset by the movie duration, queues a marker that makes the
 //! decoder drain and flush, and seeks back to the start. Frames keep their
@@ -23,12 +29,56 @@ use super::stream::AVERROR_EOF;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 const AVERROR_EAGAIN: i32 = -libc::EAGAIN;
 
 pub const DEMUX_BUFFER_DEFAULT: u32 = 4 * 1024 * 1024;
 pub const DEMUX_BUFFER_MIN: u32 = 128 * 1024;
 pub const DEMUX_BUFFER_MAX: u32 = 32 * 1024 * 1024;
+
+/// Tells when the GPU command thread has processed the commands queued so
+/// far (see the module comment).
+pub trait RecordFence: Send + Sync {
+    /// A ticket for everything queued until now.
+    fn ticket(&self) -> u64;
+    /// Everything queued before `ticket` was taken has been processed.
+    fn passed(&self, ticket: u64) -> bool;
+}
+
+/// The process-wide PM4 queue.
+struct QueueFence;
+
+impl RecordFence for QueueFence {
+    fn ticket(&self) -> u64 {
+        crate::agc::pm4::queue::global().ticket()
+    }
+    fn passed(&self, ticket: u64) -> bool {
+        crate::agc::pm4::queue::global().passed(ticket)
+    }
+}
+
+static FENCE_OVERRIDE: Mutex<Option<Arc<dyn RecordFence>>> = Mutex::new(None);
+
+/// The fence new pipelines use: the PM4 queue unless a test set one.
+fn record_fence() -> Arc<dyn RecordFence> {
+    FENCE_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Arc::new(QueueFence))
+}
+
+/// Make pipelines started from now on use `fence` (`None`: the PM4 queue).
+#[cfg(test)]
+pub fn set_record_fence(fence: Option<Arc<dyn RecordFence>>) {
+    *FENCE_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = fence;
+}
+
+/// Longest time a retired picture is held back from the decoder. A queue
+/// that does not move for this long is stalled on something else (a wait
+/// the title resolves later), and the decoder must not stall the movie
+/// behind it.
+const HOLD_LIMIT: Duration = Duration::from_millis(250);
+
+/// How often a decoder waiting for a held buffer checks the fence.
+const HOLD_POLL: Duration = Duration::from_millis(1);
 
 /// An output buffer allocated through the title's allocator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,9 +122,31 @@ pub struct Pipe {
     pub audio_pool: Vec<GuestBuf>,
     pub video_frames: VecDeque<ReadyFrame>,
     pub audio_frames: VecDeque<ReadyFrame>,
+    /// Retired pictures waiting for the GPU commands that may read them:
+    /// (ticket, retirement time, buffer).
+    video_held: VecDeque<(u64, Instant, GuestBuf)>,
+    fence: Arc<dyn RecordFence>,
 }
 
 impl Pipe {
+    /// The title retired the picture in `buf`: it goes back to the decoder
+    /// once the GPU commands queued until now were processed.
+    pub fn retire_video(&mut self, buf: GuestBuf) {
+        let ticket = self.fence.ticket();
+        self.video_held.push_back((ticket, Instant::now(), buf));
+    }
+
+    /// Move held pictures whose commands were processed to the free pool.
+    fn collect_held(&mut self) {
+        while let Some(&(ticket, since, buf)) = self.video_held.front() {
+            if !self.fence.passed(ticket) && since.elapsed() < HOLD_LIMIT {
+                break;
+            }
+            self.video_held.pop_front();
+            self.video_pool.push(buf);
+        }
+    }
+
     /// Everything was demuxed, decoded and handed out.
     pub fn drained(&self) -> bool {
         self.demux_eof && self.video_done && self.audio_done && self.video_frames.is_empty() && self.audio_frames.is_empty()
@@ -93,6 +165,10 @@ impl Shared {
 
     fn wait<'a>(&self, g: MutexGuard<'a, Pipe>) -> MutexGuard<'a, Pipe> {
         self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_for<'a>(&self, g: MutexGuard<'a, Pipe>, d: Duration) -> MutexGuard<'a, Pipe> {
+        self.cv.wait_timeout(g, d).unwrap_or_else(|e| e.into_inner()).0
     }
 
     fn fail(&self) {
@@ -165,6 +241,8 @@ impl Pipeline {
                 audio_pool: s.audio_pool,
                 video_frames: VecDeque::new(),
                 audio_frames: VecDeque::new(),
+                video_held: VecDeque::new(),
+                fence: record_fence(),
             }),
             cv: Condvar::new(),
         });
@@ -251,6 +329,7 @@ impl Pipeline {
         let mut p = self.shared.lock();
         let mut video: Vec<GuestBuf> = std::mem::take(&mut p.video_pool);
         video.extend(p.video_frames.drain(..).map(|f| f.buf));
+        video.extend(p.video_held.drain(..).map(|h| h.2));
         let mut audio: Vec<GuestBuf> = std::mem::take(&mut p.audio_pool);
         audio.extend(p.audio_frames.drain(..).map(|f| f.buf));
         p.video_packets = PacketQueue::default();
@@ -471,11 +550,16 @@ fn pop_buffer(sh: &Shared, video: bool) -> Option<GuestBuf> {
         if p.stop {
             return None;
         }
+        if video {
+            p.collect_held();
+        }
         let pool = if video { &mut p.video_pool } else { &mut p.audio_pool };
         if let Some(b) = pool.pop() {
             return Some(b);
         }
-        p = sh.wait(p);
+        // Held pictures are released by the command thread's progress,
+        // which does not signal this pipeline: poll it.
+        p = if video && !p.video_held.is_empty() { sh.wait_for(p, HOLD_POLL) } else { sh.wait(p) };
     }
 }
 

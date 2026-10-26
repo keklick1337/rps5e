@@ -329,7 +329,7 @@ struct Source {
     idle_video: Vec<GuestBuf>,
     idle_audio: Vec<GuestBuf>,
     /// The picture last handed to the title; its buffer goes back to the
-    /// pool when the next picture is handed out.
+    /// pool after the next picture is handed out (see `Pipe::retire_video`).
     current_video: Option<ReadyFrame>,
     current_audio: Option<ReadyFrame>,
 }
@@ -522,10 +522,11 @@ impl Source {
                 }
             }
             let due = if f.offset <= self.pass_offset { self.due_time(&f) } else { due };
-            // The previous picture's buffer is free again: the decoder may
+            // The previous picture's buffer is free again once the GPU
+            // commands that may sample it were processed: the decoder may
             // run ahead into every buffer but the one now shown.
             if let Some(current) = self.current_video.take() {
-                p.video_pool.push(current.buf);
+                p.retire_video(current.buf);
             }
             (f, due)
         };

@@ -802,6 +802,182 @@ fn alias_refills_from_a_newer_image_with_cpu_written_pages() {
     drop(buffers);
 }
 
+/// A large image that holds an older alias's GPU bytes and then gets a
+/// CPU-written page keeps them: its next refill (from a newer alias
+/// elsewhere in its range) merges the written page into its own contents
+/// instead of reloading guest memory under the newer alias. Before, the
+/// reload replaced the older alias's bytes with stale memory and, being the
+/// newest image there, handed those back to the older alias (a render pool
+/// that lost a depth buffer this way drew tile-shaped holes).
+#[test]
+#[ignore]
+fn stale_image_refill_keeps_older_alias_bytes() {
+    use vk::Format as F;
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let span = 256 << 10;
+    let stale: Vec<u8> = (0..span).map(|i| (i * 13 % 241) as u8).collect();
+    assert!(mem.write_backing(addr, &stale));
+
+    // D: rendered in the pool's first 64 KiB block.
+    let dkey = key2d(F::R8G8B8A8_UINT, 4, sw, 128, 128, addr);
+    let d = images.find_or_create(&mut sched, &mut buffers, &dkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, d, true));
+    images.clear_color(&mut sched, d, vk::ClearColorValue { uint32: [1, 2, 3, 4] }, None);
+    // B: the whole pool, takes D's bytes.
+    let bkey = key2d(F::R32_UINT, 4, sw, 256, 256, addr);
+    assert_eq!(bkey.size(), span as u64);
+    let b = images.find_or_create(&mut sched, &mut buffers, &bkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, b, false));
+    // S: rendered in the third block, newer than B.
+    let skey = key2d(F::R8G8B8A8_UINT, 4, sw, 128, 128, addr + (128 << 10));
+    let s = images.find_or_create(&mut sched, &mut buffers, &skey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, s, true));
+    images.clear_color(&mut sched, s, vk::ClearColorValue { uint32: [5, 6, 7, 8] }, None);
+    // The CPU writes into B's last block (not D's or S's).
+    let off = 3 * (64 << 10) + 100;
+    // SAFETY: faulting write resolved by the image watch table.
+    unsafe { std::ptr::write_volatile((addr + off) as *mut u32, 0x0102_0304) };
+    assert!(images.needs_upload(b));
+    assert!(!images.needs_upload(d));
+    // B is refilled (S on top), then D is asked for again.
+    assert!(images.prepare(&mut sched, &mut buffers, b, false));
+    assert!(images.prepare(&mut sched, &mut buffers, d, false));
+    let back = read_image(&dev, &mut sched, &mut images, d, 4);
+    assert!(back.chunks(4).all(|t| t == [1, 2, 3, 4]), "D lost its rendering: {:?}", &back[..16]);
+    // B holds D's bytes, S's bytes and the CPU's word.
+    let bp = DetileParams::new(sw, 4, 256).unwrap();
+    let mut guest = stale.clone();
+    tile_at(&DetileParams::new(sw, 4, 128).unwrap(), &vec![1, 2, 3, 4].repeat(128 * 128), 128, 128, &mut guest, 0);
+    tile_at(&DetileParams::new(sw, 4, 128).unwrap(), &vec![5, 6, 7, 8].repeat(128 * 128), 128, 128, &mut guest, 128 << 10);
+    guest[off as usize..off as usize + 4].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    let mut now = vec![0u8; span];
+    assert!(mem.read_backing(addr, &mut now));
+    guest[3 * (64 << 10)..].copy_from_slice(&now[3 * (64 << 10)..]);
+    assert_eq!(read_image(&dev, &mut sched, &mut images, b, 4), detile_at(&bp, &guest, 0, 256, 256, 4));
+    // B's memory still partly belongs to the CPU: no write-back over it.
+    assert!(!images.writeback(&mut sched, &mut buffers, b));
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// A depth/stencil image refilled from a newer colour alias over part of
+/// its depth plane goes through guest memory (the GPU path does not take
+/// stencil planes): its own rendering is written there first, so it keeps
+/// its depth wherever the alias does not lie.
+#[test]
+#[ignore]
+fn depth_stencil_refill_through_memory_keeps_its_own_depth() {
+    use vk::Format as F;
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let (w, h) = (256u32, 256u32);
+    let zp = DetileParams::new(tiling::SWIZZLE_64KB_Z_X, 4, w).unwrap();
+    let size = zp.surface_size(h);
+    assert!(mem.write_backing(addr, &vec![0x55u8; size]));
+    let mut ykey = ImageKey {
+        format: F::D32_SFLOAT_S8_UINT,
+        width: w,
+        height: h,
+        depth: 1,
+        layers: 1,
+        levels: 1,
+        samples: 1,
+        dim: ImageDim::D2,
+        main: Plane { addr: 0, bytes_per_element: 0, swizzle: 0, pitch: 0, slice_size: 0, bytes: 0, aspect: vk::ImageAspectFlags::COLOR },
+        stencil: None,
+        transform: Default::default(),
+    };
+    ykey.main = plane(&ykey, addr, 4, tiling::SWIZZLE_64KB_Z_X, vk::ImageAspectFlags::DEPTH);
+    ykey.stencil = Some(plane(&ykey, addr + (2 << 20), 1, tiling::SWIZZLE_64KB_Z_X, vk::ImageAspectFlags::STENCIL));
+    let y = images.find_or_create(&mut sched, &mut buffers, &ykey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, y, true));
+    images.clear_depth_stencil(&mut sched, y, Some(0.25), Some(7), None, None);
+    // X: a newer colour surface over the first 64 KiB block only.
+    let xkey = key2d(F::R32_UINT, 4, tiling::SWIZZLE_64KB_R_X, 128, 128, addr);
+    let x = images.find_or_create(&mut sched, &mut buffers, &xkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, x, true));
+    images.clear_color(&mut sched, x, vk::ClearColorValue { uint32: [0x3f00_0000, 0, 0, 0] }, None);
+    assert!(images.needs_refresh(y));
+    assert!(images.prepare(&mut sched, &mut buffers, y, false));
+    let back = read_image(&dev, &mut sched, &mut images, y, 4);
+    let at = |x: u32, y: u32| f32::from_le_bytes(back[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize].try_into().unwrap());
+    let (mut inside, mut outside) = (0, 0);
+    for yy in (0..h).step_by(7) {
+        for xx in (0..w).step_by(5) {
+            if zp.offset(xx, yy) < (64 << 10) {
+                assert_eq!(at(xx, yy), 0.5, "texel ({xx}, {yy}) under X");
+                inside += 1;
+            } else {
+                assert_eq!(at(xx, yy), 0.25, "texel ({xx}, {yy}): Y's own depth");
+                outside += 1;
+            }
+        }
+    }
+    assert!(inside > 0 && outside > 0);
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// CPU writes and re-watches of a partially resident image racing on two
+/// threads keep the page's watch count equal to what the entry holds. A
+/// re-watch that added its watches after releasing the table lock let a
+/// write in between remove a watch that was not there yet; the one added
+/// next belonged to nobody, and later stores to the page faulted for ever.
+#[test]
+fn watch_table_rewatch_racing_cpu_writes_leaks_no_watch() {
+    let mem = test_memory();
+    let (view, _) = guest_mapping(mem, 4 << 20);
+    let table = Arc::new(WatchTable::new(mem.pages.clone()));
+    let a = view + 16 * PAGE_BYTES;
+    let page = |i: u64| a + i * PAGE_BYTES;
+    // Partially resident: pages 4..6 uncommitted, so the entry is watched
+    // per page.
+    unmap_guest(mem, page(4), 2 * PAGE_BYTES);
+    table.insert(1, a, page(16));
+    table.rearm(1, true);
+    assert!(table.is_sparse(1));
+    let target = page(1);
+    std::thread::scope(|s| {
+        let t = table.clone();
+        s.spawn(move || {
+            for _ in 0..200_000 {
+                t.mark_cpu_write(target + 8, 8, false);
+            }
+        });
+        for _ in 0..200_000 {
+            table.rearm_with(1, true, true, None);
+        }
+    });
+    // Quiet now: the entry watches the page once, and a write unwatches it.
+    table.rearm_with(1, true, true, None);
+    assert_eq!(mem.pages.watchers(target).1, 1, "watch count after re-watching");
+    table.mark_cpu_write(target + 8, 8, false);
+    assert_eq!(mem.pages.watchers(target).1, 0, "a watch nobody holds was left on the page");
+    table.remove(1);
+}
+
 /// A partially resident image (some pages of its range not committed) is
 /// watched on its committed pages, and a page committed, written or
 /// unmapped later makes exactly that page stale.

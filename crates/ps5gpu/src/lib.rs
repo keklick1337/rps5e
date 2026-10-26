@@ -315,11 +315,12 @@ impl Presenter {
             }
         }
         let hdr = Some(format::is_hdr(desc.pixel_format));
-        // A display buffer the GPU rendered is taken from the image cache.
-        if !self.is_headless() {
-            if let Some(frame) = backend::capture_display(&desc, guest_ptr) {
-                return self.present_gpu_frame(desc.width, desc.height, frame, not_before, hdr);
-            }
+        // A display buffer the GPU rendered is taken from the image cache,
+        // headless too: reading it from guest memory would download it and
+        // wait for the GPU on every flip, which a window never does (the
+        // frame pacing of a headless run would differ from a real one).
+        if let Some(frame) = backend::capture_display(&desc, guest_ptr) {
+            return self.present_gpu_frame(desc.width, desc.height, frame, not_before, hdr);
         }
         match read_guest_surface(&desc, guest_ptr) {
             Ok(pixels) => self.present_converted(desc.width, desc.height, pixels, not_before, hdr),

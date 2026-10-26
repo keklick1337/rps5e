@@ -1113,6 +1113,58 @@ impl WatchTable {
         })
     }
 
+    /// Diagnostics: every entry over the page of `addr` (looked up without
+    /// the bucket index) with its watch state there.
+    pub fn describe_page(&self, addr: u64) -> String {
+        let page = addr & !(PAGE_BYTES - 1);
+        let in_index = self.with_buckets(|_, buckets| {
+            buckets.get(&(page >> WATCH_BUCKET_BITS)).map(|l| l.iter().map(|&p| p as usize).collect::<Vec<_>>()).unwrap_or_default()
+        });
+        self.with(|v| {
+            v.iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    let (eb, ee) = e.pages();
+                    eb <= page && page < ee
+                })
+                .map(|(pos, e)| {
+                    let (eb, _) = e.pages();
+                    let i = (page - eb) / PAGE_BYTES;
+                    format!(
+                        "#{} {:#x}..{:#x} watched {} unwatched-here {} partial {} sparse {} whole {} cpu-written {} indexed {}",
+                        e.id,
+                        e.begin,
+                        e.end,
+                        e.watched,
+                        e.unwatched.get(i),
+                        e.partial,
+                        e.sparse,
+                        e.whole,
+                        e.cpu_written,
+                        in_index.contains(&pos)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    /// The CPU wrote into the image's memory since its load (see
+    /// `WatchEntry::touched`).
+    fn touched(&self, id: u64) -> bool {
+        self.with_index(|v, index| index.get(&id).is_some_and(|&i| v[i].touched))
+    }
+
+    /// Keep the CPU's claim on the image's memory across a refill that
+    /// rearmed it (the refill kept the CPU's pages, see `merge_cpu_pages`).
+    fn touch(&self, id: u64) {
+        self.with_index(|v, index| {
+            if let Some(&i) = index.get(&id) {
+                v[i].touched = true;
+            }
+        });
+    }
+
     /// The whole image is about to be overwritten by the GPU.
     fn untouch(&self, id: u64) {
         self.with_index(|v, index| {
@@ -1157,7 +1209,7 @@ impl WatchTable {
         // table lock: a watchable range that is not is partially resident.
         let Some((begin, end)) = self.with_index(|v, index| index.get(&id).map(|&i| (v[i].begin, v[i].end))) else { return };
         let sparse = watch && !self.pages.is_registered(begin, end - begin);
-        let add = self.with_index(|v, index| {
+        self.with_index(|v, index| {
             let e = &mut v[*index.get(&id)?];
             let written_since = since.is_some_and(|s| s != e.writes) && read_race_check_enabled();
             e.sparse = sparse;
@@ -1194,11 +1246,16 @@ impl WatchTable {
                 e.unwatched.clear();
                 e.maybe.clear();
             }
-            add
+            // The watches go on before the table lock is released: a CPU
+            // write faulting in between would otherwise find the page
+            // watched by the entry, remove a watch that is not there yet,
+            // and leave the one added afterwards to nobody (the store then
+            // faults for ever).
+            for (b, e) in add.unwrap_or_default() {
+                self.pages.add_watch(b, e - b, false);
+            }
+            Some(())
         });
-        for (b, e) in add.unwrap_or_default() {
-            self.pages.add_watch(b, e - b, false);
-        }
     }
 
     /// Why an image needs an upload (diagnostics): 1 new / unknown, 2 CPU
@@ -1364,6 +1421,12 @@ pub struct ImageStats {
     pub pressure_runs: u64,
     /// Write-backs skipped because a newer image holds the memory.
     pub superseded_writebacks: u64,
+    /// Stale GPU-modified images that merged their CPU-written pages and
+    /// kept their content version before a refill from newer aliases.
+    pub kept_merges: u64,
+    /// Depth/stencil or multisampled images written back before their
+    /// refill through guest memory.
+    pub own_writebacks: u64,
     /// Write-backs before GPU work wrote the image's memory as a buffer.
     pub buffer_write_writebacks: u64,
     pub pressure_drops: u64,
@@ -2811,7 +2874,7 @@ impl ImageCache {
         // write count and upload state are then read under one lock (the
         // steps below in the same order, without the alias walk).
         let plain = !discard && self.images.get(&id).is_some_and(|i| i.initialized && i.aliases.is_empty() && (i.edge_hash.is_none() || i.gpu_modified));
-        let (since, newer, stale) = if plain {
+        let (since, newer, mut stale) = if plain {
             let (since, (watched, written)) = self.table.counted_resolved_state(id);
             let modified = self.images.get(&id).is_some_and(|i| i.gpu_modified);
             (since, Vec::new(), written || (!watched && !modified))
@@ -2859,12 +2922,26 @@ impl ImageCache {
         } else {
             crate::slice_shadow::Hole::ImageRefresh
         });
-        if stale && newer.is_empty() && !discard {
-            if let Some(ok) = self.merge_cpu_pages(sched, buffers, id) {
-                if let Some(i) = self.images.get_mut(&id) {
-                    i.last_use = tick;
+        let mut merged_ok = true;
+        let mut keep_touched = false;
+        if stale && !discard {
+            let modified = self.images.get(&id).is_some_and(|i| i.initialized && i.gpu_modified);
+            if newer.is_empty() {
+                if let Some(ok) = self.merge_cpu_pages(sched, buffers, id, false) {
+                    if let Some(i) = self.images.get_mut(&id) {
+                        i.last_use = tick;
+                    }
+                    return ok;
                 }
-                return ok;
+            } else if modified {
+                // Its own GPU contents with the CPU's pages merged are
+                // current but for the newer aliases, which go on top below.
+                if let Some(ok) = self.merge_cpu_pages(sched, buffers, id, true) {
+                    merged_ok = ok;
+                    stale = false;
+                    keep_touched = self.table.touched(id);
+                    self.stats.kept_merges += 1;
+                }
             }
         }
         if !newer.is_empty() && !discard {
@@ -2933,14 +3010,24 @@ impl ImageCache {
         } else if !newer.is_empty() {
             match self.refresh_from_aliases(sched, buffers, id, &newer, stale) {
                 Some(ok) => {
+                    if keep_touched {
+                        self.table.touch(id);
+                    }
                     if let Some(i) = self.images.get_mut(&id) {
                         i.last_use = tick;
                     }
-                    return ok;
+                    return ok && merged_ok;
                 }
                 None => {
                     // Shapes the GPU path does not handle (stencil planes,
-                    // multisampling): through guest memory.
+                    // multisampling): through guest memory. The image's own
+                    // GPU contents go there first (the newer images then
+                    // land over them), or the reload would lose them where
+                    // no newer image lies.
+                    if !stale && self.images.get(&id).is_some_and(|i| i.initialized && i.gpu_modified) {
+                        self.writeback(sched, buffers, id);
+                        self.stats.own_writebacks += 1;
+                    }
                     for &x in &newer {
                         if self.images.get(&x).is_some_and(|i| i.gpu_modified) {
                             self.writeback(sched, buffers, x);
@@ -2969,7 +3056,7 @@ impl ImageCache {
             i.seq = self.seq;
             i.edge_hash = edge_hash;
         }
-        ok
+        ok && merged_ok
     }
 
     /// The hash of the guest bytes of an image lying within two pages (its
@@ -3017,14 +3104,17 @@ impl ImageCache {
     /// detiled from it. The result is what the hardware holds after the GPU
     /// results and then the CPU's bytes landed in memory. None when the
     /// image has no such pages or its shape needs a full load.
-    fn merge_cpu_pages(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64) -> Option<bool> {
+    ///
+    /// `keep_version`: the image keeps its content version (sequence)
+    /// instead of becoming the newest: newer aliases still go over it.
+    fn merge_cpu_pages(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, keep_version: bool) -> Option<bool> {
         let t = sched.time_item_begin(crate::scheduler::gpu_timer::label::IMG_UPLOAD);
-        let r = self.merge_cpu_pages_timed(sched, buffers, id);
+        let r = self.merge_cpu_pages_timed(sched, buffers, id, keep_version);
         sched.time_item_end(t);
         r
     }
 
-    fn merge_cpu_pages_timed(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64) -> Option<bool> {
+    fn merge_cpu_pages_timed(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, keep_version: bool) -> Option<bool> {
         let img = self.images.get(&id)?;
         // A partially resident image takes the pages committed or written
         // since its load the same way: its other pages still match guest
@@ -3079,9 +3169,14 @@ impl ImageCache {
         }
         let tracked = self.memory.is_watchable(yb, key.size());
         self.table.rearm_with(id, tracked, true, read_race_check_enabled().then_some(since));
-        self.seq += 1;
+        if !keep_version {
+            self.seq += 1;
+        }
+        let seq = self.seq;
         if let Some(i) = self.images.get_mut(&id) {
-            i.seq = self.seq;
+            if !keep_version {
+                i.seq = seq;
+            }
             i.edge_hash = None;
             i.merged = true;
         }

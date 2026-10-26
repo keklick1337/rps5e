@@ -56,6 +56,8 @@ pub enum Kind {
 struct Submission {
     kind: Kind,
     queue: usize,
+    /// Enqueue order over all queues (see [`GpuQueue::ticket`]).
+    seq: u64,
     addr: u64,
     dwords: u32,
     exec: Execution,
@@ -79,6 +81,10 @@ struct State {
     next_queue: usize,
     pending_boundaries: usize,
     processing: bool,
+    /// `seq` of the submission being processed.
+    processing_seq: u64,
+    /// `seq` the next enqueued submission gets.
+    next_seq: u64,
     frames: u64,
     /// The GPU thread stopped for process shutdown.
     stopped: bool,
@@ -116,6 +122,8 @@ impl GpuQueue {
                 next_queue: 0,
                 pending_boundaries: 0,
                 processing: false,
+                processing_seq: 0,
+                next_seq: 0,
                 frames: 0,
                 stopped: false,
             }),
@@ -130,9 +138,36 @@ impl GpuQueue {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn enqueue(st: &mut State, s: Submission) {
+    fn enqueue(st: &mut State, mut s: Submission) {
+        s.seq = st.next_seq;
+        st.next_seq += 1;
         st.queues[s.queue].push_back(s);
         st.count += 1;
+    }
+
+    /// The oldest submission not yet completed (`next_seq` when none is):
+    /// each queue runs in enqueue order, so it is the smallest head or the
+    /// one being processed.
+    fn oldest_pending(st: &State) -> u64 {
+        let heads = st.queues.iter().filter_map(|q| q.front()).map(|s| s.seq);
+        let oldest = heads.min().unwrap_or(st.next_seq);
+        if st.processing {
+            oldest.min(st.processing_seq)
+        } else {
+            oldest
+        }
+    }
+
+    /// A ticket for everything submitted so far; [`Self::passed`] tells when
+    /// the command thread has processed (recorded) all of it. Memory those
+    /// commands read can be reused by the CPU after that.
+    pub fn ticket(&self) -> u64 {
+        self.lock().next_seq
+    }
+
+    /// Every submission enqueued before `ticket` was taken has completed.
+    pub fn passed(&self, ticket: u64) -> bool {
+        Self::oldest_pending(&self.lock()) >= ticket
     }
 
     /// Queue a graphics command buffer.
@@ -143,7 +178,7 @@ impl GpuQueue {
         let mut st = self.lock();
         Self::enqueue(
             &mut st,
-            Submission { kind: Kind::Commands, queue: 0, addr, dwords, exec: Execution::default(), started: false, blocked: false, blocked_since: None },
+            Submission { kind: Kind::Commands, queue: 0, seq: 0, addr, dwords, exec: Execution::default(), started: false, blocked: false, blocked_since: None },
         );
         self.cv.notify_all();
     }
@@ -158,7 +193,7 @@ impl GpuQueue {
         let mut st = self.lock();
         Self::enqueue(
             &mut st,
-            Submission { kind: Kind::Commands, queue, addr, dwords, exec: Execution::default(), started: false, blocked: false, blocked_since: None },
+            Submission { kind: Kind::Commands, queue, seq: 0, addr, dwords, exec: Execution::default(), started: false, blocked: false, blocked_since: None },
         );
         self.cv.notify_all();
         true
@@ -174,6 +209,7 @@ impl GpuQueue {
             Submission {
                 kind: Kind::FrameBoundary,
                 queue: 0,
+                seq: 0,
                 addr: 0,
                 dwords: 0,
                 exec: Execution::default(),
@@ -389,6 +425,7 @@ impl GpuQueue {
             st.count -= 1;
             st.next_queue = (q + 1) % QUEUE_COUNT;
             st.processing = true;
+            st.processing_seq = s.seq;
             s
         };
 
@@ -485,5 +522,29 @@ impl GpuQueue {
     pub fn with_interpreter<R>(&self, queue: usize, f: impl FnOnce(&mut Interpreter) -> R) -> R {
         let mut interps = self.interpreters.lock().unwrap_or_else(|e| e.into_inner());
         f(interps[queue].get_or_insert_with(|| Interpreter::new(queue)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ticket passes once every submission enqueued before it completed,
+    /// and not before; later submissions do not hold it back.
+    #[test]
+    fn ticket_passes_when_earlier_submissions_completed() {
+        let q = GpuQueue::new(1);
+        assert!(q.passed(q.ticket()), "nothing queued");
+        q.suspend_point();
+        let first = q.ticket();
+        assert!(!q.passed(first));
+        q.suspend_point();
+        let second = q.ticket();
+        assert_eq!(q.process_one(), SliceResult::Completed);
+        assert!(q.passed(first));
+        assert!(!q.passed(second));
+        assert_eq!(q.process_one(), SliceResult::Completed);
+        assert!(q.passed(second));
+        assert_eq!(q.process_one(), SliceResult::NoWork);
     }
 }

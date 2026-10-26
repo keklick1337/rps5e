@@ -2,6 +2,14 @@
 
 All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.0-alpha.2] - 2026-10-27
+
+### Fixed
+
+- ASTRO BOT: tile-shaped holes, black sky and ghost images left from earlier frames ([#1](https://github.com/keklick1337/rps5e/issues/1)).
+- Torn frames in videos played through AvPlayer (ASTRO BOT intro).
+- Demon's Souls: a crash with an endless memory fault after a CPU write raced the GPU image cache.
+
 ## [0.1.0-alpha.1] - 2026-10-26
 
 First public alpha.
@@ -31,4 +39,5 @@ First public alpha.
 - The project is named RustPS5Emu (RPS5E): binaries `rps5e` and `rps5e-cli`, environment variables `RPS5E_*`, data, settings and caches under `rps5e` folders.
 - Release packages: `scripts/package.sh` (Linux tarball, Windows zip) with a `dist` build profile without debug info.
 
+[0.1.0-alpha.2]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.0-alpha.1

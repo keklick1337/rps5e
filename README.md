@@ -18,7 +18,7 @@ RustPS5Emu is a compatibility layer for PS5 games, in the spirit of Wine:
 - the system libraries (kernel, libc, graphics, audio, input, save data, networking, ...) are implemented in Rust (HLE);
 - the GPU command stream is translated to **Vulkan**, and RDNA shaders are recompiled to SPIR-V.
 
-**Status: alpha (0.1.0-alpha.1).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
+**Status: alpha (0.1.0-alpha.2).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
 
 `master` is the development branch: every change lands there first, so it has the newest fixes but can be unstable. Tagged versions on the [Releases](https://github.com/keklick1337/rps5e/releases) page come with prebuilt Linux and Windows archives.
 
