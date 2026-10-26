@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: System packages
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libvulkan-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libvulkan-dev libasound2-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

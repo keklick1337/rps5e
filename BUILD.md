@@ -17,6 +17,7 @@ Packages (names differ per distribution):
 - Rust (stable, via rustup or the distribution), a C compiler, `pkg-config`;
 - Vulkan loader and driver (`libvulkan.so.1`);
 - OpenSSL development files (`libssl-dev` / `openssl-devel`);
+- ALSA development files (`libasound2-dev` / `alsa-lib-devel`);
 - optional: FFmpeg development files (`libavformat`, `libavcodec`, `libavutil`, `libswscale`, `libswresample`) for in-game movies; without them movies are skipped;
 - optional at run time: SDL3 (`libSDL3.so`) for controllers; keyboard and mouse work without it.
 

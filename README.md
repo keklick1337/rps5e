@@ -67,7 +67,7 @@ All frames come from the emulator's own frame dump at the game's native resoluti
 
 ## Building
 
-Short version for Linux (Rust stable, a C compiler, `pkg-config`, Vulkan and OpenSSL development files; FFmpeg optional for movies):
+Short version for Linux (Rust stable, a C compiler, `pkg-config`, Vulkan, OpenSSL and ALSA development files; FFmpeg optional for movies):
 
 ```sh
 make build          # = cargo build --release
