@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: System packages
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libvulkan-dev libasound2-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --locked
@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: MinGW-w64
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 perl make
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
