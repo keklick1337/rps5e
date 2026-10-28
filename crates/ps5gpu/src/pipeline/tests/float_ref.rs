@@ -396,7 +396,7 @@ fn half_boundary_rows() -> Vec<Vec<u32>> {
             }
         }
     }
-    for v in [0x7F80_0000u32, 0xFF80_0000, 0x7FC0_0000, 0x7F80_0001, 0xFFFF_FFFF, 0x477F_F000, 0x477F_EFFF, 0x4780_0000] {
+    for v in [0x7F80_0000u32, 0xFF80_0000, 0x7FC0_0000, 0x7F80_0001, 0xFFFF_FFFF, 0x477F_F000, 0x477F_EFFF, 0x4780_0000, 0x7F7F_FFFF, 0xFF7F_FFFF, 0x5000_0000, 0x4780_0001] {
         rows.push(vec![v]);
     }
     rows

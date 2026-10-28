@@ -1205,7 +1205,8 @@ impl ShaderFrontend {
                 if let Some(cell) = record {
                     let mut g = cell.borrow_mut();
                     let (s, b) = &mut *g;
-                    b.download_window(s, a);
+                    log::trace!("ps5gpu: program {shader_base:#x} reads GPU-written word {a:#x} {}", crate::memory::history::describe(a, 6).unwrap_or_default());
+                    crate::backend::profile::preparing(shader_base, || b.download_window(s, a));
                 } else {
                     return None;
                 }

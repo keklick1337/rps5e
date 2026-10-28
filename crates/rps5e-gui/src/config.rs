@@ -30,6 +30,13 @@ pub const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 pub const SCALE_MODES: [(&str, &str); 3] =
     [("fit", "Fit (keep aspect ratio)"), ("stretch", "Stretch to the window"), ("integer", "Integer multiples")];
 
+/// Resolution of the emulated display (`RPS5E_DISPLAY_RESOLUTION`).
+pub const DISPLAY_RESOLUTIONS: [(&str, &str); 3] =
+    [("720p", "720p (1280x720)"), ("1080p", "1080p (1920x1080)"), ("2160p", "2160p (3840x2160)")];
+
+/// The default of [`EmulatorSettings::display_resolution`].
+pub const DEFAULT_DISPLAY_RESOLUTION: &str = "2160p";
+
 /// Scaling filter (`RPS5E_SCALE_FILTER`).
 pub const SCALE_FILTERS: [(&str, &str); 2] = [("linear", "Linear (smooth)"), ("nearest", "Nearest (sharp pixels)")];
 
@@ -87,6 +94,9 @@ pub struct EmulatorSettings {
     pub fullscreen: bool,
     /// HDR10 output for games that show HDR frames (`--hdr`, `RPS5E_HDR`).
     pub hdr: bool,
+    /// 720p | 1080p | 2160p: the emulated display games are told about
+    /// (`--display-resolution`, `RPS5E_DISPLAY_RESOLUTION`).
+    pub display_resolution: String,
     /// Performance overlay shown from the start (`--perf-overlay`; F10 toggles).
     pub perf_overlay: bool,
     /// Small FPS counter in the corner (`RPS5E_FPS_COUNTER`).
@@ -146,6 +156,7 @@ impl Default for EmulatorSettings {
             gpu_device: String::new(),
             fullscreen: false,
             hdr: false,
+            display_resolution: DEFAULT_DISPLAY_RESOLUTION.into(),
             perf_overlay: false,
             fps_counter: false,
             scale_mode: "fit".into(),
@@ -198,6 +209,7 @@ impl EmulatorSettings {
         put("gpu_device", self.gpu_device.clone());
         put("fullscreen", bool_text(self.fullscreen));
         put("hdr", bool_text(self.hdr));
+        put("display_resolution", self.display_resolution.clone());
         put("perf_overlay", bool_text(self.perf_overlay));
         put("fps_counter", bool_text(self.fps_counter));
         put("scale_mode", self.scale_mode.clone());
@@ -241,6 +253,10 @@ impl EmulatorSettings {
             "gpu_device" => self.gpu_device = value.trim().into(),
             "fullscreen" => self.fullscreen = b(value)?,
             "hdr" => self.hdr = b(value)?,
+            "display_resolution" => {
+                let v = ps5gpu::display::DisplayResolution::parse(value).ok_or_else(bad)?;
+                self.display_resolution = v.as_str().into();
+            }
             "perf_overlay" => self.perf_overlay = b(value)?,
             "fps_counter" => self.fps_counter = b(value)?,
             "scale_mode" => {
@@ -379,6 +395,7 @@ impl EmulatorSettings {
         };
         flag(self.fullscreen, "RPS5E_FULLSCREEN", "1");
         flag(self.hdr, "RPS5E_HDR", "1");
+        flag(self.display_resolution != DEFAULT_DISPLAY_RESOLUTION, "RPS5E_DISPLAY_RESOLUTION", &self.display_resolution);
         flag(self.perf_overlay, "RPS5E_PERF_OVERLAY", "1");
         flag(self.fps_counter, "RPS5E_FPS_COUNTER", "1");
         flag(self.scale_mode != "fit", "RPS5E_SCALE_MODE", &self.scale_mode);
@@ -552,6 +569,7 @@ mod tests {
         s.fast_paths = false;
         s.pause_in_menu = true;
         s.hdr = true;
+        s.display_resolution = "1080p".into();
         let mut t = EmulatorSettings::default();
         for (k, v) in s.to_map() {
             t.set(&k, &v).unwrap();
@@ -567,6 +585,14 @@ mod tests {
         assert!(t.set("hdr", "off").is_ok() && !t.hdr);
         assert!(!EmulatorSettings::default().hdr, "HDR is off by default");
         assert!(t.set("perf_overlay", "on").is_ok() && t.perf_overlay);
+        assert_eq!(EmulatorSettings::default().display_resolution, "2160p");
+        assert!(t.set("display_resolution", "1440p").is_err());
+        assert!(t.set("display_resolution", "").is_err());
+        assert!(t.set("display_resolution", " 720P ").is_ok() && t.display_resolution == "720p");
+        assert!(t.set("display_resolution", "4k").is_ok() && t.display_resolution == "2160p");
+        for (v, _) in DISPLAY_RESOLUTIONS {
+            assert!(t.set("display_resolution", v).is_ok() && t.display_resolution == v);
+        }
         assert!(t.set("elf", "../x").is_err());
         assert!(t.set("extra_env", "=1").is_err());
         assert!(t.set("nope", "1").unwrap_err().contains("Unknown"));
@@ -600,7 +626,7 @@ mod tests {
         assert!(get("RPS5E_INPUT_OVERRIDE").unwrap().contains("keyboard"));
         assert_eq!(get("RPS5E_HEADLESS"), None);
         // Defaults of the in-game menu settings add nothing.
-        for k in ["RPS5E_HDR", "RPS5E_FPS_COUNTER", "RPS5E_SCALE_MODE", "RPS5E_SCALE_FILTER", "RPS5E_FAST_PATHS", "RPS5E_VOLUME", "RPS5E_MENU_PAUSE"] {
+        for k in ["RPS5E_HDR", "RPS5E_DISPLAY_RESOLUTION", "RPS5E_FPS_COUNTER", "RPS5E_SCALE_MODE", "RPS5E_SCALE_FILTER", "RPS5E_FAST_PATHS", "RPS5E_VOLUME", "RPS5E_MENU_PAUSE"] {
             assert_eq!(get(k), None, "{k}");
         }
         assert_eq!(get("RPS5E_SAVEDATA_DIR"), None);
@@ -611,12 +637,18 @@ mod tests {
         s.scale_mode = "stretch".into();
         s.fast_paths = false;
         s.fps_counter = true;
+        s.display_resolution = "720p".into();
         let env = s.env(None, None, None);
         let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("RPS5E_VOLUME"), Some("35"));
         assert_eq!(get("RPS5E_SCALE_MODE"), Some("stretch"));
         assert_eq!(get("RPS5E_FAST_PATHS"), Some("0"));
         assert_eq!(get("RPS5E_FPS_COUNTER"), Some("1"));
+        assert_eq!(get("RPS5E_DISPLAY_RESOLUTION"), Some("720p"));
+        assert_eq!(
+            ps5gpu::display::DisplayResolution::parse(get("RPS5E_DISPLAY_RESOLUTION").unwrap()),
+            Some(ps5gpu::display::DisplayResolution::P720)
+        );
         // The emulator reads the value the launcher passes as "on".
         assert!(ps5gpu::display::parse_hdr(get("RPS5E_HDR").unwrap()));
         s.cheats = false;
@@ -629,12 +661,19 @@ mod tests {
         let mut c = GameConfigs::default();
         let mut s = EmulatorSettings::default();
         s.fullscreen = true;
+        s.display_resolution = "1080p".into();
         c.games.insert("/g/A".into(), GameConfig { title_id: "PPSA01234".into(), name: "A".into(), settings: s.clone() });
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(GameConfigs::parse(&text).unwrap(), c);
         let global = EmulatorSettings::default();
         assert!(c.effective("/g/A", &global).fullscreen);
         assert!(!c.effective("/g/B", &global).fullscreen);
+        assert_eq!(c.effective("/g/A", &global).display_resolution, "1080p");
+        assert_eq!(c.effective("/g/B", &global).display_resolution, "2160p");
+        // A games.toml written before the setting existed reads the default.
+        let old = text.replace("display_resolution = \"1080p\"\n", "");
+        assert_ne!(old, text);
+        assert_eq!(GameConfigs::parse(&old).unwrap().games["/g/A"].settings.display_resolution, "2160p");
 
         let json = c.export_json("/g/A").unwrap();
         let imp = parse_import(&json).unwrap();

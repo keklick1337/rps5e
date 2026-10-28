@@ -447,7 +447,8 @@ pub fn default_bindings() -> Vec<Binding> {
 }
 
 /// Defaults both keyboard sets share: the touch pad click, Create, mute,
-/// motion on the numpad and the touch pad gestures.
+/// motion on the numpad, the touch pad gestures and its left / right
+/// halves on Z / X.
 fn shared_extra_bindings() -> Vec<Binding> {
     use Control as C;
     use KeyCode as K;
@@ -469,6 +470,8 @@ fn shared_extra_bindings() -> Vec<Binding> {
         key(K::Delete, C::SwipeLeft),
         key(K::PageDown, C::SwipeRight),
         key(K::PageUp, C::TapCenter),
+        key(K::KeyZ, C::TouchLeft),
+        key(K::KeyX, C::TouchRight),
         key(K::Insert, C::TwoFingerTouch),
     ]
 }
@@ -1646,7 +1649,7 @@ mod tests {
     fn defaults_without_file() {
         let cfg = parse_config("").unwrap();
         assert_eq!(cfg, Config::default());
-        assert_eq!(cfg.bindings.len(), 52);
+        assert_eq!(cfg.bindings.len(), 54);
         assert_eq!(cfg.mode, DeviceMode::Auto);
         assert_eq!(cfg.players, 1);
     }

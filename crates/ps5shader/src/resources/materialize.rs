@@ -770,8 +770,24 @@ fn materialize_indirect_image(
     if material.len() != 4 || heap.len() != 4 {
         return Err(other("indirect image tables have invalid width"));
     }
+    // The program selects each record's image through the host table map
+    // (the heap's records from offset 0 on), reading its keys itself.
+    let entries = scalar_buffer_size(heap) / TABLE_ENTRY_BYTES;
+    let host_map = || {
+        (bindless_tables_enabled() && bindless_eligible(image) && entries <= BINDLESS_MAP_MAX_ENTRIES).then(|| {
+            let mut words = [0u32; 4];
+            words.copy_from_slice(heap);
+            IndirectImageTable { keys: vec![0], candidates: vec![0], descriptors: vec![vec![0; 8]], bindless: Some((words, 0, entries as u32)), ..Default::default() }
+        })
+    };
     let material_stride = (material[1] >> 16) & 0x3FFF;
     if material_stride != indirect.selector_stride {
+        // The records cannot be enumerated through this V# (a null V#, or
+        // records the planned stride does not describe): only the host
+        // map reaches every key the program may read.
+        if let Some(table) = host_map() {
+            return Ok(table);
+        }
         return Err(other("material table stride does not match the selector stride"));
     }
     let step = gcd(indirect.selector_stride as u64, 1u64 << 32);
@@ -835,18 +851,11 @@ fn materialize_indirect_image(
     }
     let mut table = finish_indirect_image(probed, keys)?;
     // Several candidates: the program selects the record's image through
-    // the host table map (the heap's records from offset 0 on).
-    let entries = scalar_buffer_size(heap) / TABLE_ENTRY_BYTES;
-    if table.descriptors.len() > 1 && bindless_tables_enabled() && bindless_eligible(image) && entries <= BINDLESS_MAP_MAX_ENTRIES {
-        let mut words = [0u32; 4];
-        words.copy_from_slice(heap);
-        return Ok(IndirectImageTable {
-            keys: vec![0],
-            candidates: vec![0],
-            descriptors: vec![vec![0; 8]],
-            bindless: Some((words, 0, entries as u32)),
-            ..Default::default()
-        });
+    // the host table map.
+    if table.descriptors.len() > 1 {
+        if let Some(map) = host_map() {
+            return Ok(map);
+        }
     }
     table.material_descriptor = material.to_vec();
     table.heap_descriptor = heap.to_vec();
@@ -1050,6 +1059,14 @@ fn materialize_table_image(
             }
             keys.sort_unstable();
             keys.dedup();
+            // The scan only narrows the table to the keys the records
+            // hold. Records that name no entry of it (a null or empty
+            // material V#: the program reads its key some other way, or
+            // reads zero) narrow nothing: the table modes below bind
+            // every entry the program may reach.
+            if keys.is_empty() {
+                material_mode = false;
+            }
             if keys.len() > BINDLESS_TABLE_SLOTS {
                 if bindless {
                     return Ok(host_map());
@@ -1084,7 +1101,14 @@ fn materialize_table_image(
         keys = (0..entries as u32).collect();
     }
     if keys.is_empty() {
-        return Err(other("bindless table selects no entry"));
+        return Err(other(format!(
+            "bindless table selects no entry (entries {entries}, material {} records of {} bytes, bindless {bindless}, offset {:#x}, material V# {:08x?}, heap V# {:08x?})",
+            if indirect.selector_stride != 0 { scalar_buffer_size(material) / indirect.selector_stride as u64 } else { 0 },
+            indirect.selector_stride,
+            table.entry_offset,
+            material,
+            heap
+        )));
     }
     let mut probed = Vec::with_capacity(keys.len());
     let mut shape: Option<(ImageNumericClass, u32)> = None;
@@ -2019,5 +2043,59 @@ mod emulated_compare_tests {
         // A 3D view, or X not red, is not emulated.
         assert_eq!(emulated_compare_state(&info, &[sampler.as_slice().into()], 0, &descriptor(13, image_format::TYPE_3D, 4)), 0);
         assert_eq!(emulated_compare_state(&info, &[sampler.as_slice().into()], 0, &descriptor(13, image_format::TYPE_2D, 5)), 0);
+    }
+}
+
+#[cfg(test)]
+mod table_image_tests {
+    use super::*;
+
+    fn sampled_2d() -> ImageResource {
+        ImageResource { resource_class: ImageResourceClass::Sampled, numeric_class: ImageNumericClass::Float, dimension: ImageDimension::Dim2D, read: true, ..ImageResource::new(0, 0) }
+    }
+
+    /// Material records that name no entry of a large table (here a null
+    /// material V#: the program reads key zero through it) narrow nothing:
+    /// the table is selected through the host table map instead of failing
+    /// the dispatch.
+    #[test]
+    fn material_records_naming_no_entry_select_through_the_host_map() {
+        let zero = |_: u64| Some(0u32);
+        let mut inputs = ResourceRuntimeInputs::new(&[], 0);
+        inputs.read_memory = Some(&zero);
+        inputs.read_clean_memory = Some(&zero);
+        let indirect = IndirectImageSelector::new(1, 0, 188, 0);
+        let table = TableImageSelector { entry_offset: 0, has_material: true };
+        let heap = [0x8000, 0, 64 * TABLE_ENTRY_BYTES as u32, 0];
+        let r = materialize_table_image(&indirect, table, &heap, &[0; 4], &sampled_2d(), None, &inputs).expect("table selected");
+        assert_eq!(r.bindless, Some((heap, 0, 64)));
+        // Records of a real material V# whose keys all lie past the table
+        // narrow nothing either.
+        let past = |a: u64| Some(if a >= 0x9000 { 1000u32 } else { 0 });
+        inputs.read_clean_memory = Some(&past);
+        let r = materialize_table_image(&indirect, table, &heap, &[0x9000, 0, 188 * 4, 0], &sampled_2d(), None, &inputs).expect("table selected");
+        assert_eq!(r.bindless, Some((heap, 0, 64)));
+    }
+
+    /// A material V# that does not describe the records the program reads
+    /// (here null: the program reads key zero through it) cannot be
+    /// enumerated; a heap the host table map can hold is selected through
+    /// it instead of failing the dispatch.
+    #[test]
+    fn unenumerable_material_selects_through_the_host_map() {
+        let bytes: Vec<u8> = 0xBF81_0000u32.to_le_bytes().to_vec();
+        let program = crate::program::decode_blob(&bytes, 0x10_0000).unwrap();
+        let plan = ShaderResourcePlan::extract(program, super::super::info::ShaderStage::Compute, 0x1234, 0, 4, None, 64).unwrap();
+        let zero = |_: u64| Some(0u32);
+        let mut inputs = ResourceRuntimeInputs::new(&[], 0);
+        inputs.read_memory = Some(&zero);
+        inputs.read_clean_memory = Some(&zero);
+        let indirect = IndirectImageSelector::new(0, 1, 188, 0);
+        let heap = [0x8000, 0, 64 * TABLE_ENTRY_BYTES as u32, 0];
+        let r = materialize_indirect_image(&plan, &indirect, &[0; 4], &heap, &sampled_2d(), &inputs, false).expect("table selected");
+        assert_eq!(r.bindless, Some((heap, 0, 64)));
+        // An image the map cannot hold (written) still fails.
+        let written = ImageResource { written: true, ..sampled_2d() };
+        assert!(materialize_indirect_image(&plan, &indirect, &[0; 4], &heap, &written, &inputs, false).is_err());
     }
 }

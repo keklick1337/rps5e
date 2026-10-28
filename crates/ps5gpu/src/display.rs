@@ -18,6 +18,9 @@
 //! - `RPS5E_HDR=1`: HDR10 output for games that flip PQ display buffers,
 //!   when the display offers an HDR10 surface format (default off; read at
 //!   start, see [`crate::hdr`]).
+//! - `RPS5E_DISPLAY_RESOLUTION=720p|1080p|2160p`: the resolution of the
+//!   emulated display the game is told about (default `2160p`; read once
+//!   at start, see [`display_resolution`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
@@ -195,6 +198,64 @@ pub fn hdr_enabled() -> bool {
     HDR.get("RPS5E_HDR", |s| Some(u8::from(parse_hdr(s))), 0) == 1
 }
 
+/// Resolution of the emulated display (the TV the console is connected
+/// to). Games that ask for it pick the size of their display buffers from
+/// it; the window scales whatever they show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DisplayResolution {
+    /// 1280x720.
+    P720,
+    /// 1920x1080.
+    P1080,
+    /// 3840x2160.
+    #[default]
+    P2160,
+}
+
+impl DisplayResolution {
+    pub const ALL: [DisplayResolution; 3] = [DisplayResolution::P720, DisplayResolution::P1080, DisplayResolution::P2160];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisplayResolution::P720 => "720p",
+            DisplayResolution::P1080 => "1080p",
+            DisplayResolution::P2160 => "2160p",
+        }
+    }
+
+    /// `720p`, `1080p`, `2160p` (also `4k`), any case.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("4k") {
+            return Some(DisplayResolution::P2160);
+        }
+        Self::ALL.into_iter().find(|m| m.as_str().eq_ignore_ascii_case(s))
+    }
+
+    /// Width and height in pixels.
+    pub fn size(self) -> (u32, u32) {
+        match self {
+            DisplayResolution::P720 => (1280, 720),
+            DisplayResolution::P1080 => (1920, 1080),
+            DisplayResolution::P2160 => (3840, 2160),
+        }
+    }
+}
+
+/// The emulated display's resolution (`RPS5E_DISPLAY_RESOLUTION`, default
+/// 2160p). Read once: the guest learns it when it starts. An invalid value
+/// is reported and the default used.
+pub fn display_resolution() -> DisplayResolution {
+    static RES: std::sync::OnceLock<DisplayResolution> = std::sync::OnceLock::new();
+    *RES.get_or_init(|| match std::env::var("RPS5E_DISPLAY_RESOLUTION") {
+        Ok(v) if !v.trim().is_empty() => DisplayResolution::parse(&v).unwrap_or_else(|| {
+            log::warn!("RPS5E_DISPLAY_RESOLUTION={v:?} is not 720p, 1080p or 2160p: using 2160p");
+            DisplayResolution::default()
+        }),
+        _ => DisplayResolution::default(),
+    })
+}
+
 /// What the window's surface offers for HDR output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HdrSurface {
@@ -289,6 +350,20 @@ mod tests {
         }
         assert_eq!(PresentMode::parse("FIFO"), Some(PresentMode::Fifo));
         assert_eq!(ScaleMode::parse("zoom"), None);
+    }
+
+    #[test]
+    fn display_resolution_names_and_sizes() {
+        for r in DisplayResolution::ALL {
+            assert_eq!(DisplayResolution::parse(r.as_str()), Some(r));
+        }
+        assert_eq!(DisplayResolution::parse(" 4K "), Some(DisplayResolution::P2160));
+        assert_eq!(DisplayResolution::parse("1080P"), Some(DisplayResolution::P1080));
+        assert_eq!(DisplayResolution::parse("1440p"), None);
+        assert_eq!(DisplayResolution::default(), DisplayResolution::P2160);
+        assert_eq!(DisplayResolution::P720.size(), (1280, 720));
+        assert_eq!(DisplayResolution::P1080.size(), (1920, 1080));
+        assert_eq!(DisplayResolution::P2160.size(), (3840, 2160));
     }
 
     #[test]

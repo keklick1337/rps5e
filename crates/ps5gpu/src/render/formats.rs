@@ -468,9 +468,15 @@ pub fn supports_dcc_fixed_clear(format: vk::Format) -> bool {
     )
 }
 
+/// DCC key of a 256-byte block compressed to one colour: the block
+/// decompresses to the element stored at its start. A "single" clear
+/// writes this key for every block and the clear colour at each block's
+/// start (the keys alone do not carry the colour).
+pub const DCC_CLEAR_SINGLE: u8 = 0x10;
+
 /// True for the byte codes a DCC fast clear leaves in metadata.
 pub fn is_dcc_clear_code(code: u8) -> bool {
-    matches!(code, 0x00 | 0x20 | 0x40 | 0x80 | 0xC0)
+    matches!(code, 0x00 | DCC_CLEAR_SINGLE | 0x20 | 0x40 | 0x80 | 0xC0)
 }
 
 /// The DCC clear code layout of a color target: true when the alpha flag

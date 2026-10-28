@@ -42,8 +42,9 @@ fn trace_hex(buf: &mut [u8], off: usize, val: u64) -> usize {
 /// Append one HLE call record to the trace file. Fully async-signal-safe:
 /// uses only libc::open/write, no allocation, no locks.
 /// Format: "nid rdi rsi rdx rcx rax caller tid\n" (arguments as on entry,
-/// tid = host thread id). `PS5_HLE_TRACE=/path` writes to that file instead
-/// of /tmp/hle_trace.txt.
+/// tid = host thread id). `PS5_HLE_TRACE=<file>` writes to that file
+/// (a relative path is relative to the current directory); `1` or an empty
+/// value writes `hle_trace.txt` in the current directory.
 fn trace_hle_call(nid: &str, args: [u64; 4], rax: u64, caller: u64) {
     let [rdi, rsi, rdx, rcx] = args;
     let fd = TRACE_FD.load(std::sync::atomic::Ordering::Relaxed);
@@ -55,8 +56,8 @@ fn trace_hle_call(nid: &str, args: [u64; 4], rax: u64, caller: u64) {
             return;
         };
         let value = value.to_string_lossy().into_owned();
-        let path = if std::path::Path::new(&value).is_absolute() { value } else { "/tmp/hle_trace.txt".to_string() };
-        let path = std::ffi::CString::new(path).unwrap_or_else(|_| c"/tmp/hle_trace.txt".to_owned());
+        let path = if value.is_empty() || value == "1" { "hle_trace.txt".to_string() } else { value };
+        let path = std::ffi::CString::new(path).unwrap_or_else(|_| c"hle_trace.txt".to_owned());
         let new_fd = unsafe {
             libc::open(
                 path.as_ptr() as *const libc::c_char,

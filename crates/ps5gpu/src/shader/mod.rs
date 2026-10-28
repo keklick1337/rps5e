@@ -218,6 +218,10 @@ pub struct EmitOptions {
     /// `s_buffer_load`: SGPR operands, no EXEC) once and both lane halves
     /// share the words, instead of loading them per half.
     pub smem_once: bool,
+    /// `RPS5E_BVH_VECTOR_LOADS`: a BVH node (64-byte aligned) is read with
+    /// one residency branch and 16-byte vector loads instead of a branch
+    /// per four dwords and one load per dword.
+    pub bvh_vector_loads: bool,
 }
 
 impl EmitOptions {
@@ -245,6 +249,7 @@ impl EmitOptions {
         half_fma_fast: false,
         lane_reductions: true,
         smem_once: true,
+        bvh_vector_loads: true,
     };
     /// Every exact switch on, on a device with every feature they use
     /// (tests).
@@ -272,6 +277,7 @@ impl EmitOptions {
         half_fma_fast: false,
         lane_reductions: false,
         smem_once: false,
+        bvh_vector_loads: false,
     };
 
     /// The switches from the environment (read once).
@@ -306,6 +312,7 @@ impl EmitOptions {
                 half_fma_fast: opt_in("RPS5E_HALF_FMA_FAST"),
                 lane_reductions: on("RPS5E_LANE_REDUCTIONS"),
                 smem_once: on("RPS5E_SMEM_ONCE"),
+                bvh_vector_loads: on("RPS5E_BVH_VECTOR_LOADS"),
             };
             if o.fast_transcendental {
                 log::warn!("[shader] RPS5E_FAST_TRANSCENDENTAL=1: v_exp/log/rcp/rsq/sqrt_f32 use the host's precision and special values");
@@ -862,7 +869,20 @@ impl SpirvCompiler {
         // halves of a paired invocation).
         let t_runs = std::time::Instant::now();
         if compute && lanes == 1 {
-            let runs = ps5shader::opt::exec_runs::group_exec_runs(&mut compiled.function, self.exec_run_minimum);
+            // A split plan names values and blocks of the function: the
+            // runs add branches and phis, so it is made again after them.
+            let before = split.as_ref().filter(|p| !p.slots.is_empty() || !p.fused.is_empty() || !p.riders.is_empty()).map(|_| compiled.function.clone());
+            let mut runs = ps5shader::opt::exec_runs::group_exec_runs(&mut compiled.function, self.exec_run_minimum);
+            if let (Some(before), true) = (before, runs > 0) {
+                match wave_split::plan(&compiled.function, r.local_size, r.local_data_share_dwords, &self.features, self.wave64_native_shuffles) {
+                    Ok(p) => split = Some(p),
+                    Err(why) => {
+                        log::debug!("[shader] cs {:#x}: no EXEC runs in the split program: {why}", r.program().address);
+                        compiled.function = before;
+                        runs = 0;
+                    }
+                }
+            }
             // Inside a run the written values are read without their EXEC
             // selects: flushes of flushed values show again.
             if runs > 0 && options.rewrites & translate::rewrites::FLUSH_ELISION != 0 {

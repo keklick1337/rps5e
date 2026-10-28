@@ -149,12 +149,12 @@
  "firmware": {
   "dir": "PS5-3.20_Libs",
   "total": {
-   "implemented": 3264,
+   "implemented": 3266,
    "total": 31275,
    "modules": 275,
    "entries": 39158,
    "modules_touched": 117,
-   "modules_complete": 33,
+   "modules_complete": 34,
    "implemented_outside": {
     "DbgAddressSanitizer": 7,
     "libKernel": 20,
@@ -178,6 +178,7 @@
     "libSceNpCppWebApi": 1,
     "libSceNpEntitlementAccess": 1,
     "libScePad": 5,
+    "libScePlayGo": 3,
     "libScePsml": 30,
     "libSceSaveData": 2,
     "libSceSharePlay": 1,
@@ -461,6 +462,12 @@
     "total": 30
    },
    {
+    "library": "libScePlayGo",
+    "implemented": 21,
+    "stub": 0,
+    "total": 21
+   },
+   {
     "library": "libSceUserService",
     "implemented": 19,
     "stub": 437,
@@ -483,12 +490,6 @@
     "implemented": 19,
     "stub": 4,
     "total": 23
-   },
-   {
-    "library": "libScePlayGo",
-    "implemented": 19,
-    "stub": 2,
-    "total": 21
    },
    {
     "library": "libSceNpTrophy2",
@@ -2058,7 +2059,7 @@
    "hle": 16,
    "lle": 0,
    "stub": 0,
-   "implemented": 19,
+   "implemented": 21,
    "total": 21
   },
   {

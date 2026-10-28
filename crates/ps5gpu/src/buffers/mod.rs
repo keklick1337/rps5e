@@ -25,6 +25,7 @@
 
 pub mod guest;
 mod through;
+mod written_words;
 
 use crate::device::{Buffer, GpuDevice, MemoryUse};
 use crate::memory::tracker::GuestPageTracker;
@@ -157,6 +158,10 @@ pub struct BufferStats {
     pub direct_downloads: u64,
     /// Downloads satisfied by waiting for a command-processor write-through.
     pub written_through_waits: u64,
+    /// Descriptor reads satisfied by the write-through that landed the word
+    /// (an older one than its page's newest).
+    pub word_landings: u64,
+    pub word_landing_us: u64,
     /// Ranges copied out to guest memory to release their mirrors
     /// ([`BufferCache::settle`]), and buffers / bytes collected.
     pub settled: u64,
@@ -234,6 +239,9 @@ pub struct BufferCache {
     /// to guest memory (through the import) at the tick: a CPU access waits
     /// for that tick only instead of downloading behind all queued work.
     written_through: through::ThroughSpans,
+    /// The exact ranges GPU work wrote and the write-throughs landing them
+    /// (descriptor reads next to newer writes, see [`Self::download_window`]).
+    written_words: written_words::WrittenWords,
     /// Tick of the last write-through recorded.
     last_through_tick: u64,
     /// GPU-written ranges to write through at the next submit (or CPU
@@ -532,6 +540,22 @@ fn descriptor_window() -> u64 {
     if crate::backend::ab::new_fast() { w } else { 0 }
 }
 
+/// `RPS5E_WRITTEN_WORDS=0`: a descriptor read waits for the newest
+/// write-through of the word's page, not the one that landed the word (see
+/// [`BufferCache::download_window`]). A/B scope `release`.
+fn written_words_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_WRITTEN_WORDS")) && crate::backend::ab::release_fast("RPS5E_WRITTEN_WORDS")
+}
+
+/// `RPS5E_DESC_WINDOW_TICKS=0`: a descriptor read downloads the whole
+/// window whatever the other pages wait for (see
+/// [`BufferCache::download_window`]). A/B scope `release`.
+fn window_ticks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_DESC_WINDOW_TICKS")) && crate::backend::ab::release_fast("RPS5E_DESC_WINDOW_TICKS")
+}
+
 pub(crate) fn parse_descriptor_window(v: Option<&str>) -> u64 {
     match v.map(|v| v.trim().parse::<u64>()) {
         Some(Ok(k)) => (k << 10).next_power_of_two().min(1 << 30) * (k != 0) as u64,
@@ -641,6 +665,7 @@ impl BufferCache {
             stats: BufferStats::default(),
             zero_copy: zero_copy_enabled(),
             written_through: through::ThroughSpans::default(),
+            written_words: Default::default(),
             last_through_tick: 0,
             pending_through: Vec::new(),
             readback: Default::default(),
@@ -1056,6 +1081,7 @@ impl BufferCache {
         if written {
             // GPU work may change these pages after any write-through.
             self.forget_written_through(addr, size);
+            self.written_words.written(addr, size);
         }
         // Written ranges the CPU may poll are written through to guest
         // memory after the work: small ranges whole, of a large range only
@@ -1333,8 +1359,10 @@ impl BufferCache {
                 self.stats.written_through_waits += 1;
             }
         }
+        let (staged, through_n, through_tick, current) = (runs.len(), through.len(), tick, sched.current_tick());
         let ok = runs.is_empty() || self.download_runs(sched, runs);
         self.stats.download_us += t0.elapsed().as_micros() as u64;
+        log::trace!("ps5gpu: sync download {addr:#x}+{size:#x}: {staged} run(s) copied, {through_n} written through (tick {through_tick}, current {current}), {} us", t0.elapsed().as_micros());
         ok
     }
 
@@ -1434,6 +1462,7 @@ impl BufferCache {
                 return true;
             }
             self.written_through.push(ThroughSpan { start, end, tick: sched.current_tick(), staged: None });
+            self.written_words.written_through(start, end, addr, size, sched.current_tick());
             self.note_landing(start, end - start, sched.current_tick());
             self.last_through_tick = sched.current_tick();
             return true;
@@ -1463,6 +1492,7 @@ impl BufferCache {
         }
         crate::memory::history::note(crate::memory::history::Event::Through, start, end - start, sched.current_tick());
         self.written_through.push(ThroughSpan { start, end, tick: sched.current_tick(), staged: None });
+        self.written_words.written_through(start, end, addr, size, sched.current_tick());
         self.note_landing(start, end - start, sched.current_tick());
         self.last_through_tick = sched.current_tick();
         true
@@ -1655,13 +1685,75 @@ impl BufferCache {
         }
     }
 
+    /// The guest-memory import holding `[addr, addr+size)` as a transfer
+    /// source (see [`guest::GuestImports::source_slice`]), when guest
+    /// memory is imported (resident guest memory, or the imports of
+    /// unranged reads) and one import covers the range.
+    pub fn guest_source(&mut self, addr: u64, size: u64) -> Option<(vk::Buffer, u64)> {
+        self.guest.as_mut().or(self.unranged.as_mut())?.source_slice(addr, size)
+    }
+
     /// A word at `addr` GPU work wrote is read on the CPU (a descriptor the
     /// host needs): the GPU-written pages of the aligned window around it
     /// are downloaded at once, so the other words of its table cost no
     /// further wait (`RPS5E_DESC_WINDOW_KIB`).
+    ///
+    /// A word GPU work wrote long ago whose page got a newer write-through
+    /// (a small write next to it) is read once its own write-through
+    /// completed ([`written_words`], `RPS5E_WRITTEN_WORDS=0`: the page's).
+    ///
+    /// When the word's page only waits for its write-through (the copy of
+    /// an earlier tick), the window takes only the pages whose data is in
+    /// guest memory by that tick too: a page GPU work recorded since (the
+    /// dispatch just before, writing next to the table) would make the read
+    /// wait for all the work recorded so far (`RPS5E_DESC_WINDOW_TICKS=0`:
+    /// the whole window).
     pub fn download_window(&mut self, sched: &mut Scheduler, addr: u64) -> bool {
         let w = descriptor_window().max(crate::memory::PAGE_BYTES);
-        self.download(sched, addr & !(w - 1), w)
+        let base = addr & !(w - 1);
+        let page = crate::memory::PAGE_BYTES;
+        let first = addr & !(page - 1);
+        if written_words_enabled() {
+            // The word itself landed with an older write-through than its
+            // page's newest: wait for that one only, and leave the page.
+            if let (Some(page_tick), Some(word_tick)) = (self.written_through_tick(first, page), self.written_words.landed(addr & !3, 4)) {
+                if word_tick <= page_tick {
+                    let t0 = std::time::Instant::now();
+                    sched.wait(word_tick);
+                    self.stats.word_landings += 1;
+                    self.stats.word_landing_us += t0.elapsed().as_micros() as u64;
+                    return true;
+                }
+            }
+        }
+        if !window_ticks_enabled() {
+            return self.download(sched, base, w);
+        }
+        let mut own = false;
+        self.tracker.for_each_download_range(first, page, false, &mut |_, _| own = true);
+        let Some(need) = own.then(|| self.written_through_tick(first, page)).flatten() else {
+            // A copy of the word's page waits for all the work recorded so
+            // far: the rest of the window comes at no extra wait.
+            return self.download(sched, base, w);
+        };
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        self.tracker.for_each_download_range(base, w, false, &mut |a, n| runs.push((a, n)));
+        let mut ok = self.download(sched, first, page);
+        for (a, n) in runs {
+            if a + n <= first || a >= first + page {
+                if self.written_through_tick(a, n).is_some_and(|t| t <= need) {
+                    ok &= self.download(sched, a, n);
+                }
+            } else {
+                // The run around the word's page: its other pages.
+                for (s, e) in [(a, first), (first + page, a + n)] {
+                    if s < e && self.written_through_tick(s, e - s).is_some_and(|t| t <= need) {
+                        ok &= self.download(sched, s, e - s);
+                    }
+                }
+            }
+        }
+        ok
     }
 
     /// The tick after which guest memory holds the GPU data of every page
@@ -1892,6 +1984,7 @@ impl BufferCache {
     pub fn unmap(&mut self, sched: &mut Scheduler, addr: u64, size: u64) {
         self.download(sched, addr, size);
         self.forget_written_through(addr, size);
+        self.written_words.forget(addr, size);
         self.settling.retain(|&(s, e, _)| e <= addr || s >= addr + size);
         self.pending_through.retain(|&(a, n)| a + n <= addr || a >= addr + size);
         self.readback.remove(addr, size);

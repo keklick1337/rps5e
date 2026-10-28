@@ -517,6 +517,16 @@ struct TargetMemo {
 /// Per-slice metadata clears: (layer, clear value).
 type SliceClears = smallvec::SmallVec<[(u32, vk::ClearColorValue); 4]>;
 
+/// How a layer under single-colour DCC keys is cleared.
+enum SingleClear {
+    /// Cleared to this value (the colour read from guest memory).
+    Value(vk::ClearColorValue),
+    /// Filled on the GPU from the colour GPU work stored.
+    Filled,
+    /// Not a clear the back-end can reproduce.
+    Undecided,
+}
+
 /// Two clear values with the same bits.
 fn same_clear(a: &vk::ClearColorValue, b: &vk::ClearColorValue) -> bool {
     // SAFETY: every member of the clear value union is plain data of the same size.
@@ -1090,9 +1100,91 @@ impl Backend {
             }
             b
         };
-        let value = t.metadata_clear(code, cmask)?;
+        let value = if !cmask && code == crate::render::formats::DCC_CLEAR_SINGLE {
+            match self.dcc_single_clear(t, (addr - base) / slice) {
+                SingleClear::Value(v) => v,
+                SingleClear::Filled => {
+                    // The image holds the colour already: nothing to clear.
+                    self.consume_metadata_clear(addr, slice);
+                    return None;
+                }
+                SingleClear::Undecided => return None,
+            }
+        } else {
+            t.metadata_clear(code, cmask)?
+        };
         self.consume_metadata_clear(addr, slice);
         Some(value)
+    }
+
+    /// Layer `layer` of `t` whose DCC keys all hold the single-colour code:
+    /// every 256-byte block is the element stored at its start (a clear
+    /// writes one colour to every block start). Block starts the GPU wrote
+    /// stay there: the layer is filled from the first one on the GPU
+    /// (reading it back would wait for the GPU each frame). Block starts in
+    /// guest memory give the clear value; the first, middle and last must
+    /// agree (blocks of different colours are not a clear).
+    fn dcc_single_clear(&mut self, t: &ColorTarget, layer: u64) -> SingleClear {
+        const BLOCK: u64 = 256;
+        let bpe = t.format.bytes_per_element as u64;
+        let blocks = t.slice_size / BLOCK;
+        if blocks == 0 || bpe == 0 || bpe > 8 {
+            crate::log_once(&format!("ps5gpu: single-colour DCC clear of {:#x} ({:?}, {bpe} bytes per element) not decoded", t.base, t.format.host));
+            return SingleClear::Undecided;
+        }
+        let data = t.base + layer * t.slice_size;
+        if self.buffers.has_gpu_dirty(data, bpe) {
+            return if self.dcc_single_fill_on_gpu(t, layer, data, bpe) { SingleClear::Filled } else { SingleClear::Undecided };
+        }
+        let mut element = None;
+        for block in [0, blocks / 2, blocks - 1] {
+            let at = data + block * BLOCK;
+            if self.buffers.has_gpu_dirty(at, bpe) && !self.buffers.download(&mut self.sched, at, bpe) {
+                return SingleClear::Undecided;
+            }
+            let mut bytes = [0u8; 8];
+            if !self.memory.read_backing(at, &mut bytes[..bpe as usize]) {
+                return SingleClear::Undecided;
+            }
+            match element {
+                None => element = Some(bytes),
+                Some(e) if e == bytes => {}
+                Some(_) => {
+                    crate::log_once(&format!("ps5gpu: single-colour DCC keys of {:#x} over blocks of different colours: not a clear", t.base));
+                    return SingleClear::Undecided;
+                }
+            }
+        }
+        let Some(e) = element else { return SingleClear::Undecided };
+        match t.stored_clear([u32::from_le_bytes(e[0..4].try_into().unwrap()), u32::from_le_bytes(e[4..8].try_into().unwrap())]) {
+            Some(v) => SingleClear::Value(v),
+            None => SingleClear::Undecided,
+        }
+    }
+
+    /// [`Self::dcc_single_clear`] of a layer whose first block start the GPU
+    /// wrote: the layer of the target's image is filled with that element
+    /// on the GPU. Only for single-layer images whose host texels are the
+    /// stored elements (no transform); false otherwise.
+    fn dcc_single_fill_on_gpu(&mut self, t: &ColorTarget, layer: u64, element: u64, bpe: u64) -> bool {
+        if t.format.transform() != crate::tiler::ColorTransform::None {
+            return false;
+        }
+        let Ok(id) = self.images.find_or_create(&mut self.sched, &mut self.buffers, &color_key(t)) else { return false };
+        if self.images.get(id).is_none_or(|i| i.key.slices() != 1) || layer != 0 {
+            return false;
+        }
+        let Ok(src) = self.buffers.obtain(&mut self.sched, element, bpe, false) else { return false };
+        // The fill covers the whole image: its memory is the GPU's.
+        self.images.prepare(&mut self.sched, &mut self.buffers, id, true);
+        if !self.images.fill_layer_with_element(&mut self.sched, id, 0, (src.buffer, src.offset), bpe) {
+            return false;
+        }
+        self.stats.color_clears += 1;
+        if crate::pipeline::trace::active() {
+            crate::pipeline::trace::log(&format!("    (DCC single-colour clear of color target #{id} {:#x} from its first block on the GPU)", t.base));
+        }
+        true
     }
 
     /// Consume a metadata clear of `[addr, addr+slice)`: the metadata now
@@ -1669,7 +1761,10 @@ impl Backend {
             // Debug: the colour targets as the pass finds them.
             let seq = crate::pipeline::trace::peek_seq();
             for &(t, id) in &targets.colors {
-                crate::pipeline::trace::dump_image(&self.dev, &mut self.sched, &mut self.images, id, seq, &format!("pre{}", t.slot));
+                let what = format!("pre{}", t.slot);
+                if crate::pipeline::trace::dump_wanted(seq, &what) {
+                    crate::pipeline::trace::dump_image(&self.dev, &mut self.sched, &mut self.images, id, seq, &what);
+                }
             }
         }
         if targets.colors.is_empty() && targets.depth.is_none() && !d.shaders.ps.bound() {
@@ -1973,7 +2068,7 @@ impl Backend {
     /// fills covering them) or reloaded, DCC keys holding a clear code clear
     /// their surface, HTILE fills clear depth at the next bind. False when
     /// the pattern is not one repeated dword.
-    fn run_fill_kernel(&mut self, base: u64, bytes: u64, pattern: [u32; 4]) -> bool {
+    pub(crate) fn run_fill_kernel(&mut self, base: u64, bytes: u64, pattern: [u32; 4]) -> bool {
         let p = pattern[0];
         if pattern.iter().any(|&w| w != p) || bytes == 0 || base % 4 != 0 {
             return false;
@@ -1986,10 +2081,13 @@ impl Backend {
         if crate::pipeline::trace::active() {
             crate::pipeline::trace::log(&format!("    (fill kernel: {base:#x}+{bytes:#x} = {p:08x})"));
         }
-        if self.htile.contains(&base) || self.cmask.contains(&base) {
+        let dcc = self.dcc_targets.get(&base).copied();
+        // Single-colour DCC keys: the colour is stored in the surface's
+        // blocks, which the clear writes after the keys; the bind decides.
+        let single = dcc.is_some() && p == u32::from_ne_bytes([crate::render::formats::DCC_CLEAR_SINGLE; 4]);
+        if self.htile.contains(&base) || self.cmask.contains(&base) || single {
             self.images.note_fill(base, bytes, p);
         }
-        let dcc = self.dcc_targets.get(&base).copied();
         self.images.filled(&mut self.sched, base, base + bytes, p);
         if let Some(t) = dcc {
             let code = p as u8;
@@ -3814,14 +3912,26 @@ pub(crate) mod profile {
     }
     /// Synchronous downloads (the caller waits for the GPU) by call site
     /// and 64 KiB window: (count, ns).
-    type SiteKey = (&'static str, u32, u64);
+    type SiteKey = (&'static str, u32, u64, u64);
+    std::thread_local! {
+        /// Guest address of the program whose resource preparation runs on
+        /// this thread (0: none): synchronous downloads name it.
+        static PREPARING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    /// Run `f` with `program` noted as the program being prepared.
+    pub fn preparing<T>(program: u64, f: impl FnOnce() -> T) -> T {
+        let old = PREPARING.with(|c| c.replace(program));
+        let r = f();
+        PREPARING.with(|c| c.set(old));
+        r
+    }
     type SiteMap = std::collections::HashMap<SiteKey, (u64, u64)>;
     static DOWNLOADS: std::sync::Mutex<Option<SiteMap>> = std::sync::Mutex::new(None);
     pub struct DownloadSite(Option<(SiteKey, std::time::Instant)>);
     impl DownloadSite {
         pub fn new(at: &'static std::panic::Location<'static>, addr: u64) -> Self {
             let file = at.file().rsplit('/').next().unwrap_or("");
-            DownloadSite(on().then(|| ((file, at.line(), addr & !0xFFFF), std::time::Instant::now())))
+            DownloadSite(on().then(|| ((file, at.line(), addr & !0xFFFF, PREPARING.with(|c| c.get())), std::time::Instant::now())))
         }
     }
     impl Drop for DownloadSite {
@@ -3835,12 +3945,57 @@ pub(crate) mod profile {
             }
         }
     }
+    /// Full barriers by call site: count.
+    static BARRIERS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32), u64>>> = std::sync::Mutex::new(None);
+    /// `RPS5E_BARRIER_SITES=1` (with the profile): full barriers counted by
+    /// call site in the summary.
+    fn barrier_sites() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RPS5E_BARRIER_SITES").is_ok_and(|v| v == "1"))
+    }
+    pub fn note_full_barrier(at: &'static std::panic::Location<'static>) {
+        if !barrier_sites() || !on() {
+            return;
+        }
+        let file = at.file().rsplit('/').next().unwrap_or("");
+        let mut g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+        *g.get_or_insert_with(Default::default).entry((file, at.line())).or_default() += 1;
+    }
+    /// Blocking GPU waits by call site: count and wall nanoseconds.
+    static WAITS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32, u64), (u64, u64)>>> = std::sync::Mutex::new(None);
+    /// `RPS5E_BARRIER_SITES=1` (with the profile) also counts the GPU waits
+    /// that blocked, by call site.
+    pub fn wait_sites() -> bool {
+        barrier_sites() && on()
+    }
+    pub fn note_wait(at: &'static std::panic::Location<'static>, ns: u64) {
+        let file = at.file().rsplit('/').next().unwrap_or("");
+        let mut g = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        let program = PREPARING.with(|c| c.get());
+        let e = g.get_or_insert_with(Default::default).entry((file, at.line(), program)).or_default();
+        e.0 += 1;
+        e.1 += ns;
+    }
+    fn wait_line() -> String {
+        let g = WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = g.as_ref() else { return String::new() };
+        let mut v: Vec<(&(&str, u32, u64), &(u64, u64))> = m.iter().collect();
+        v.sort_unstable_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        v.iter().take(12).map(|((f, l, p), (n, ns))| if *p != 0 { format!("{f}:{l}<-p{p:#x}:{n}/{}ms", ns / 1_000_000) } else { format!("{f}:{l}:{n}/{}ms", ns / 1_000_000) }).collect::<Vec<_>>().join(" ")
+    }
+    fn barrier_line() -> String {
+        let g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = g.as_ref() else { return String::new() };
+        let mut v: Vec<(&(&str, u32), &u64)> = m.iter().collect();
+        v.sort_unstable_by(|a, b| b.1.cmp(a.1));
+        v.iter().take(8).map(|((f, l), n)| format!("{f}:{l}:{n}")).collect::<Vec<_>>().join(" ")
+    }
     fn download_line() -> String {
         let g = DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = g.as_ref() else { return String::new() };
         let mut v: Vec<(&SiteKey, &(u64, u64))> = m.iter().collect();
         v.sort_unstable_by(|a, b| b.1 .1.cmp(&a.1 .1));
-        v.iter().take(8).map(|((f, l, a), (n, ns))| format!("{f}:{l}@{a:#x}:{n}/{}ms", ns / 1_000_000)).collect::<Vec<_>>().join(" ")
+        v.iter().take(8).map(|((f, l, a, p), (n, ns))| if *p != 0 { format!("{f}:{l}@{a:#x}<-p{p:#x}:{n}/{}ms", ns / 1_000_000) } else { format!("{f}:{l}@{a:#x}:{n}/{}ms", ns / 1_000_000) }).collect::<Vec<_>>().join(" ")
     }
     static WRITE_FAULT_WINDOW: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     static WRITE_FAULT_COUNT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
@@ -3922,7 +4077,7 @@ pub(crate) mod profile {
             .collect();
         faults.sort_unstable_by(|a, b| b.cmp(a));
         let top: Vec<String> = faults.iter().take(6).map(|(ns, n, a, w, rip)| format!("{a:#x}:{n}/{}ms{}@rip{rip:#x}{}", ns / 1_000_000, writer_of(*w), host_symbol(*rip))).collect();
-        format!( " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {}", parts.join(" "), top.join(" "), iw.join(" "), write_fault_line(), download_line())
+        format!( " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {} | full barriers: {} | gpu waits: {}", parts.join(" "), top.join(" "), iw.join(" "), write_fault_line(), download_line(), barrier_line(), wait_line())
     }
 }
 
@@ -4505,7 +4660,7 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | retiles: {}", b.images.retile_top(40)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -4530,6 +4685,7 @@ fn summary_locked() -> Option<String> {
             i.writebacks,
             i.conversions,
             i.retiles,
+            i.import_uploads,
             i.direct_copies,
             i.reused,
             i.discards,
@@ -4556,6 +4712,8 @@ fn summary_locked() -> Option<String> {
             bf.download_us / 1000,
             bf.direct_downloads,
             bf.written_through_waits,
+            bf.word_landings,
+            bf.word_landing_us / 1000,
             bf.gpu_copies,
             bf.gpu_fills,
             bf.gpu_writes,
@@ -4608,7 +4766,7 @@ fn summary_locked() -> Option<String> {
             b.dev.arena.stats().used_bytes >> 20,
             provider
         ) + &format!(" unranged-syncs={}/{}buf", bf.unranged_syncs, bf.unranged_synced_buffers) + &format!(" watch-index-misses={}", crate::images::WATCH_INDEX_MISSES.load(Ordering::Relaxed))
-            + &gpu_time_line(b.sched.stats().gpu, &b.sched.gpu_top(10))
+            + &gpu_time_line(b.sched.stats().gpu, &b.sched.gpu_top(gpu_top_count()))
             + &profile::line()
             + &ab::line()
             + &b.buffers.import_stats().map_or(String::new(), |g| {
@@ -4630,6 +4788,13 @@ fn summary_locked() -> Option<String> {
                 )
             })
     })
+}
+
+/// `RPS5E_GPU_TOP=<n>`: programs listed in the profile's top shaders
+/// (default 10).
+fn gpu_top_count() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("RPS5E_GPU_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(10))
 }
 
 /// GPU execution time of the submitted command buffers (profile only).

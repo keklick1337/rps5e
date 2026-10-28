@@ -9,10 +9,10 @@ text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 .num{font-variant-numeric:tabular-nums}
 </style>
 <rect class="bg" x="0" y="0" width="1000" height="696" rx="8"/>
-<g><title>Firmware 3.20 functions: 3264 / 31275</title>
+<g><title>Firmware 3.20 functions: 3266 / 31275</title>
 <text class="ink2 num" x="16.0" y="34" font-size="13" text-anchor="start">Firmware 3.20 functions</text>
 <text class="ink num" x="16.0" y="70" font-size="30" text-anchor="start" font-weight="600">10.4%</text>
-<text class="mute num" x="16.0" y="92" font-size="11.5" text-anchor="start">3,264 / 31,275 with an HLE implementation</text>
+<text class="mute num" x="16.0" y="92" font-size="11.5" text-anchor="start">3,266 / 31,275 with an HLE implementation</text>
 <rect class="track" x="16.0" y="104" width="230.0" height="6" rx="3"/>
 <rect class="s1" x="16.0" y="104" width="24.0" height="6" rx="3"/>
 </g>

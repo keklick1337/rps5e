@@ -1385,6 +1385,18 @@ impl CachedImage {
     }
 }
 
+/// `RPS5E_IMPORT_UPLOADS=0`: a texture upload that does not fit the full
+/// staging ring copies guest memory into a fresh upload buffer. On (the
+/// default), with guest memory imported, it reads the texels straight from
+/// the import: no buffer allocation and no CPU copy (thousands of textures
+/// at once when GTA V enters the city). Uploads that fit the ring keep it:
+/// reading every texture from the import made ASTRO BOT upload and retile
+/// twice as many images per frame. A/B scope `release`.
+fn import_uploads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_IMPORT_UPLOADS")) && crate::backend::ab::release_fast("RPS5E_IMPORT_UPLOADS")
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImageStats {
     pub images: usize,
@@ -1399,6 +1411,8 @@ pub struct ImageStats {
     /// Images refilled from newer overlapping images through their guest
     /// layout on the GPU.
     pub retiles: u64,
+    /// Uploads copied straight out of the guest-memory import.
+    pub import_uploads: u64,
     /// Conversions and retiles done as one image copy.
     pub direct_copies: u64,
     /// GPU-modified images that took the pages written into them since
@@ -3402,6 +3416,16 @@ impl ImageCache {
             self.staging.buffer.flush(off, size);
             return Some((self.staging.buffer.buffer, off));
         }
+        if import_uploads_enabled() && !buffers.has_gpu_dirty(addr, size) {
+            // The staging ring is full (thousands of textures in one tick
+            // when GTA V enters the city): with guest memory imported the
+            // copy reads the texels from the import instead of a fresh
+            // upload buffer filled by the CPU.
+            if let Some((buffer, off)) = buffers.guest_source(addr, size).filter(|&(_, off)| off % 256 == 0) {
+                self.stats.import_uploads += 1;
+                return Some((buffer, off));
+            }
+        }
         let tmp = Buffer::new(&self.dev, size, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER, MemoryUse::Upload).ok()?;
         let readable = self.memory.read_committed(addr, &mut tmp.bytes_mut()[..size as usize]);
         tmp.flush(0, size);
@@ -4116,6 +4140,49 @@ impl ImageCache {
 
     /// Clear `layers` layers from `base_layer` of every level of colour
     /// image `id` (depth slices of a volume, through an attachment view).
+    /// Fill layer `layer` of the 2D colour image `id` with one element the
+    /// GPU holds at `src` (buffer, offset; `bpe` bytes in the host
+    /// format): the element is doubled in the scratch buffer up to a whole
+    /// layer, which is copied in. No CPU read (a DCC single-colour clear
+    /// whose colour GPU work stored). False when the image cannot be
+    /// filled so.
+    pub fn fill_layer_with_element(&mut self, sched: &mut Scheduler, id: u64, layer: u32, src: (vk::Buffer, u64), bpe: u64) -> bool {
+        let Some(img) = self.images.get(&id) else { return false };
+        if img.key.dim != ImageDim::D2 || img.key.samples != 1 || img.key.is_depth() || layer >= img.key.slices() || bpe == 0 {
+            return false;
+        }
+        let (w, h, image) = (img.key.width, img.key.height, img.image.image);
+        let total = w as u64 * h as u64 * bpe;
+        let Some(scratch) = self.tiled.get(&self.dev, sched, total) else { return false };
+        crate::slice_shadow::hole(crate::slice_shadow::Hole::ImageClear);
+        self.changed(id);
+        before_buffer_work(sched);
+        let copy = |sched: &mut Scheduler, from: vk::Buffer, src_offset: u64, dst_offset: u64, size: u64| {
+            let region = vk::BufferCopy { src_offset, dst_offset, size };
+            // SAFETY: recording buffer; both buffers alive for the tick.
+            unsafe { self.dev.device.cmd_copy_buffer(sched.ordered_cmd(), from, scratch, &[region]) };
+            sched.memory_barrier(
+                (vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE),
+                (vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE),
+            );
+        };
+        copy(sched, src.0, src.1, 0, bpe);
+        let mut filled = bpe;
+        while filled < total {
+            let n = filled.min(total - filled);
+            copy(sched, scratch, 0, filled, n);
+            filled += n;
+        }
+        self.transit(sched, id, TRANSFER_DST, Some(SubRange { base_level: 0, levels: 1, base_layer: layer, layers: 1 }));
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: layer, layer_count: 1 })
+            .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+        // SAFETY: recording buffer; the layer is in TRANSFER_DST layout.
+        unsafe { self.dev.device.cmd_copy_buffer_to_image(sched.ordered_cmd(), scratch, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]) };
+        self.mark_gpu_written(id, sched.current_tick());
+        true
+    }
+
     pub fn clear_color_layers(&mut self, sched: &mut Scheduler, id: u64, value: vk::ClearColorValue, base_layer: u32, layers: u32) {
         let t = sched.time_item_begin(crate::scheduler::gpu_timer::label::IMG_CLEAR);
         let r = self.clear_color_layers_timed(sched, id, value, base_layer, layers);

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 //! Debugging options of one run ("Run with..."): log filter, GPU profile,
-//! performance overlay, shader compile wait, HLE call trace and frame
-//! dumps. They go on top of the game's configuration as the environment
+//! performance overlay, display resolution, shader compile wait, HLE call
+//! trace and frame dumps. They go on top of the game's configuration as the environment
 //! variables the emulator reads, and the launcher keeps the last ones used
 //! per game.
 
@@ -34,6 +34,9 @@ pub struct RunOptions {
     pub gpu_profile: u8,
     /// Performance overlay from the start (`RPS5E_PERF_OVERLAY`).
     pub perf_overlay: bool,
+    /// Emulated display resolution (`RPS5E_DISPLAY_RESOLUTION`): empty =
+    /// the game's settings, else 720p, 1080p or 2160p.
+    pub display_resolution: String,
     /// Per-frame wait for shaders still compiling: empty = the default
     /// (3 ms), `exact` = draws always wait, else milliseconds
     /// (`RPS5E_COMPILE_WAIT_MS`).
@@ -59,6 +62,7 @@ impl Default for RunOptions {
             rust_log: String::new(),
             gpu_profile: 0,
             perf_overlay: false,
+            display_resolution: String::new(),
             compile_wait: String::new(),
             hle_trace: false,
             hle_trace_file: String::new(),
@@ -82,6 +86,7 @@ impl RunOptions {
         self.rust_log.trim().is_empty()
             && self.gpu_profile == 0
             && !self.perf_overlay
+            && self.display_resolution.trim().is_empty()
             && self.compile_wait.trim().is_empty()
             && !self.hle_trace
             && !self.dump_frames
@@ -95,6 +100,10 @@ impl RunOptions {
         }
         if self.rust_log.trim().contains(char::is_whitespace) {
             return Err("The log filter has no spaces (e.g. info,ps5gpu=debug)".into());
+        }
+        let r = self.display_resolution.trim();
+        if !r.is_empty() && ps5gpu::display::DisplayResolution::parse(r).is_none() {
+            return Err(format!("Display resolution \"{r}\": 720p, 1080p or 2160p"));
         }
         if self.gpu_profile > 2 {
             return Err("GPU profile: 0, 1 or 2".into());
@@ -137,6 +146,9 @@ impl RunOptions {
         }
         if self.perf_overlay {
             set("RPS5E_PERF_OVERLAY", "1".into());
+        }
+        if let Some(r) = ps5gpu::display::DisplayResolution::parse(&self.display_resolution) {
+            set("RPS5E_DISPLAY_RESOLUTION", r.as_str().into());
         }
         match self.compile_wait.trim() {
             "" => {}
@@ -183,6 +195,9 @@ impl RunOptions {
         }
         if self.perf_overlay {
             parts.push("overlay".into());
+        }
+        if let Some(r) = ps5gpu::display::DisplayResolution::parse(&self.display_resolution) {
+            parts.push(format!("{} display", r.as_str()));
         }
         match self.compile_wait.trim() {
             "" => {}
@@ -236,6 +251,7 @@ mod tests {
             rust_log: " info,ps5gpu=debug ".into(),
             gpu_profile: 2,
             perf_overlay: true,
+            display_resolution: "1080p".into(),
             compile_wait: "Exact".into(),
             hle_trace: true,
             hle_trace_after: 30,
@@ -244,18 +260,23 @@ mod tests {
             ..Default::default()
         };
         assert!(!o.is_default() && o.validate().is_ok());
-        let mut env = vec![("RUST_LOG".to_string(), "warn".to_string()), ("RPS5E_PRESENT_MODE".into(), "fifo".into())];
+        let mut env = vec![
+            ("RUST_LOG".to_string(), "warn".to_string()),
+            ("RPS5E_PRESENT_MODE".into(), "fifo".into()),
+            ("RPS5E_DISPLAY_RESOLUTION".into(), "720p".into()),
+        ];
         o.apply(&mut env, dbg);
         assert_eq!(get(&env, "RUST_LOG"), Some("info,ps5gpu=debug"), "replaces the game's level");
         assert_eq!(get(&env, "RPS5E_PRESENT_MODE"), Some("fifo"));
         assert_eq!(get(&env, "RPS5E_GPU_PROFILE"), Some("2"));
         assert_eq!(get(&env, "RPS5E_PERF_OVERLAY"), Some("1"));
+        assert_eq!(get(&env, "RPS5E_DISPLAY_RESOLUTION"), Some("1080p"), "replaces the game's resolution");
         assert_eq!(get(&env, "RPS5E_COMPILE_WAIT_MS"), Some("exact"));
         assert_eq!(get(&env, "PS5_HLE_TRACE").map(PathBuf::from), Some(dbg.join("hle.txt")));
         assert_eq!(get(&env, "PS5_HLE_TRACE_AFTER"), Some("30"));
         assert_eq!(get(&env, "RPS5E_DUMP_FRAMES").map(PathBuf::from), Some(dbg.join("frames")));
         assert_eq!(get(&env, "RPS5E_DUMP_EVERY"), Some("10"));
-        assert_eq!(o.summary(), "log info,ps5gpu=debug, detailed GPU profile, overlay, exact shaders, HLE trace, frames every 10");
+        assert_eq!(o.summary(), "log info,ps5gpu=debug, detailed GPU profile, overlay, 1080p display, exact shaders, HLE trace, frames every 10");
         // Explicit places and a millisecond budget.
         let o = RunOptions {
             compile_wait: "12".into(),
@@ -284,6 +305,7 @@ mod tests {
         assert!(bad(&|o| o.compile_wait = "soon".into()));
         assert!(bad(&|o| o.rust_log = "info debug".into()));
         assert!(bad(&|o| o.gpu_profile = 3));
+        assert!(bad(&|o| o.display_resolution = "1440p".into()));
         assert!(bad(&|o| {
             o.dump_frames = true;
             o.dump_every = 0

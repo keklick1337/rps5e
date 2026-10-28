@@ -79,7 +79,7 @@ pub struct Emitter<'a, 'p> {
     prologue_open: bool,
     pub exts: BTreeSet<&'static str>,
     /// Definitions per lane half.
-    defs: Vec<[Word; 2]>,
+    pub(crate) defs: Vec<[Word; 2]>,
     /// Values emitted in the branch of a lazy select rather than in their
     /// block ([`Self::plan_lazy_selects`]).
     deferred: Vec<bool>,
@@ -1085,6 +1085,10 @@ impl<'a, 'p> Emitter<'a, 'p> {
 
     /// The SPIR-V id of an IR value (constants and undefs on demand).
     pub fn val(&mut self, v: Value) -> R<Word> {
+        if self.split.as_ref().is_some_and(|s| s.is_slot(v)) {
+            // Held as lane slots: this invocation's own word.
+            return super::wave_split::slot_lane_word(self, v);
+        }
         let d = self.defs[v.index()][self.half];
         if d != 0 {
             return Ok(d);
@@ -1170,11 +1174,24 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.begin(label);
         self.cse_enter_block(blk.index());
         let bd = self.f.block(blk).clone();
+        let mut phis_done = false;
         for &v in &bd.insts {
             if self.deferred.get(v.index()).copied().unwrap_or(false) {
                 continue;
             }
+            if !phis_done && self.f.op(v) != Op::Phi {
+                phis_done = true;
+                if self.split.is_some() {
+                    super::wave_split::phi_entries(self, blk);
+                }
+            }
             self.emit_value(v).map_err(|e| format!("%{} = {}: {e}", v.0, self.f.op(v).name()))?;
+        }
+        if !phis_done && self.split.is_some() {
+            super::wave_split::phi_entries(self, blk);
+        }
+        if self.split.is_some() {
+            super::wave_split::phi_exits(self, blk)?;
         }
         self.exits[blk.index()] = self.cur_label;
         let lab = |e: &Self, b: Block| -> R<Word> {
@@ -1242,8 +1259,15 @@ impl<'a, 'p> Emitter<'a, 'p> {
                 return Err(format!("phi %{} has {} arguments for {} predecessors", v.0, args.len(), preds.len()));
             }
             let mut ops = Vec::new();
+            let slot = self.split.as_ref().is_some_and(|s| s.is_slot(v));
             for (k, &a) in args.iter().enumerate() {
-                let w = self.val(a)?;
+                let w = if slot {
+                    super::wave_split::slot_form(self, a)?
+                } else if let Some(w) = super::wave_split::phi_exit_word(self, v, k) {
+                    w
+                } else {
+                    self.val(a)?
+                };
                 let exit = self.exits[preds[k].index()];
                 if exit == 0 {
                     return Err(format!("phi %{} predecessor block {} was not emitted", v.0, preds[k].0));
@@ -1362,6 +1386,12 @@ impl<'a, 'p> Emitter<'a, 'p> {
         matches!(op, Op::Ballot | Op::Barrier | Op::SubgroupLdsBarrier | Op::DataCacheInvalidate | Op::LdsAppend { .. } | Op::GdsAppend { .. } | Op::Clock { .. } | Op::SendMessage { .. })
     }
 
+    /// Emit `v` at the current position ahead of its own (a split
+    /// program's riding ballot operands, see `wave_split::ensure_emitted`).
+    pub(crate) fn emit_early(&mut self, v: Value) -> R<()> {
+        self.emit_value(v)
+    }
+
     fn emit_value(&mut self, v: Value) -> R<()> {
         let op = self.f.op(v);
         // Scalar memory reads take SGPR operands and no EXEC: both lane
@@ -1384,7 +1414,8 @@ impl<'a, 'p> Emitter<'a, 'p> {
     fn emit_value_half(&mut self, v: Value) -> R<()> {
         let data = self.f.value(v).clone();
         if data.op == Op::Phi {
-            let ty = self.ty(data.ty);
+            let slot = self.split.as_ref().is_some_and(|s| s.is_slot(v));
+            let ty = if slot { self.t_uvec(2) } else { self.ty(data.ty) };
             let id = self.b.id();
             let inst = Instruction::new(S::Phi, Some(ty), Some(id), vec![]);
             self.b.insert_into_block(InsertPoint::End, inst).unwrap();
@@ -1398,6 +1429,9 @@ impl<'a, 'p> Emitter<'a, 'p> {
         let w = self.emit_op(v, &data)?;
         if let Some(w) = w {
             self.define(v, w);
+            if self.split.is_some() {
+                super::wave_split::note_definition(self, v, w);
+            }
         }
         Ok(())
     }

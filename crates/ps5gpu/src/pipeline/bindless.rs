@@ -837,7 +837,11 @@ impl BindlessSet {
                 }
             }
             Err(why) => {
-                crate::log_once(&format!("ps5gpu: bindless table entry reads zeros: {why}"));
+                // Failed entries are looked at again whenever images change:
+                // the message is formatted when the entry first fails.
+                if !t.distinct[d as usize].failed {
+                    crate::log_once(&format!("ps5gpu: bindless table entry reads zeros: {why}"));
+                }
                 if t.distinct[d as usize].slot != t.null_slot {
                     t.map_stale = true;
                 }

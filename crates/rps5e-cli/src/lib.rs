@@ -275,6 +275,11 @@ struct RunOptions {
     /// supports it (default off) [RPS5E_HDR].
     #[arg(long)]
     hdr: bool,
+    /// Resolution of the emulated display: 720p, 1080p or 2160p (default
+    /// 2160p); games that detect the display pick their output size from it
+    /// [RPS5E_DISPLAY_RESOLUTION].
+    #[arg(long, value_name = "RES")]
+    display_resolution: Option<String>,
     /// Show the performance overlay from the start (F10 toggles)
     /// [RPS5E_PERF_OVERLAY].
     #[arg(long)]
@@ -288,7 +293,7 @@ struct RunOptions {
     /// No window [RPS5E_HEADLESS].
     #[arg(long)]
     headless: bool,
-    /// Console language id, 0..29 (1 = English US) [RPS5E_SYSTEM_LANGUAGE].
+    /// Console language id, 0..30 (1 = English US) [RPS5E_SYSTEM_LANGUAGE].
     #[arg(long, value_name = "ID")]
     language: Option<u32>,
     /// No audio output [RPS5E_AUDIO=null].
@@ -297,9 +302,10 @@ struct RunOptions {
     /// Turn the console's skip-notice-screen setting on [RPS5E_SKIP_NOTICE_SCREEN].
     #[arg(long)]
     skip_notice_screen: bool,
-    /// Guest display refresh rate in Hz [RPS5E_GUEST_REFRESH_RATE].
+    /// Guest display refresh rate in Hz, 30..1000; 60 and 120 run at
+    /// 59.94 / 119.88 Hz like the console [RPS5E_GUEST_REFRESH_RATE].
     #[arg(long, value_name = "HZ")]
-    refresh_rate: Option<f64>,
+    refresh_rate: Option<u32>,
     /// Game patch (mods JSON) applied at load [RPS5E_GAME_PATCH].
     #[arg(long, value_name = "FILE")]
     game_patch: Option<String>,
@@ -364,8 +370,8 @@ impl RunOptions {
             set("RPS5E_HEADLESS", "1");
         }
         if let Some(l) = self.language {
-            if l > 29 {
-                return Err(anyhow!("--language {l}: expected 0..29"));
+            if l > 30 {
+                return Err(anyhow!("--language {l}: expected 0..30"));
             }
             set("RPS5E_SYSTEM_LANGUAGE", &l.to_string());
         }
@@ -376,8 +382,8 @@ impl RunOptions {
             set("RPS5E_SKIP_NOTICE_SCREEN", "1");
         }
         if let Some(hz) = self.refresh_rate {
-            if !(1.0..=1000.0).contains(&hz) {
-                return Err(anyhow!("--refresh-rate {hz}: expected 1..1000"));
+            if !(30..=1000).contains(&hz) {
+                return Err(anyhow!("--refresh-rate {hz}: expected a whole number of Hz from 30 to 1000"));
             }
             set("RPS5E_GUEST_REFRESH_RATE", &hz.to_string());
         }
@@ -436,6 +442,11 @@ impl RunOptions {
         }
         if self.hdr {
             set("RPS5E_HDR", "1");
+        }
+        if let Some(r) = &self.display_resolution {
+            let r = ps5gpu::display::DisplayResolution::parse(r)
+                .ok_or_else(|| anyhow!("--display-resolution {r}: expected 720p, 1080p or 2160p"))?;
+            set("RPS5E_DISPLAY_RESOLUTION", r.as_str());
         }
         if self.perf_overlay {
             set("RPS5E_PERF_OVERLAY", "1");
@@ -823,10 +834,7 @@ fn title_of(game: &str) -> Result<String> {
 
 /// The pipeline cache file of `title` (its prewarm list sits next to it).
 fn title_cache_path(title: &str) -> Result<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .ok_or_else(|| anyhow!("no cache directory (HOME unset)"))?;
+    let base = ps5vm::appenv::cache_base().ok_or_else(|| anyhow!("no cache directory (HOME unset)"))?;
     Ok(match std::env::var("RPS5E_PIPELINE_CACHE") {
         Ok(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("off") => std::path::PathBuf::from(v),
         _ => ps5gpu::pipeline::cache::title_path(&base, title),
@@ -958,10 +966,7 @@ fn clear_title_shader_cache(title: &str, list: bool) -> Result<()> {
 }
 
 fn clear_all_shader_caches(list: bool) -> Result<()> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
-        .ok_or_else(|| anyhow!("no cache directory (HOME unset)"))?;
+    let base = ps5vm::appenv::cache_base().ok_or_else(|| anyhow!("no cache directory (HOME unset)"))?;
     let app = ps5vm::appenv::app_dir(&base);
     let module_dir = match std::env::var("RPS5E_SHADER_CACHE") {
         Ok(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("off") => std::path::PathBuf::from(v),

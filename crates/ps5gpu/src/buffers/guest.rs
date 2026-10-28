@@ -240,6 +240,20 @@ impl GuestImports {
         }
     }
 
+    /// The import buffer and offset holding guest bytes `[addr, addr+size)`
+    /// when one import covers them all (one backing run inside one chunk):
+    /// a transfer source reading guest memory as it is when the GPU runs.
+    pub fn source_slice(&mut self, addr: u64, size: u64) -> Option<(vk::Buffer, u64)> {
+        let runs = self.memory.backing_runs(addr, size);
+        let &[(g, b, n)] = runs.as_slice() else { return None };
+        if g != addr || n != size || size == 0 || (b >> CHUNK_BITS) != ((b + size - 1) >> CHUNK_BITS) {
+            return None;
+        }
+        let (buffer, _, len) = self.chunk((b >> CHUNK_BITS) as usize)?;
+        let off = b & (CHUNK - 1);
+        (off + size <= len).then_some((buffer, off))
+    }
+
     /// Device address of backing bytes `[b, b+len)` (inside one chunk).
     fn backing_address(&mut self, b: u64, len: u64) -> Option<u64> {
         if len == 0 || b + len > self.alias_size || (b >> CHUNK_BITS) != ((b + len - 1) >> CHUNK_BITS) {

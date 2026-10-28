@@ -8,7 +8,7 @@
 //! `@<seconds>` picks the first frame presented that long after start. With
 //! `RPS5E_FRAME_TRACE_DIR=<dir>` the images each recorded pass writes are
 //! read back after the pass and written as `<dir>/NNNN_<what>_<addr>.ppm`
-//! (layer 0, downscaled to at most 960 pixels wide; float formats clamped to
+//! (layer 0, downscaled to at most 960 pixels wide, `RPS5E_FRAME_TRACE_WIDTH`; float formats clamped to
 //! 0..1), with per-channel min/max/mean in the log.
 
 use crate::device::{Buffer, GpuDevice, MemoryUse};
@@ -237,6 +237,13 @@ pub fn dump_address(addr: u64) -> bool {
     .contains(&addr)
 }
 
+/// `RPS5E_FRAME_TRACE_WIDTH=<px>`: image dumps are downscaled to at most
+/// this width (default 960).
+fn dump_width() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("RPS5E_FRAME_TRACE_WIDTH").ok().and_then(|v| v.parse().ok()).filter(|&w: &u32| w > 0).unwrap_or(960))
+}
+
 /// `RPS5E_FRAME_TRACE_ARRAYS=1`: sampled array and cube images are
 /// dumped too (as `tex`).
 pub fn dump_arrays() -> bool {
@@ -337,7 +344,7 @@ pub fn dump_image(dev: &Arc<GpuDevice>, sched: &mut Scheduler, images: &mut Imag
         log(&format!("  {what} {:#x} slice means: {}", key.addr(), means.join(" ")));
     }
     let bytes = &all[..size as usize];
-    let step = w.div_ceil(960).max(1);
+    let step = w.div_ceil(dump_width()).max(1);
     let (ow, oh) = (w.div_ceil(step), h.div_ceil(step));
     let mut lo = [f32::INFINITY; 4];
     let mut hi = [f32::NEG_INFINITY; 4];

@@ -6,7 +6,7 @@
 //!
 //! One `VkPipelineCache` is shared by every pipeline the provider creates.
 //! It is loaded from `RPS5E_PIPELINE_CACHE` (a file path; `0`/`off`
-//! disables it) or `$XDG_CACHE_HOME/rps5e/pipelines/` (`~/.cache/...`),
+//! disables it) or `$XDG_CACHE_HOME/rps5e/pipelines/` (`~/.cache/...`; `%LOCALAPPDATA%\rps5e\pipelines` on Windows),
 //! one file per game named by its title id (no title id: no cache), and
 //! written back periodically and on drop.
 //!
@@ -71,9 +71,7 @@ pub fn default_path(_dev: &GpuDevice) -> Option<PathBuf> {
         _ => {}
     }
     let title = TITLE_ID.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let base = ps5vm::appenv::cache_base()?;
     Some(title_path(&base, &title))
 }
 

@@ -5,9 +5,11 @@
 // Unit tests of the `ps5hle::videoout` module.
 
 use super::exports::{
-    buffer_attribute2_bytes, hdr_allowed, initial_output_options, output_status_bytes, parse_buffer_attribute,
-    resolution_status_bytes, EXPORTS,
+    buffer_attribute2_bytes, hdr_allowed, initial_output_options, output_resolution_class, output_status_bytes,
+    param_attribute3, parse_buffer_attribute, reported_display, resolution_status_bytes, EXPORTS,
+    PARAM_ATTRIBUTE3_RESOLUTION_DETECTION,
 };
+use ps5gpu::display::DisplayResolution;
 use super::*;
 use crate::context::{CpuContext, CpuRegister::*};
 use crate::sync::equeue;
@@ -87,16 +89,52 @@ fn attribute_layouts() {
     assert_eq!((v2.pixel_format, v2.width, v2.height), (0x8000_0000_0000_0000, 640, 360));
     assert_eq!(u32::from_le_bytes(raw[0x30..0x34].try_into().unwrap()), 0x48);
 
-    let s = output_status_bytes(1920, 1080, 60, false);
+    let s = output_status_bytes(1, 60, false);
     assert_eq!(u32::from_le_bytes(s[0..4].try_into().unwrap()), 1);
     assert_eq!(u64::from_le_bytes(s[8..16].try_into().unwrap()), 3);
-    assert_eq!(u32::from_le_bytes(output_status_bytes(3840, 2160, 120, true)[0..4].try_into().unwrap()), 2);
+    let s = output_status_bytes(2, 120, true);
+    assert_eq!(u32::from_le_bytes(s[0..4].try_into().unwrap()), 2);
+    assert_eq!(u64::from_le_bytes(s[8..16].try_into().unwrap()), 13);
+}
+
+#[test]
+fn resolution_class_follows_the_display_and_attribute3() {
+    use DisplayResolution::*;
+    let detect = PARAM_ATTRIBUTE3_RESOLUTION_DETECTION;
+    // An application that detects the resolution sees the display.
+    assert_eq!(output_resolution_class(P720, detect), 1);
+    assert_eq!(output_resolution_class(P1080, detect), 1);
+    assert_eq!(output_resolution_class(P2160, detect), 2);
+    assert_eq!(output_resolution_class(P1080, 0xFFFF_FFFF), 1);
+    assert_eq!(reported_display(P720, detect), P720);
+    assert_eq!(reported_display(P1080, detect | 0x1), P1080);
+    // Without the bit the output is always 2160p (the system scales it).
+    for d in DisplayResolution::ALL {
+        assert_eq!(output_resolution_class(d, 0), 2, "{d:?}");
+        assert_eq!(output_resolution_class(d, !detect), 2, "{d:?}");
+        assert_eq!(reported_display(d, 0), P2160, "{d:?}");
+    }
+}
+
+#[test]
+fn attribute3_from_param_json() {
+    let detect = PARAM_ATTRIBUTE3_RESOLUTION_DETECTION;
+    // No param.json at all: treated as detecting the resolution.
+    assert_eq!(param_attribute3(None), detect);
+    assert_eq!(param_attribute3(Some(r#"{"attribute": 536870912, "attribute3": 4}"#)), 4);
+    assert_eq!(param_attribute3(Some(r#"{"attribute3": 4294967295}"#)), u32::MAX);
+    // Missing or not a number: 0 (no detection).
+    assert_eq!(param_attribute3(Some(r#"{"attribute3": 0}"#)), 0);
+    assert_eq!(param_attribute3(Some(r#"{"titleId": "PPSA00001"}"#)), 0);
+    assert_eq!(param_attribute3(Some(r#"{"attribute3": "4"}"#)), 0);
+    assert_eq!(output_resolution_class(DisplayResolution::P1080, param_attribute3(Some(r#"{"attribute3": 0}"#))), 2);
+    assert_eq!(output_resolution_class(DisplayResolution::P1080, param_attribute3(Some(r#"{"attribute3": 4}"#))), 1);
 }
 
 #[test]
 fn output_status_dynamic_range() {
-    let sdr = output_status_bytes(1920, 1080, 60, false);
-    let hdr = output_status_bytes(1920, 1080, 60, true);
+    let sdr = output_status_bytes(1, 60, false);
+    let hdr = output_status_bytes(1, 60, true);
     assert_eq!(u32::from_le_bytes(sdr[4..8].try_into().unwrap()), 1);
     assert_eq!(u32::from_le_bytes(hdr[4..8].try_into().unwrap()), 2);
     // Only the dynamic range differs; flags and reserved words stay zero.
@@ -133,7 +171,9 @@ fn output_status_stays_sdr_with_hdr_off() {
     let h = call("sceVideoOutOpen", &mut ctx, &[255, 0, 0, 0]);
     assert!(h > 0);
     assert_eq!(call("sceVideoOutGetOutputStatus", &mut ctx, &[h as u64, BASE + 0x100]), 0);
-    assert_eq!(ctx.read_bytes(BASE + 0x100, 0x30).unwrap(), output_status_bytes(1920, 1080, 60, false));
+    // The tests run without param.json and without RPS5E_DISPLAY_RESOLUTION:
+    // a 2160p display, whatever buffers the port has.
+    assert_eq!(ctx.read_bytes(BASE + 0x100, 0x30).unwrap(), output_status_bytes(2, 60, false));
     assert_eq!(call("sceVideoOutClose", &mut ctx, &[h as u64]), 0);
 }
 
@@ -498,8 +538,9 @@ fn resolution_status_layout() {
     assert_eq!(call("sceVideoOutGetResolutionStatus", &mut ctx, &[h, st]), 0);
     let raw = ctx.read_bytes(st, 0x40).unwrap();
     let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
-    // Full and pane size are the port's output size.
-    assert_eq!((u32_at(0x0), u32_at(0x4), u32_at(0x8), u32_at(0xC)), (1920, 1080, 1920, 1080));
+    // Full and pane size are the emulated display's (2160p by default, no
+    // param.json in the tests), not the port's buffer size.
+    assert_eq!((u32_at(0x0), u32_at(0x4), u32_at(0x8), u32_at(0xC)), (3840, 2160, 3840, 2160));
     // Screen size, flags and reserved words are zero; the status is 48 bytes.
     assert!(raw[0x18..0x30].iter().all(|&b| b == 0));
     assert!(raw[0x30..0x40].iter().all(|&b| b == 0xFF));

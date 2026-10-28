@@ -7,7 +7,7 @@
 //! before does not stall the frame that first needs it.
 //!
 //! The directory is `RPS5E_SHADER_CACHE` (`0`/`off` disables it) or
-//! `$XDG_CACHE_HOME/rps5e/` (`~/.cache/rps5e/`), with one subdirectory
+//! `$XDG_CACHE_HOME/rps5e/` (`~/.cache/rps5e/`, `%LOCALAPPDATA%\rps5e` on Windows), with one subdirectory
 //! per shader-compiler source version and device feature set
 //! (`spirv-<stamp>`), one file per permutation key. The source version is
 //! a build-time hash of the compiler's sources (`build.rs`), so a rebuild
@@ -68,10 +68,7 @@ pub fn default_dir(features: &super::Features) -> Option<PathBuf> {
     let base = match std::env::var("RPS5E_SHADER_CACHE") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => return None,
         Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .map(|b| ps5vm::appenv::app_dir(&b))?,
+        _ => ps5vm::appenv::app_dir(&ps5vm::appenv::cache_base()?),
     };
     Some(base.join(format!("spirv-{:016x}", super::translator_stamp(features))))
 }
@@ -97,7 +94,7 @@ pub fn translator_stamp(features: &super::Features) -> u64 {
     super::vertex_wave_info_enabled().hash(&mut h);
     super::image::const_texel_offsets_enabled().hash(&mut h);
     super::emit::data_cache_invalidate_enabled().hash(&mut h);
-    (features.subgroup64_compute, features.max_compute_workgroup_subgroups, features.max_shared_bytes, super::wave_split::enabled(), super::wave_split::min_vgprs()).hash(&mut h);
+    (features.subgroup64_compute, features.max_compute_workgroup_subgroups, features.max_shared_bytes, super::wave_split::enabled(), super::wave_split::min_vgprs(), super::wave_split::lane_slots_enabled(), super::wave_split::ballot_riders_enabled()).hash(&mut h);
     VERSION.hash(&mut h);
     h.finish()
 }

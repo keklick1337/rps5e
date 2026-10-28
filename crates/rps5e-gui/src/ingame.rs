@@ -150,6 +150,9 @@ pub struct Started {
     pub refresh_rate: f64,
     /// HDR output (`RPS5E_HDR`).
     pub hdr: bool,
+    /// Emulated display resolution (`RPS5E_DISPLAY_RESOLUTION`), as the
+    /// launcher stores it (`720p`, `1080p`, `2160p`).
+    pub display_resolution: String,
     /// [`GPU_SWITCHES`] in order.
     pub switches: Vec<bool>,
 }
@@ -163,6 +166,11 @@ impl Started {
                 .unwrap_or(config::DEFAULT_CONSOLE_LANGUAGE),
             refresh_rate: var("RPS5E_GUEST_REFRESH_RATE").and_then(|v| v.trim().parse().ok()).unwrap_or(0.0),
             hdr: var("RPS5E_HDR").is_some_and(|v| ps5gpu::display::parse_hdr(&v)),
+            display_resolution: var("RPS5E_DISPLAY_RESOLUTION")
+                .and_then(|v| ps5gpu::display::DisplayResolution::parse(&v))
+                .unwrap_or_default()
+                .as_str()
+                .into(),
             switches: GPU_SWITCHES.iter().map(|s| s.is_on(var(s.env).as_deref())).collect(),
         }
     }
@@ -183,6 +191,9 @@ pub fn restart_pending(cfg: &EmulatorSettings, started: &Started) -> Vec<&'stati
     }
     if cfg.hdr != started.hdr {
         v.push("HDR");
+    }
+    if cfg.display_resolution != started.display_resolution {
+        v.push("display resolution");
     }
     for (sw, &was) in GPU_SWITCHES.iter().zip(&started.switches) {
         if sw.on_in(&cfg.extra_env) != was {
@@ -1028,6 +1039,14 @@ fn graphics(ui: &mut egui::Ui, st: &mut MenuState) {
             }
         });
         ui.end_row();
+        ui.label("Display resolution");
+        ui.horizontal(|ui| {
+            combo(ui, "menu-display-res", &mut s.display_resolution, &config::DISPLAY_RESOLUTIONS);
+            if s.display_resolution != st.started.display_resolution {
+                after_restart(ui);
+            }
+        });
+        ui.end_row();
         ui.label("Scaling");
         combo(ui, "menu-scale", &mut s.scale_mode, &config::SCALE_MODES);
         ui.end_row();
@@ -1205,17 +1224,26 @@ mod tests {
         b.hdr = true;
         assert_eq!(live_changes(&a, &b).len(), 4);
         assert_eq!(restart_pending(&b, &st), ["console language", "refresh rate", "HDR", GPU_SWITCHES[0].env]);
+        // So is the display resolution.
+        b.display_resolution = "1080p".into();
+        assert_eq!(live_changes(&a, &b).len(), 4);
+        assert_eq!(
+            restart_pending(&b, &st),
+            ["console language", "refresh rate", "HDR", "display resolution", GPU_SWITCHES[0].env]
+        );
         // What the game started with counts.
         let st = Started::from_vars(|k| match k {
             "RPS5E_SYSTEM_LANGUAGE" => Some("8".into()),
             "RPS5E_GUEST_REFRESH_RATE" => Some("120".into()),
             "RPS5E_HDR" => Some("1".into()),
+            "RPS5E_DISPLAY_RESOLUTION" => Some("1080P".into()),
             "RPS5E_SAFE" => Some("1".into()),
             _ => None,
         });
         assert!(st.hdr);
         assert!(restart_pending(&b, &st).is_empty());
         assert!(!started().hdr, "HDR is off without RPS5E_HDR");
+        assert_eq!(started().display_resolution, "2160p", "2160p without RPS5E_DISPLAY_RESOLUTION");
     }
 
     #[test]
@@ -1351,7 +1379,8 @@ mod tests {
     }
 
     /// `RPS5E_GUI_RENDER_DIR=<dir> cargo test -p rps5e-gui render_ingame -- --ignored`
-    /// writes the in-game Controls page and the controls hint as PNG files.
+    /// writes the in-game Controls page, the controls hint and the Graphics
+    /// page as PNG files.
     #[test]
     #[ignore]
     fn render_ingame() {
@@ -1374,6 +1403,13 @@ mod tests {
         shot(&mut app, Vec::new(), "ingame-controls.png");
         app.state.open_hint();
         shot(&mut app, vec![key_event(egui::Key::Space, true), key_event(egui::Key::W, true)], "ingame-hint.png");
+        // Graphics with a display resolution changed after the start.
+        app.state.hint = false;
+        app.state.section = Section::Graphics;
+        let mut next = app.state.settings.clone();
+        next.display_resolution = "1080p".into();
+        app.state.set_settings(next);
+        shot(&mut app, Vec::new(), "ingame-graphics.png");
         let _ = std::fs::remove_dir_all(&d);
     }
 

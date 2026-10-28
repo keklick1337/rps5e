@@ -81,8 +81,8 @@
 # RightStickUp     = "KEY:I"
 # RightStickDown   = "KEY:K"
 # TouchPad         = "KEY:Tab"          # touch pad click (a finger in the middle unless one is down)
-# TouchLeft        = []                 # touch pad click on the left half
-# TouchRight       = []                 # touch pad click on the right half
+# TouchLeft        = "KEY:Z"            # touch pad click on the left half
+# TouchRight       = "KEY:X"            # touch pad click on the right half
 # ToggleMouse      = "KEY:F9"           # capture the mouse: it drives the stick in mouse mode
 # ReleaseMouse     = "KEY:Escape"       # leave capture or touch pad mode (Escape still presses Options)
 # ToggleFullscreen = "KEY:F11"
@@ -140,8 +140,8 @@
 # RightStickUp     = "KEY:I"
 # RightStickDown   = "KEY:K"
 # TouchPad         = "KEY:Tab"
-# TouchLeft        = []
-# TouchRight       = []
+# TouchLeft        = "KEY:Z"
+# TouchRight       = "KEY:X"
 # ToggleFullscreen = "KEY:F11"
 # TogglePerfOverlay = "KEY:F10"     # performance overlay (FPS, frame times, CPU/GPU)
 # ToggleMenu = "KEY:F1"            # in-game menu (keyboard keys only; the PS button also opens it)

@@ -703,8 +703,12 @@ impl Emitter<'_, '_> {
     }
 
     /// Load `count` (a multiple of 4) consecutive dwords at guest `addr`
-    /// (u64, within one page); zeros when the page is not resident.
+    /// (u64, 16-byte aligned, within one page); zeros when the page is not
+    /// resident.
     pub fn device_load_dwords(&mut self, addr: Word, count: u32) -> R<Vec<Word>> {
+        if self.feat.emit.bvh_vector_loads {
+            return self.device_load_quads(addr, count);
+        }
         let (dev, resident) = self.translate_address(addr)?;
         let tu = self.t_u32();
         let t4 = self.t_uvec(4);
@@ -729,6 +733,35 @@ impl Emitter<'_, '_> {
             }
         }
         Ok(out)
+    }
+
+    /// [`Self::device_load_dwords`]: one residency branch around the
+    /// 16-byte vector loads of the whole run.
+    fn device_load_quads(&mut self, addr: Word, count: u32) -> R<Vec<Word>> {
+        let (dev, resident) = self.translate_address(addr)?;
+        let tu = self.t_u32();
+        let t64 = self.ty(Type::U64);
+        let zeros = vec![self.cu(0); count as usize];
+        Ok(self.if_values(resident, tu, &zeros, |e| {
+            e.physical_caps();
+            let t4 = e.t_uvec(4);
+            let p4 = e.ptr(SC::PhysicalStorageBuffer, t4);
+            let mut out = Vec::with_capacity(count as usize);
+            for first in (0..count).step_by(4) {
+                let a = if first == 0 {
+                    dev
+                } else {
+                    let off = e.c64(first as u64 * 4);
+                    e.ins(S::IAdd, t64, &[dev, off])
+                };
+                let p = e.ins(S::ConvertUToPtr, p4, &[a]);
+                let v = e.ins_ops(S::Load, t4, vec![Operand::IdRef(p), Operand::MemoryAccess(rspirv::spirv::MemoryAccess::ALIGNED), Operand::LiteralBit32(16)]);
+                for i in 0..4 {
+                    out.push(e.extract(tu, v, i));
+                }
+            }
+            out
+        }))
     }
 
     /// `n` dwords from guest address `a0` (u64, dword aligned); dword `k` is

@@ -18,9 +18,9 @@ RustPS5Emu is a compatibility layer for PS5 games, in the spirit of Wine:
 - the system libraries (kernel, libc, graphics, audio, input, save data, networking, ...) are implemented in Rust (HLE);
 - the GPU command stream is translated to **Vulkan**, and RDNA shaders are recompiled to SPIR-V.
 
-**Status: alpha (0.1.0-alpha.2).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
+**Status: alpha (0.1.1-alpha).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
 
-`master` is the development branch: every change lands there first, so it has the newest fixes but can be unstable. Tagged versions on the [Releases](https://github.com/keklick1337/rps5e/releases) page come with prebuilt Linux and Windows archives.
+`master` is the development branch: every change lands there first, so it has the newest fixes but can be unstable. Tagged versions on the [Releases](https://github.com/keklick1337/rps5e/releases) page come with prebuilt Linux and Windows archives. What comes next is in the [roadmap](ROADMAP.md).
 
 ### Tested games
 
@@ -108,7 +108,7 @@ rps5e-cli run ~/games/PPSA10112 --input-mode keyboard --fullscreen
 scripts/run-game.sh ~/games/PPSA10112 --bind Cross=KEY:Space
 ```
 
-Useful `run` options (`rps5e-cli run --help` lists all; most have an `RPS5E_*` environment variable too):
+Useful `run` options (`rps5e-cli run --help` lists all; most have an `RPS5E_*` environment variable too). Every command and option is described in [docs/COMMANDS.md](docs/COMMANDS.md), every environment variable in [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md):
 
 | Option | Meaning |
 |---|---|

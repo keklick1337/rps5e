@@ -122,7 +122,19 @@ impl Timeline {
 
     /// Block until `tick` completed. A tick that was never submitted would
     /// block forever; callers only wait on submitted ticks.
+    #[track_caller]
     pub fn wait(&self, tick: u64) {
+        let at = std::panic::Location::caller();
+        if crate::backend::profile::wait_sites() && !self.is_complete(tick) {
+            let t = std::time::Instant::now();
+            self.wait_inner(tick);
+            crate::backend::profile::note_wait(at, t.elapsed().as_nanos() as u64);
+            return;
+        }
+        self.wait_inner(tick);
+    }
+
+    fn wait_inner(&self, tick: u64) {
         // A lost device completes nothing: the waiting thread stops (the
         // process is shutting down) instead of failing every later wait.
         if crate::device::is_lost() {
@@ -1237,6 +1249,7 @@ impl Scheduler {
     }
 
     /// Submit and wait for the GPU to finish it.
+    #[track_caller]
     pub fn flush_and_wait(&mut self) -> u64 {
         let t = self.flush();
         if self.slice.is_some() {
@@ -1249,6 +1262,7 @@ impl Scheduler {
 
     /// Wait for `tick`, submitting the recording buffer first when `tick`
     /// is the current one.
+    #[track_caller]
     pub fn wait(&mut self, tick: u64) {
         if self.slice_bail() {
             return;
@@ -1263,6 +1277,7 @@ impl Scheduler {
 
     /// Submit, wait for every submitted tick and run completion work,
     /// including priority callbacks up to the last tick.
+    #[track_caller]
     pub fn finish(&mut self) {
         if self.slice_bail() {
             return;
@@ -1354,7 +1369,9 @@ impl Scheduler {
 
     /// Record a full pipeline barrier (simple, conservative ordering between
     /// transfer/compute/graphics work recorded before and after).
+    #[track_caller]
     pub fn full_barrier(&mut self) {
+        crate::backend::profile::note_full_barrier(std::panic::Location::caller());
         // Ending an open rendering scope records the barrier.
         if self.end_rendering_scope() {
             return;

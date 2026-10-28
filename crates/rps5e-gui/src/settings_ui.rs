@@ -482,6 +482,21 @@ pub(crate) fn emulator_form(ui: &mut egui::Ui, s: &mut EmulatorSettings, salt: &
         ui.checkbox(&mut s.hdr, "Enable HDR display support")
             .on_hover_text("HDR10 output for games that support it. Requires HDR enabled on the host display; SDR otherwise.");
         ui.end_row();
+        ui.label("Display resolution");
+        let current = config::DISPLAY_RESOLUTIONS.iter().find(|m| m.0 == s.display_resolution).map(|m| m.1).unwrap_or("?");
+        egui::ComboBox::from_id_salt((salt, "display-res"))
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                for (k, label) in config::DISPLAY_RESOLUTIONS {
+                    ui.selectable_value(&mut s.display_resolution, k.to_string(), label);
+                }
+            })
+            .response
+            .on_hover_text(
+                "The resolution of the TV the game is told about. Games that detect the display pick their output size from it; \
+                 others always render for 2160p. The window scales the picture either way.",
+            );
+        ui.end_row();
         ui.label("Performance overlay");
         ui.checkbox(&mut s.perf_overlay, "Show FPS, frame times, CPU/GPU load (F10 toggles in game)");
         ui.end_row();

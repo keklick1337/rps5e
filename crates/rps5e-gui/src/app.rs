@@ -1784,7 +1784,8 @@ mod tests {
         app.settings.view = LibraryView::List;
         shoot(&mut app, &mut r, &out, "library-list.png");
         app.do_action(Action::RunWith("/srv/ps5games/SILENT HILL".into()));
-        app.run_dialog.as_mut().unwrap().options = RunOptions { gpu_profile: 1, hle_trace: true, ..Default::default() };
+        app.run_dialog.as_mut().unwrap().options =
+            RunOptions { gpu_profile: 1, hle_trace: true, display_resolution: "1080p".into(), ..Default::default() };
         shoot(&mut app, &mut r, &out, "run-with.png");
         app.run_dialog = None;
         for (tab, name) in [(Tab::Library, "settings-library.png"), (Tab::Emulator, "settings-emulator.png"), (Tab::Interface, "settings-interface.png")] {

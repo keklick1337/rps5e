@@ -7,6 +7,7 @@
 use super::*;
 use crate::context::{CpuContext, CpuRegister};
 use crate::registry::{HleRegistry, HleResult};
+use ps5gpu::display::DisplayResolution;
 
 const OK: HleResult = 0;
 const BUFFER_ATTRIBUTE_SIZE: usize = 0x28;
@@ -103,18 +104,71 @@ fn read_buffer_attribute(ctx: &CpuContext, addr: u64, attribute2: bool) -> Optio
     parse_buffer_attribute(&ctx.read_bytes(addr, len)?, attribute2)
 }
 
-/// Build the 0x30-byte SceVideoOutOutputStatus: resolution class (u32),
-/// dynamic range (u32 at 0x04: 1 SDR, 2 HDR), refresh-rate code (u64 at
-/// 0x08), flags and reserved words (zero).
-pub(crate) fn output_status_bytes(width: u32, height: u32, refresh_rate: u32, hdr: bool) -> [u8; OUTPUT_STATUS_SIZE] {
+/// Build the 0x30-byte SceVideoOutOutputStatus: resolution class (u32:
+/// 1 under 2160p, 2 for 2160p, see [`output_resolution_class`]), dynamic
+/// range (u32 at 0x04: 1 SDR, 2 HDR), refresh-rate code (u64 at 0x08),
+/// flags and reserved words (zero).
+pub(crate) fn output_status_bytes(resolution_class: u32, refresh_rate: u32, hdr: bool) -> [u8; OUTPUT_STATUS_SIZE] {
     let mut s = [0u8; OUTPUT_STATUS_SIZE];
-    let resolution_class = if width >= 3840 || height >= 2160 { 2 } else { 1 };
     put_u32(&mut s, 0x00, resolution_class);
     put_u32(&mut s, 0x04, if hdr { 2 } else { 1 });
     // The status carries a refresh-rate code, not the pacing frequency.
     let code = if refresh_rate >= 119 { REFRESH_RATE_119_88HZ } else { REFRESH_RATE_59_94HZ };
     put_u64(&mut s, 0x08, code);
     s
+}
+
+/// param.json `attribute3` bit 2: the application detects the display's
+/// resolution. Without it the system scales a 2160p output to the display
+/// itself and the application is always told about a 2160p display.
+pub(crate) const PARAM_ATTRIBUTE3_RESOLUTION_DETECTION: u32 = 0x4;
+
+/// Integer member `key` of param.json (missing or not an unsigned 32-bit
+/// number: 0).
+fn param_u32(json: &str, key: &str) -> u32 {
+    match crate::app_info::param_json_member(json, key) {
+        Some(crate::app_info::JsonScalar::Num(n)) if n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n) => n as u32,
+        _ => 0,
+    }
+}
+
+/// param.json `attribute3` of an application; without a param.json at all
+/// the application is treated as detecting the resolution.
+pub(crate) fn param_attribute3(param_json: Option<&str>) -> u32 {
+    param_json.map_or(PARAM_ATTRIBUTE3_RESOLUTION_DETECTION, |json| param_u32(json, "attribute3"))
+}
+
+/// [`param_attribute3`] of the running application (param.json read once).
+fn app_attribute3() -> u32 {
+    static ATTRIBUTE3: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ATTRIBUTE3.get_or_init(|| param_attribute3(crate::app_info::read_param_json().as_deref()))
+}
+
+/// The display mode an application with param.json `attribute3` is shown
+/// for the emulated `display`: the display itself when the application
+/// detects the resolution, 2160p otherwise.
+pub(crate) fn reported_display(display: DisplayResolution, attribute3: u32) -> DisplayResolution {
+    if attribute3 & PARAM_ATTRIBUTE3_RESOLUTION_DETECTION != 0 {
+        display
+    } else {
+        DisplayResolution::P2160
+    }
+}
+
+/// Resolution class of the output status: 2 for a 2160p display, 1 for a
+/// smaller one (720p, 1080p, 1440p), only told to an application that
+/// detects the resolution ([`reported_display`]).
+pub(crate) fn output_resolution_class(display: DisplayResolution, attribute3: u32) -> u32 {
+    match reported_display(display, attribute3) {
+        DisplayResolution::P2160 => 2,
+        DisplayResolution::P720 | DisplayResolution::P1080 => 1,
+    }
+}
+
+/// [`reported_display`] for the running application and the emulated
+/// display ([`ps5gpu::display::display_resolution`]).
+fn app_display() -> DisplayResolution {
+    reported_display(ps5gpu::display::display_resolution(), app_attribute3())
 }
 
 /// param.json `attribute` bit 29: the application supports HDR output.
@@ -125,11 +179,7 @@ const PARAM_ATTRIBUTE_HDR: u32 = 0x2000_0000;
 /// counts as 0); without a param.json at all, yes.
 pub(crate) fn hdr_allowed(param_json: Option<&str>) -> bool {
     let Some(json) = param_json else { return true };
-    let attribute = match crate::app_info::param_json_member(json, "attribute") {
-        Some(crate::app_info::JsonScalar::Num(n)) if n.fract() == 0.0 && (0.0..=u32::MAX as f64).contains(&n) => n as u32,
-        _ => 0,
-    };
-    attribute & PARAM_ATTRIBUTE_HDR != 0
+    param_u32(json, "attribute") & PARAM_ATTRIBUTE_HDR != 0
 }
 
 /// [`hdr_allowed`] for the running application (param.json read once).
@@ -361,7 +411,8 @@ fn cb_get_output_status(ctx: &mut CpuContext) -> HleResult {
         return ERROR_INVALID_HANDLE;
     };
     let hdr = ps5gpu::display::hdr_enabled() && app_hdr_allowed() && hdr_output_supported(w, h);
-    write_or_fault(ctx, addr, &output_status_bytes(w, h, r, hdr))
+    let class = output_resolution_class(ps5gpu::display::display_resolution(), app_attribute3());
+    write_or_fault(ctx, addr, &output_status_bytes(class, r, hdr))
 }
 
 /// sceVideoOutGetOutputStatusWithVrr(handle, status*): the 0x30-byte
@@ -378,7 +429,8 @@ fn cb_get_output_status_with_vrr(ctx: &mut CpuContext) -> HleResult {
     };
     let hdr = ps5gpu::display::hdr_enabled() && app_hdr_allowed() && hdr_output_supported(w, h);
     let mut status = [0u8; OUTPUT_STATUS_WITH_VRR_SIZE];
-    status[..OUTPUT_STATUS_SIZE].copy_from_slice(&output_status_bytes(w, h, r, hdr));
+    let class = output_resolution_class(ps5gpu::display::display_resolution(), app_attribute3());
+    status[..OUTPUT_STATUS_SIZE].copy_from_slice(&output_status_bytes(class, r, hdr));
     write_or_fault(ctx, addr, &status)
 }
 
@@ -393,20 +445,26 @@ pub(crate) fn resolution_status_bytes(width: u32, height: u32, refresh_rate: u32
     put_u32(&mut s, 0x08, width);
     put_u32(&mut s, 0x0C, height);
     // The same refresh-rate code as the output status.
-    s[0x10..0x18].copy_from_slice(&output_status_bytes(width, height, refresh_rate, false)[0x08..0x10]);
+    s[0x10..0x18].copy_from_slice(&output_status_bytes(1, refresh_rate, false)[0x08..0x10]);
     s
 }
 
-/// sceVideoOutGetResolutionStatus(handle, status*)
+/// sceVideoOutGetResolutionStatus(handle, status*): the display mode the
+/// application may see ([`reported_display`]): the emulated display's size
+/// for an application that detects the resolution, 2160p otherwise. This
+/// is a model, not a measured answer: the size the console reports here
+/// has not been checked on hardware; it follows the output status's
+/// resolution class.
 fn cb_get_resolution_status(ctx: &mut CpuContext) -> HleResult {
     let handle = handle_arg(ctx.rdi());
     let addr = ctx.rsi();
     if addr == 0 {
         return ERROR_INVALID_ADDRESS;
     }
-    let Some((w, h, r)) = lock().ports.get(&handle).map(|p| (p.output_width, p.output_height, p.refresh_rate)) else {
+    let Some(r) = lock().ports.get(&handle).map(|p| p.refresh_rate) else {
         return ERROR_INVALID_HANDLE;
     };
+    let (w, h) = app_display().size();
     write_or_fault(ctx, addr, &resolution_status_bytes(w, h, r))
 }
 

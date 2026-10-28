@@ -1111,6 +1111,89 @@ fn compute_written_dcc_keys_clear_volume_slices_on_the_gpu() {
     compute_written_dcc_keys_clear_their_layers(true);
 }
 
+/// A "single-colour" DCC clear: the SDK fills every key with 0x10 and
+/// stores the clear colour at the start of each 256-byte block of the
+/// surface; each block then reads as that colour. The next bind of the
+/// target clears it to the colour of the block starts (not only the
+/// texels the kernel stored), and the keys become uncompressed. With
+/// `gpu_heads` the block starts are stored by GPU work (the layer is then
+/// filled from the first one on the GPU, without a read-back).
+fn single_colour_dcc_keys_clear_to_the_block_colour(gpu_heads: bool) {
+    const W: u32 = 32;
+    const SLICE: u64 = 0x10000;
+    let mut g = Guest::new(32 << 20);
+    let vs = g.program(&[asm::S_ENDPGM]);
+    let ps = solid_program(&mut g);
+    // A small triangle in one corner: the texels checked are not drawn.
+    let verts = g.alloc(&floats(&[-1.0, -1.0, 0.0, 1.0, -0.9, -1.0, 0.0, 1.0, -1.0, -0.9, 0.0, 1.0]));
+    // The surface's blocks: the clear colour (green) at each block start,
+    // zeros elsewhere (what the clear kernel leaves in memory).
+    let green = [0x00u8, 0xFF, 0x00, 0xFF];
+    let mut surface = vec![0u8; SLICE as usize];
+    if !gpu_heads {
+        for block in surface.chunks_mut(256) {
+            block[..4].copy_from_slice(&green);
+        }
+    }
+    let mut target = rgba8_target(g.alloc(&surface), W, W);
+    target.swizzle = crate::tiling::SWIZZLE_64KB_R_X;
+    target.pitch = 128;
+    target.slice_size = SLICE;
+    target.dcc_enabled = true;
+    let keys = 0x1000u64;
+    target.dcc_address = g.alloc(&vec![0xFFu8; keys as usize]);
+    assert_eq!(target.dcc_slice_size(), keys);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(TestCompiler::new().with(vs, TestProgram::PassthroughVertex { inputs: 1 }).with(ps, TestProgram::SolidPixel));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    p.set_vertex_input_resolver(Some(Box::new(FixedInputs(vec4_attrs(&[(verts, 48, 16, false)], &[(0, 0, 0)])))));
+    b.pipelines = Box::new(p);
+    let d = draw_into(target, stage(vs, &[]), stage(ps, &color_words([0.0, 0.0, 1.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    b.draw(&d);
+    assert_eq!(b.stats.recorded_draws, 1);
+    let id = b.images.find_or_create(&mut b.sched, &mut b.buffers, &color_key(&target)).unwrap();
+    let read = |b: &mut Backend| {
+        b.images.transit(&mut b.sched, id, crate::images::TRANSFER_SRC, None);
+        let image = b.images.get(id).unwrap().image.image;
+        read_image(&dev, &mut b.sched, image, W, W)
+    };
+    // Not a block start: the surface holds zero there.
+    assert_eq!(px(&read(&mut b), W, 17, 18), [0, 0, 0, 0]);
+    // The SDK clear: every key "single colour" (a fill on the GPU), then
+    // the colour at the block starts.
+    assert!(b.run_fill_kernel(target.dcc_address, keys, [0x1010_1010; 4]));
+    if gpu_heads {
+        assert!(b.buffers.fill(&mut b.sched, target.base, 4, u32::from_le_bytes(green)).unwrap());
+    }
+    b.draw(&d);
+    assert_eq!(b.stats.recorded_draws, 2);
+    let pixels = read(&mut b);
+    for (x, y) in [(17, 18), (31, 31), (8, 3)] {
+        assert_eq!(px(&pixels, W, x, y), green, "texel ({x}, {y})");
+    }
+    // The keys of the cleared slice are uncompressed: the next bind keeps
+    // what is drawn.
+    assert!(b.buffers.download(&mut b.sched, target.dcc_address, keys));
+    let mut k = vec![0u8; keys as usize];
+    assert!(g.mem.read_backing(target.dcc_address, &mut k));
+    assert!(k.iter().all(|&x| x == 0xFF));
+    assert_eq!(b.stats.dcc_cpu_reads, 0);
+}
+
+#[test]
+#[ignore]
+fn single_colour_dcc_keys_clear_to_the_block_colour_in_memory() {
+    single_colour_dcc_keys_clear_to_the_block_colour(false);
+}
+
+#[test]
+#[ignore]
+fn single_colour_dcc_keys_clear_to_the_block_colour_on_the_gpu() {
+    single_colour_dcc_keys_clear_to_the_block_colour(true);
+}
+
 /// GE_INDX_OFFSET moves the generated indices of an auto draw: with an
 /// offset of 3 the draw takes vertices 3..6 (a full-screen triangle), not
 /// 0..3 (one outside the viewport).

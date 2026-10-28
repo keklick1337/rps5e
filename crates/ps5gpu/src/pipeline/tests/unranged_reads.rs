@@ -125,3 +125,104 @@ fn unranged_bvh_reads_reach_memory_without_mirrors() {
     assert_eq!(out_words(&mut rig, mem, out)[..4], [0x9000; 4]);
 }
 
+
+/// image_bvh_intersect_ray of the node pointer `pointer`, origin (0.25,
+/// 0.5, 0.125), direction and inverse direction 1: the four result dwords
+/// of lane `tid` go to `out[tid]`, `out[64 + tid]`, `out[128 + tid]` and
+/// `out[192 + tid]`.
+fn all_results_program(g: &mut Guest, pointer: u32) -> u64 {
+    let mut code = vec![sa::vop1(sa::OP_V_MOV_B32, 4, sa::LITERAL), pointer, sa::vop1(sa::OP_V_MOV_B32, 5, sa::LITERAL), 10.0f32.to_bits()];
+    for (v, x) in [(6, 0.25f32), (7, 0.5), (8, 0.125)] {
+        code.extend([sa::vop1(sa::OP_V_MOV_B32, v, sa::LITERAL), x.to_bits()]);
+    }
+    for v in 9..15 {
+        code.push(sa::vop1(sa::OP_V_MOV_B32, v, sa::F_ONE));
+    }
+    code.extend([0xF198_8F07, 0x0002_1804, 0x0807_0605, 0x0C0B_0A09, 0x0000_0E0D]);
+    code.push(S_WAITCNT_0);
+    // v1 = v0 << 2
+    code.push((0x1A << 25) | (1 << 17) | (128 + 2));
+    for (k, v) in (24..28).enumerate() {
+        let [w0, w1] = asm::buffer_store_dword(v, 1, 0);
+        code.extend([w0 | (k as u32 * 256), w1]);
+    }
+    code.push(sa::S_ENDPGM);
+    g.program(&code)
+}
+
+/// Triangle (types 0 and 1), fp16 box and fp32 box nodes read with
+/// `RPS5E_BVH_VECTOR_LOADS` on give the results of the per-dword loads.
+#[test]
+#[ignore]
+fn bvh_vector_node_loads_match_dword_loads() {
+    use crate::shader::{EmitOptions, Features, SpirvCompiler};
+    let rig_with = |g: &Guest, vector: bool| {
+        Rig::with_compiler(
+            g,
+            |dev| {
+                let features = Features::of(dev);
+                Arc::new(SpirvCompiler::new(Features { emit: EmitOptions { bvh_vector_loads: vector, ..features.emit }, ..features }, Some(g.mem)))
+            },
+            None,
+            None,
+        )
+    };
+    // A triangle across the ray (vertices 0..3, the second triangle's
+    // third vertex, triangle id), and node words for the boxes: fp16
+    // halves and fp32 bounds around and off the ray, sorted children.
+    let mut triangle: Vec<u32> = [[2.0f32, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0], [1.5, 1.5, 0.0]].iter().flatten().map(|f| f.to_bits()).collect();
+    triangle.extend([0, 0, 0, 0x0000_0123]);
+    let mut box32 = vec![0x1005u32, 0x2005, 0x3005, 0x4005];
+    for (lo, hi) in [(-1.0f32, 1.0f32), (2.0, 3.0), (0.5, 4.0), (-3.0, -2.0)] {
+        box32.extend([lo.to_bits(); 3]);
+        box32.extend([hi.to_bits(); 3]);
+    }
+    let half = |x: f32| half_bits(x) as u32;
+    let mut box16 = vec![0x1004u32, 0x2004, 0x3004, 0x4004];
+    for (lo, hi) in [(-1.0f32, 1.0f32), (2.0, 3.0), (0.5, 4.0), (-3.0, -2.0)] {
+        box16.extend([half(lo) | half(lo) << 16, half(lo) | half(hi) << 16, half(hi) | half(hi) << 16]);
+    }
+    let mut results = Vec::new();
+    for vector in [false, true] {
+        let mut g = Guest::new(16 << 20);
+        let mut rig = rig_with(&g, vector);
+        let mem = g.mem;
+        let mut node_bytes = asm::bytes(&triangle);
+        node_bytes.resize(128, 0);
+        let tri = g.alloc(&node_bytes);
+        let b32 = g.alloc(&asm::bytes(&box32));
+        let b16 = g.alloc(&asm::bytes(&box16));
+        let out = g.zeroed(1024);
+        let mut rows = Vec::new();
+        for (node, pointer) in [(tri, 0u32), (tri, 1), (b16, 4), (b32, 5)] {
+            let cs = all_results_program(&mut g, pointer);
+            let mut d = query(cs, node, out);
+            // Box sorting on (T# word 1 bit 31).
+            d.shader.user_data[9] |= 0x8000_0000;
+            assert_eq!(rig.dispatch(&d), DrawOutcome::Recorded);
+            assert!(rig.buffers.download(&mut rig.sched, out, 1024));
+            let mut b = vec![0u8; 1024];
+            assert!(mem.read_backing(out, &mut b));
+            let w: Vec<u32> = b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            rows.push([w[0], w[64], w[128], w[192]]);
+        }
+        results.push(rows);
+    }
+    assert_eq!(results[0], results[1], "vector node loads changed a result");
+    // The node words reached the tests (not the zeros of a missing page).
+    assert_ne!(results[0][0], [0; 4]);
+    assert_ne!(results[0][3], [0xFFFF_FFFF; 4]);
+}
+
+/// f32 → f16 bits (normal values only).
+fn half_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+    let mant = ((b >> 13) & 0x3FF) as u16;
+    if x == 0.0 {
+        sign
+    } else {
+        sign | ((exp as u16) << 10) | mant
+    }
+}

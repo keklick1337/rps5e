@@ -7253,6 +7253,7 @@ fn create_compute_pipeline(dev: &GpuDevice, pipeline_cache: vk::PipelineCache, k
     }
     let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(key.layout).flags(flags);
     let t = std::time::Instant::now();
+    log::trace!("ps5gpu: creating compute pipeline of module {:#018x}", key.cs);
     // SAFETY: valid create info.
     let pipelines = unsafe { dev.device.create_compute_pipelines(pipeline_cache, &[info], None) }.map_err(|(_, e)| e)?;
     if dev.caps.pipeline_executable_info {

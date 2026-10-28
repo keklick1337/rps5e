@@ -506,8 +506,20 @@ impl Presenter {
 }
 
 fn log_once(msg: &str) {
-    // Asked per draw by some paths (dummy bindings): a seen message costs
-    // a lookup, no allocation.
+    // Asked per draw by some paths (dummy bindings): a message this thread
+    // saw costs a hash and a thread-local lookup (no lock, no allocation).
+    std::thread_local! {
+        static LOCAL: std::cell::RefCell<crate::fxhash::HashSet<u64>> = std::cell::RefCell::new(Default::default());
+    }
+    let hash = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = rustc_hash::FxBuildHasher.build_hasher();
+        h.write(msg.as_bytes());
+        h.finish()
+    };
+    if LOCAL.with(|l| !l.borrow_mut().insert(hash)) {
+        return;
+    }
     static SEEN: Mutex<Option<crate::fxhash::HashSet<String>>> = Mutex::new(None);
     let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let seen = g.get_or_insert_with(Default::default);

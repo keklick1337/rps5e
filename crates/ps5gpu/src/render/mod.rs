@@ -415,7 +415,13 @@ impl ColorTarget {
     /// The fast-clear color of CB_COLOR_CLEAR_WORD0/1 in the target format
     /// (the words hold the stored texel, moved to the host layout first).
     pub fn register_clear(&self) -> Option<ash::vk::ClearColorValue> {
-        let mut words = [self.clear_word0, self.clear_word1];
+        self.stored_clear([self.clear_word0, self.clear_word1])
+    }
+
+    /// The clear value of one element as the target stores it in memory
+    /// (`words`: its bytes, little-endian; elements narrower than 8 bytes
+    /// in the low bits), moved to the host layout first.
+    pub fn stored_clear(&self, mut words: [u32; 2]) -> Option<ash::vk::ClearColorValue> {
         self.format.transform().apply(&mut words, true);
         formats::decode_clear_color(self.format.host, words)
     }

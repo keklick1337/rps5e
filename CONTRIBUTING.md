@@ -74,7 +74,7 @@ Everything that belongs to your machine goes into `local/` (it is the only ignor
 
 ## Branches and versions
 
-The project is in early development. All work, including pull requests, goes straight into `master`, which is always the current development version and can be unstable. Versions are marked with tags (`v0.1.0-alpha.1`, ...); each tag gets prebuilt Linux and Windows archives on the Releases page. If you want something that was tested as a whole, use a tagged release; if you want the newest fixes, build `master`.
+The project is in early development. All work, including pull requests, goes straight into `master`, which is always the current development version and can be unstable. Versions are marked with tags (`v0.1.1-alpha`, ...); each tag gets prebuilt Linux and Windows archives on the Releases page. If you want something that was tested as a whole, use a tagged release; if you want the newest fixes, build `master`.
 
 ## Pull requests
 

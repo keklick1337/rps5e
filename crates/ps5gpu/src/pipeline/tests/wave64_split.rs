@@ -128,6 +128,139 @@ const LANE_MOVES_AT_THE_HALF_BOUNDARY: &[u32] = &[
 /// if/else on even lanes through saveexec, xor and or (float arithmetic
 /// the host rounds like the hardware).
 /// Outputs: 3 regions.
+/// A lane stack and SGPR spills (the code a compiler makes for a
+/// wave-coherent traversal): 45 pushes with `v_writelane` at an SGPR lane
+/// (crossing into the high half, with EXEC 0xffff), pops with
+/// `v_readlane` at that lane into an order-dependent hash, spills to lanes
+/// 5, 33 and 40 of v12 read back after the loops, both registers used as
+/// per-lane values, and a run of six writes under EXEC 0xffff (an EXEC
+/// run branch) of which one adds to v12. Outputs: 8 regions.
+const LANE_STACK_AND_SPILLS: &[u32] = &[
+    0x343c0082, // v_lshlrev_b32_e32 v30, 2, v0
+    0x16060087, // v_mul_u32_u24_e32 v3, 7, v0
+    0x7e2e02ff, 0x00000055, // v_mov_b32_e32 v23, 0x55
+    0x7e180280, // v_mov_b32_e32 v12, 0
+    0xbe8c03ff, 0x00001234, // s_mov_b32 s12, 0x1234
+    0xbe8d03ff, 0x00005678, // s_mov_b32 s13, 0x5678
+    0xd761000c, 0x02010a0c, // v_writelane_b32 v12, s12, 5
+    0xd761000c, 0x0201500d, // v_writelane_b32 v12, s13, 40
+    0xbe9c047e, // s_mov_b64 s[28:29], exec
+    0xbefe03ff, 0x0000ffff, // s_mov_b32 exec_lo, 0xffff
+    0xbeff0380, // s_mov_b32 exec_hi, 0
+    0xbeb10380, // s_mov_b32 s49, 0
+    0xbe8e0380, // s_mov_b32 s14, 0
+    0x930f830e, // s_mul_i32 s15, s14, 3
+    0x800f810f, // s_add_u32 s15, s15, 1
+    0xd7610017, 0x0200620f, // v_writelane_b32 v23, s15, s49
+    0x80318131, // s_add_u32 s49, s49, 1
+    0x800e810e, // s_add_u32 s14, s14, 1
+    0xbf0aad0e, // s_cmp_lt_u32 s14, 45
+    0xbf85fff8, // s_cbranch_scc1 push
+    0x4a500681, // v_add_nc_u32_e32 v40, 1, v3
+    0x4a520682, // v_add_nc_u32_e32 v41, 2, v3
+    0x4a181883, // v_add_nc_u32_e32 v12, 3, v12
+    0x4a540684, // v_add_nc_u32_e32 v42, 4, v3
+    0x4a560685, // v_add_nc_u32_e32 v43, 5, v3
+    0x4a580686, // v_add_nc_u32_e32 v44, 6, v3
+    0xbefe041c, // s_mov_b64 exec, s[28:29]
+    0x80b18731, // s_sub_u32 s49, s49, 7
+    0xd761000c, 0x02014231, // v_writelane_b32 v12, s49, 33
+    0x4a040717, // v_add_nc_u32_e32 v2, v23, v3
+    0xbe900380, // s_mov_b32 s16, 0
+    0x80b18131, // s_sub_u32 s49, s49, 1
+    0xd7600011, 0x02006317, // v_readlane_b32 s17, v23, s49
+    0x93109f10, // s_mul_i32 s16, s16, 31
+    0x80101110, // s_add_u32 s16, s16, s17
+    0xbf078031, // s_cmp_lg_u32 s49, 0
+    0xbf85fff9, // s_cbranch_scc1 pop
+    0xd7600012, 0x02010b0c, // v_readlane_b32 s18, v12, 5
+    0xd7600013, 0x0201510c, // v_readlane_b32 s19, v12, 40
+    0xd7600014, 0x0201430c, // v_readlane_b32 s20, v12, 33
+    0x7e020210, // v_mov_b32_e32 v1, s16
+    0xe0701000, 0x800c011e, // buffer_store_dword v1, v30, s[48:51], 0 offen
+    0x7e020212, // v_mov_b32_e32 v1, s18
+    0xe0701100, 0x800c011e, // buffer_store_dword v1, v30, s[48:51], 0 offen offset:256
+    0x7e020213, // v_mov_b32_e32 v1, s19
+    0xe0701200, 0x800c011e, // buffer_store_dword v1, v30, s[48:51], 0 offen offset:512
+    0x7e020214, // v_mov_b32_e32 v1, s20
+    0xe0701300, 0x800c011e, // buffer_store_dword v1, v30, s[48:51], 0 offen offset:768
+    0xe0701400, 0x800c171e, // buffer_store_dword v23, v30, s[48:51], 0 offen offset:1024
+    0xe0701500, 0x800c0c1e, // buffer_store_dword v12, v30, s[48:51], 0 offen offset:1280
+    0xe0701600, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:1536
+    0x4a505328, // v_add_nc_u32_e32 v40, v40, v41
+    0x4a505528, // v_add_nc_u32_e32 v40, v40, v42
+    0x4a505728, // v_add_nc_u32_e32 v40, v40, v43
+    0x4a505928, // v_add_nc_u32_e32 v40, v40, v44
+    0xe0701700, 0x800c281e, // buffer_store_dword v40, v30, s[48:51], 0 offen offset:1792
+    0xbf810000, // s_endpgm
+];
+
+/// Lane reads at the first set lane of a compare mask (`s_ff1_i32_b64`
+/// then `v_readlane`): the first lane in the high half, an empty mask
+/// (lane 63), the first lane in the low half, a mask made under EXEC
+/// 0xff00 in the high word, and a compare of a register written in a run
+/// of six writes under EXEC 0xffff (an EXEC run branch: the compare's
+/// operand becomes a phi of the run's join). Outputs: 7 regions.
+const FIRST_LANE_READS: &[u32] = &[
+    0x343c0082, // v_lshlrev_b32_e32 v30, 2, v0
+    0x16060087, // v_mul_u32_u24_e32 v3, 7, v0
+    0x7e0c02ff, 0x00000100, // v_mov_b32_e32 v6, 0x100
+    0x7e0e02ff, 0x00000100, // v_mov_b32_e32 v7, 0x100
+    0x7e1002ff, 0x00000100, // v_mov_b32_e32 v8, 0x100
+    0x7e1202ff, 0x00000100, // v_mov_b32_e32 v9, 0x100
+    0x7e1402ff, 0x00000100, // v_mov_b32_e32 v10, 0x100
+    0x7e1602ff, 0x00000100, // v_mov_b32_e32 v11, 0x100
+    0x7d8200a8, // v_cmp_lt_u32_e32 vcc, 40, v0
+    0x020206c1, // v_cndmask_b32_e32 v1, -1, v3, vcc
+    0xd4c50014, 0x000202c1, // v_cmp_ne_u32_e64 s[20:21], -1, v1
+    0xbe961414, // s_ff1_i32_b64 s22, s[20:21]
+    0xd7600017, 0x02002d03, // v_readlane_b32 s23, v3, s22
+    0xd7600018, 0x02002d01, // v_readlane_b32 s24, v1, s22
+    0xd4c4001a, 0x00020080, // v_cmp_gt_u32_e64 s[26:27], 0, v0
+    0xbe99141a, // s_ff1_i32_b64 s25, s[26:27]
+    0xd760001c, 0x02003303, // v_readlane_b32 s28, v3, s25
+    0xd4c2001e, 0x00020089, // v_cmp_eq_u32_e64 s[30:31], 9, v0
+    0xbe9d141e, // s_ff1_i32_b64 s29, s[30:31]
+    0xd7600020, 0x02003b03, // v_readlane_b32 s32, v3, s29
+    0xbea2047e, // s_mov_b64 s[34:35], exec
+    0xbefe0380, // s_mov_b32 exec_lo, 0
+    0xbeff03ff, 0x0000ff00, // s_mov_b32 exec_hi, 0xff00
+    0xd4c10024, 0x000200ac, // v_cmp_lt_u32_e64 s[36:37], 44, v0
+    0xbea11424, // s_ff1_i32_b64 s33, s[36:37]
+    0xbefe0422, // s_mov_b64 exec, s[34:35]
+    0xd7600026, 0x02004303, // v_readlane_b32 s38, v3, s33
+    0x7e040217, // v_mov_b32_e32 v2, s23
+    0xe0701000, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen
+    0x7e040218, // v_mov_b32_e32 v2, s24
+    0xe0701100, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:256
+    0x7e04021c, // v_mov_b32_e32 v2, s28
+    0xe0701200, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:512
+    0x7e040220, // v_mov_b32_e32 v2, s32
+    0xe0701300, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:768
+    0x7e040226, // v_mov_b32_e32 v2, s38
+    0xe0701400, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:1024
+    0xbefe03ff, 0x0000ffff, // s_mov_b32 exec_lo, 0xffff
+    0xbeff0380, // s_mov_b32 exec_hi, 0
+    0x4a0c0081, // v_add_nc_u32_e32 v6, 1, v0
+    0x4a0e0082, // v_add_nc_u32_e32 v7, 2, v0
+    0x4a100083, // v_add_nc_u32_e32 v8, 3, v0
+    0x4a120084, // v_add_nc_u32_e32 v9, 4, v0
+    0x4a140085, // v_add_nc_u32_e32 v10, 5, v0
+    0x4a160086, // v_add_nc_u32_e32 v11, 6, v0
+    0xbefe0422, // s_mov_b64 exec, s[34:35]
+    0xd4c10028, 0x00020c8a, // v_cmp_lt_u32_e64 s[40:41], 10, v6
+    0xbea71428, // s_ff1_i32_b64 s39, s[40:41]
+    0xd760002a, 0x02004f03, // v_readlane_b32 s42, v3, s39
+    0x7e04022a, // v_mov_b32_e32 v2, s42
+    0xe0701500, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:1280
+    0x4a041107, // v_add_nc_u32_e32 v2, v7, v8
+    0x4a041302, // v_add_nc_u32_e32 v2, v2, v9
+    0x4a041502, // v_add_nc_u32_e32 v2, v2, v10
+    0x4a041702, // v_add_nc_u32_e32 v2, v2, v11
+    0xe0701600, 0x800c021e, // buffer_store_dword v2, v30, s[48:51], 0 offen offset:1536
+    0xbf810000, // s_endpgm
+];
+
 const DIVERGENT_LOOP_AND_IF_ELSE: &[u32] = &[
     0x343c0082, // v_lshlrev_b32_e32 v30, 2, v0
     0x36020087, // v_and_b32_e32 v1, 7, v0
@@ -217,9 +350,28 @@ const WAVES_BARRIER_AND_LDS: &[u32] = &[
     0xbf810000, // s_endpgm
 ];
 
-/// 256 threads: a ballot inside an `s_cbranch_execz` region the first
+/// 256 threads: a lane read inside an `s_cbranch_execz` region the first
 /// wave skips. The exchange would sit under control flow that differs
 /// between the waves, so the program runs paired.
+const LANE_READ_UNDER_A_WAVE_DEPENDENT_BRANCH: &[u32] = &[
+    0x343c0082, // v_lshlrev_b32_e32 v30, 2, v0
+    0x7e0a0280, // v_mov_b32_e32 v5, 0
+    0x7d8200ff, 0x00000060, // v_cmp_lt_u32_e32 vcc, 0x60, v0
+    0xbe94047e, // s_mov_b64 s[20:21], exec
+    0x87fe6a7e, // s_and_b64 exec, exec, vcc
+    0xbf880004, // s_cbranch_execz skip
+    0x36080083, // v_and_b32_e32 v4, 3, v0
+    0xd7600012, 0x02010b04, // v_readlane_b32 s18, v4, 5
+    0x4a0a0812, // v_add_nc_u32_e32 v5, s18, v4
+    0xbefe0414, // s_mov_b64 exec, s[20:21]
+    0xe0701000, 0x800c051e, // buffer_store_dword v5, v30, s[48:51], 0 offen
+    0xbf810000, // s_endpgm
+];
+
+/// 256 threads: a ballot inside an `s_cbranch_execz` region the first
+/// wave skips. Its predicate is known before the region: it rides on the
+/// exchange of the branch's own ballot, outside the region, and the
+/// program runs split.
 const BALLOT_UNDER_A_WAVE_DEPENDENT_BRANCH: &[u32] = &[
     0x343c0082, // v_lshlrev_b32_e32 v30, 2, v0
     0x7e0a0280, // v_mov_b32_e32 v5, 0
@@ -597,6 +749,54 @@ fn wave64_split_ballots_and_lane_reads() {
 
 #[test]
 #[ignore]
+fn wave64_split_lane_stack_and_spills() {
+    for threads in [64, 40] {
+        let c = case(if threads == 64 { "Wave64SplitLaneStackAndSpills" } else { "Wave64SplitLaneStackAndSpillsPartialWave" }, LANE_STACK_AND_SPILLS, threads, 0, 512);
+        // The lane-indexed registers are lane slots: no lane read is an
+        // exchange.
+        let plan = split_plan(&c).unwrap();
+        assert!(plan.counts[5] > 0 && plan.counts[1] == 0, "{}: lane reads {:?}", c.name, plan.counts);
+        let w = check(&c, true);
+        assert_eq!(at(&w, 0, 0), 0x119585c7, "hash of the popped lanes");
+        assert_eq!((at(&w, 1, 0), at(&w, 2, 0), at(&w, 3, 0)), (0x1234 + 3, 0x5678, 38), "spilled lanes 5, 40 and 33");
+        for l in 0..threads as usize {
+            let v23 = if l < 45 { 3 * l as u32 + 1 } else { 0x55 };
+            assert_eq!(at(&w, 4, l), v23, "v23 lane {l}");
+            assert_eq!(at(&w, 6, l), v23 + 7 * l as u32, "v23 + 7 * lane, lane {l}");
+            let v12 = match l {
+                5 => 0x1234 + 3,
+                33 => 38,
+                40 => 0x5678,
+                _ if l < 16 => 3,
+                _ => 0,
+            };
+            assert_eq!(at(&w, 5, l), v12, "v12 lane {l}");
+            assert_eq!(at(&w, 7, l), if l < 16 { 18 + 35 * l as u32 } else { 0 }, "writes under EXEC 0xffff, lane {l}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn wave64_split_first_lane_reads() {
+    for threads in [64, 40] {
+        let c = case(if threads == 64 { "Wave64SplitFirstLaneReads" } else { "Wave64SplitFirstLaneReadsPartialWave" }, FIRST_LANE_READS, threads, 0, 448);
+        // The reads ride on their ballots' exchanges, the later ballots on
+        // the first one's.
+        let plan = split_plan(&c).unwrap();
+        assert!(plan.counts[6] >= 4 && plan.counts[1] == 0 && plan.counts[7] >= 2, "{}: exchanges {:?}", c.name, plan.counts);
+        let w = check(&c, true);
+        if threads == 64 {
+            assert_eq!((at(&w, 0, 0), at(&w, 1, 0)), (41 * 7, 41 * 7), "first lane above 40");
+            assert_eq!(at(&w, 2, 0), 63 * 7, "empty mask: lane 63");
+            assert_eq!(at(&w, 4, 0), 45 * 7, "mask under EXEC 0xff00 << 32");
+        }
+        assert_eq!(at(&w, 3, 0), 9 * 7, "first lane 9");
+    }
+}
+
+#[test]
+#[ignore]
 fn wave64_split_lane_moves_at_the_half_boundary() {
     let c = case("Wave64SplitLaneMovesAtTheHalfBoundary", LANE_MOVES_AT_THE_HALF_BOUNDARY, 64, 0, 640);
     let w = check(&c, true);
@@ -643,10 +843,17 @@ fn wave64_split_waves_barrier_and_lds() {
 
 #[test]
 #[ignore]
-fn wave64_split_falls_back_for_a_ballot_under_a_wave_dependent_branch() {
+fn wave64_split_ballot_under_a_wave_dependent_branch_rides_outside() {
     let c = case("Wave64SplitBallotUnderAWaveDependentBranch", BALLOT_UNDER_A_WAVE_DEPENDENT_BRANCH, 256, 0, 256);
-    let w = check(&c, false);
+    let w = check(&c, true);
     assert_eq!((w[0], w[100], w[200]), (0, 8, 16));
+}
+
+#[test]
+#[ignore]
+fn wave64_split_falls_back_for_a_lane_read_under_a_wave_dependent_branch() {
+    let c = case("Wave64SplitLaneReadUnderAWaveDependentBranch", LANE_READ_UNDER_A_WAVE_DEPENDENT_BRANCH, 256, 0, 256);
+    check(&c, false);
 }
 
 // ----------------------------------------------------------------------

@@ -278,6 +278,18 @@ impl App {
                     ui.label("Overlay");
                     ui.checkbox(&mut opts.perf_overlay, "Performance overlay from the start (F10 toggles)");
                     ui.end_row();
+                    ui.label("Display resolution").on_hover_text("RPS5E_DISPLAY_RESOLUTION: the TV resolution the game is told about");
+                    let current = match opts.display_resolution.trim() {
+                        "" => "From the game's settings",
+                        v => crate::config::DISPLAY_RESOLUTIONS.iter().find(|m| m.0 == v).map(|m| m.1).unwrap_or(v),
+                    };
+                    egui::ComboBox::from_id_salt("rw-display-res").selected_text(current).width(180.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut opts.display_resolution, String::new(), "From the game's settings");
+                        for (k, label) in crate::config::DISPLAY_RESOLUTIONS {
+                            ui.selectable_value(&mut opts.display_resolution, k.to_string(), label);
+                        }
+                    });
+                    ui.end_row();
                     ui.label("Shader compile wait").on_hover_text("RPS5E_COMPILE_WAIT_MS: how long a frame waits for shaders still compiling");
                     ui.horizontal(|ui| {
                         let mode = match opts.compile_wait.trim() {

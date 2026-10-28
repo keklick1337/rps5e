@@ -20,13 +20,14 @@ static NEXT: AtomicU64 = AtomicU64::new(0x60_0000_0000);
 /// takes other paths than the tests mean to check.
 const LOW_SPACE_END: u64 = 1 << 40;
 
-/// A slot of `len` bytes from `next`, sized to the mapping (2 MiB aligned)
-/// with a 64 MiB unmapped gap after it. Slots sized 4 GiB each ran past
+/// A slot of `len` bytes from `next`, sized to the mapping (aligned to the
+/// tracker's blocks, so every slot starts on a block whatever slots other
+/// tests took before it) with a 64 MiB unmapped gap after it. Slots sized 4 GiB each ran past
 /// 1 TiB in a long run of the device tests, and every test after that
 /// read its results through the wrong path (order-dependent failures).
 fn slot(next: &AtomicU64, len: usize, end: u64) -> u64 {
     const GAP: u64 = 64 << 20;
-    let stride = (len as u64).next_multiple_of(2 << 20) + GAP;
+    let stride = (len as u64).next_multiple_of(crate::memory::BLOCK_BYTES) + GAP;
     let start = next.fetch_add(stride, Ordering::SeqCst);
     assert!(start + len as u64 <= end, "test guest slots exhausted at {start:#x} (+{len:#x})");
     start

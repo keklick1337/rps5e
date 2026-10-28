@@ -2565,7 +2565,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "ps5core"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "ps5cpu"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "iced-x86",
  "libc",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "ps5elf"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "bitflags 2.13.1",
  "bytemuck",
@@ -2604,7 +2604,7 @@ dependencies = [
 
 [[package]]
 name = "ps5gpu"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "ab_glyph",
  "ash",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "ps5hle"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "ab_glyph_rasterizer",
  "base64",
@@ -2659,7 +2659,7 @@ dependencies = [
 
 [[package]]
 name = "ps5input"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "libloading",
  "log",
@@ -2672,7 +2672,7 @@ dependencies = [
 
 [[package]]
 name = "ps5nid"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "base64",
  "sha1",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "ps5pkg"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "aes",
  "flate2",
@@ -2691,14 +2691,14 @@ dependencies = [
 
 [[package]]
 name = "ps5shader"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "smallvec",
 ]
 
 [[package]]
 name = "ps5vm"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "bytemuck",
  "libc",
@@ -2831,7 +2831,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rps5e-cli"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "anyhow",
  "clap",
@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "rps5e-gui"
-version = "0.1.0-alpha.2"
+version = "0.1.1-alpha"
 dependencies = [
  "eframe",
  "egui_file",

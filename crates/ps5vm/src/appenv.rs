@@ -18,6 +18,18 @@ pub fn app_dir(base: &Path) -> PathBuf {
     base.join(APP_DIR)
 }
 
+/// The host's per-user cache base (the emulator's caches live in
+/// [`app_dir`] of it): `%LOCALAPPDATA%` on Windows, else `$XDG_CACHE_HOME`,
+/// else `~/.cache`. None when none of them is set.
+pub fn cache_base() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    #[cfg(windows)]
+    if let Some(d) = var("LOCALAPPDATA") {
+        return Some(d);
+    }
+    var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|h| h.join(".cache")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

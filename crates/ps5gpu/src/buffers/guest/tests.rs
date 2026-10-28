@@ -301,3 +301,41 @@ fn private_mappings_are_imported_in_place() {
     assert_eq!(read_table(&dev, &mut s, &g, first, 1)[0], 0);
     s.flush_and_wait();
 }
+
+/// A range inside one mapping is a transfer source in its import (the
+/// copy reads the guest bytes at their offset); a range over an unmapped
+/// hole is not.
+#[test]
+#[ignore]
+fn source_slice_reads_guest_bytes() {
+    let dev = crate::device::GpuDevice::create(false).expect("device");
+    if !dev.caps.external_memory_host {
+        eprintln!("VK_EXT_external_memory_host not supported; skipped");
+        return;
+    }
+    let mem = testutil::test_memory();
+    let len = 4u64 << 20;
+    let (view, _alias) = testutil::guest_mapping(mem, len as usize);
+    let mut s = Scheduler::new(&dev).unwrap();
+    let mut g = GuestImports::new(&dev, mem, &mut s).unwrap().expect("imports");
+    g.sync(&mut s);
+    let at = view + CACHING_PAGE * 2 + 0x300;
+    // SAFETY: the guest view is mapped read/write.
+    let words = unsafe { std::slice::from_raw_parts_mut(at as *mut u32, 1024) };
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = 0xA000_0000 | i as u32;
+    }
+    let (src, off) = g.source_slice(at, 4096).expect("one import covers the range");
+    let out = Buffer::new(&dev, 4096, vk::BufferUsageFlags::TRANSFER_DST, MemoryUse::Download).unwrap();
+    let cb = s.cmd();
+    // SAFETY: recording buffer; the import lives for the process.
+    unsafe { dev.device.cmd_copy_buffer(cb, src, out.buffer, &[vk::BufferCopy { src_offset: off, dst_offset: 0, size: 4096 }]) };
+    s.flush_and_wait();
+    out.invalidate(0, 4096);
+    let got: Vec<u32> = out.bytes_mut()[..4096].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert!(got.iter().enumerate().all(|(i, &w)| w == 0xA000_0000 | i as u32));
+    testutil::unmap_guest(mem, view + CACHING_PAGE * 8, CACHING_PAGE);
+    g.sync(&mut s);
+    assert!(g.source_slice(view + CACHING_PAGE * 7, CACHING_PAGE * 3).is_none(), "a hole in the range");
+    s.flush_and_wait();
+}
