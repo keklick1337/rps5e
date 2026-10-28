@@ -20,13 +20,27 @@
 //! u32 flags2, u32 data offset, u32 data size, u64 pad}`; flags1 bit 31
 //! marks an encrypted entry. Names of unnamed system entries follow from
 //! their id; others come from the name table entry (id 0x200).
+//!
+//! A PS5 package ("\x7FFIH", [`FihHeader`]) starts with a little-endian
+//! header, then the outer PFS image, then a "\x7FCNT" container with the
+//! metadata entries (param.json, icons, ...):
+//! ```text
+//! 0x05 u8  0x80 retail (encrypted with console keys), 0x00 development
+//! 0x10 u64 outer PFS offset   0x18 u64 outer PFS size
+//! 0x20 u64 absolute offset of the outer PFS superblock
+//! 0x58 u64 offset of the embedded CNT container
+//! 0x90 u32 64 KiB blocks of pfs_image.dat   0xA8 u64 size of naps_pkg_layout.dat
+//! ```
+//! Entry offsets of the embedded container count from its own start.
 
 use crate::io::{be_u32, be_u64, read_vec, ReadAt};
 use crate::Error;
 
 pub const PKG_MAGIC: [u8; 4] = *b"\x7FCNT";
-/// The PS5 retail container. It is always encrypted with console keys.
+/// The PS5 container (retail or development, see [`FihHeader`]).
 pub const PS5_RETAIL_MAGIC: [u8; 4] = *b"\x7FFIH";
+/// Alias of [`PS5_RETAIL_MAGIC`].
+pub const FIH_MAGIC: [u8; 4] = PS5_RETAIL_MAGIC;
 pub const PKG_HEADER_SIZE: usize = 0x1000;
 pub const ENTRY_SIZE: usize = 0x20;
 
@@ -34,6 +48,10 @@ pub const CONTENT_TYPE_GD: u32 = 0x1A;
 pub const CONTENT_TYPE_AC: u32 = 0x1B;
 pub const CONTENT_TYPE_AL: u32 = 0x1C;
 pub const CONTENT_TYPE_DP: u32 = 0x1E;
+/// PS5 game, additional content with data, additional content license.
+pub const CONTENT_TYPE_PS5_GD: u32 = 0x20;
+pub const CONTENT_TYPE_PS5_AC: u32 = 0x21;
+pub const CONTENT_TYPE_PS5_AL: u32 = 0x22;
 
 pub const CONTENT_FLAG_FIRST_PATCH: u32 = 0x0010_0000;
 pub const CONTENT_FLAG_SUBSEQUENT_PATCH: u32 = 0x4000_0000;
@@ -55,6 +73,8 @@ pub const ENTRY_PARAM_JSON: u32 = 0x100B; // shareparam.json in PS4 packages
 pub const ENTRY_ICON0_PNG: u32 = 0x1200;
 pub const ENTRY_PIC0_PNG: u32 = 0x1220;
 pub const ENTRY_PIC1_PNG: u32 = 0x1006;
+/// param.json of a PS5 package.
+pub const ENTRY_PS5_PARAM_JSON: u32 = 0x2000;
 
 /// File name of a well-known entry id.
 pub fn entry_name(id: u32) -> Option<&'static str> {
@@ -96,6 +116,7 @@ pub fn entry_name(id: u32) -> Option<&'static str> {
         0x1280 => "icon0.dds",
         0x12A0 => "pic0.dds",
         0x12C0 => "pic1.dds",
+        0x2000 => "param.json",
         _ => return None,
     })
 }
@@ -143,8 +164,8 @@ impl PkgHeader {
             return Err(Error::Format("file shorter than a PKG header".into()));
         }
         let h = read_vec(src, 0, PKG_HEADER_SIZE)?;
-        if h[..4] == PS5_RETAIL_MAGIC {
-            return Err(Error::Encrypted("PS5 retail package: encrypted with console keys, cannot be used".into()));
+        if h[..4] == FIH_MAGIC {
+            return Err(Error::Format("a PS5 package: read it with FihHeader".into()));
         }
         if h[..4] != PKG_MAGIC {
             return Err(Error::Format("not a PKG file (bad magic)".into()));
@@ -221,7 +242,10 @@ impl PkgHeader {
         self.content_type == CONTENT_TYPE_DP || self.content_flags & CONTENT_FLAG_DELTA_PATCH == CONTENT_FLAG_DELTA_PATCH
     }
     pub fn is_additional_content(&self) -> bool {
-        matches!(self.content_type, CONTENT_TYPE_AC | CONTENT_TYPE_AL)
+        matches!(self.content_type, CONTENT_TYPE_AC | CONTENT_TYPE_AL | CONTENT_TYPE_PS5_AC | CONTENT_TYPE_PS5_AL)
+    }
+    pub fn is_game(&self) -> bool {
+        matches!(self.content_type, CONTENT_TYPE_GD | CONTENT_TYPE_PS5_GD)
     }
 
     /// Digest stored for derived key `index` (entry keys: 32-byte seed
@@ -233,5 +257,60 @@ impl PkgHeader {
         }
         let v = read_vec(src, e.offset as u64 + 32 + index as u64 * 32, 32).ok()?;
         v.try_into().ok()
+    }
+}
+
+/// Header of a PS5 package (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FihHeader {
+    /// Signed byte 0x80: a retail package, encrypted with console keys.
+    pub retail: bool,
+    pub image_offset: u64,
+    pub image_size: u64,
+    /// Absolute offset of the outer superblock (0 when not recorded).
+    pub superblock_offset: u64,
+    pub cnt_offset: u64,
+    pub inner_image_blocks: u32,
+    pub naps_layout_size: u64,
+}
+
+impl FihHeader {
+    pub const SIZE: usize = 0x100;
+
+    pub fn parse(src: &dyn ReadAt) -> Result<Self, Error> {
+        if src.len() < Self::SIZE as u64 {
+            return Err(Error::Format("file shorter than a PS5 package header".into()));
+        }
+        let h = read_vec(src, 0, Self::SIZE)?;
+        if h[..4] != FIH_MAGIC {
+            return Err(Error::Format("not a PS5 package (bad magic)".into()));
+        }
+        let le = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
+        let hdr = FihHeader {
+            retail: h[5] == 0x80,
+            image_offset: le(0x10),
+            image_size: le(0x18),
+            superblock_offset: le(0x20),
+            cnt_offset: le(0x58),
+            inner_image_blocks: u32::from_le_bytes(h[0x90..0x94].try_into().unwrap()),
+            naps_layout_size: le(0xA8),
+        };
+        if !hdr.retail && h[5] != 0 {
+            return Err(Error::Format(format!("PS5 package with unknown signed byte {:#x}", h[5])));
+        }
+        let in_file = |o: u64, n: u64| o.checked_add(n).is_some_and(|e| e <= src.len());
+        if !in_file(hdr.image_offset, hdr.image_size) || !in_file(hdr.cnt_offset, PKG_HEADER_SIZE as u64) {
+            return Err(Error::Format("PS5 package header points outside the file".into()));
+        }
+        Ok(hdr)
+    }
+
+    /// Offset of the outer superblock inside the outer image: the recorded
+    /// one, else the block after pfs_image.dat and naps_pkg_layout.dat.
+    pub fn superblock_in_image(&self) -> u64 {
+        if self.superblock_offset > self.image_offset && self.superblock_offset < self.image_offset + self.image_size {
+            return self.superblock_offset - self.image_offset;
+        }
+        (self.inner_image_blocks as u64 + self.naps_layout_size.div_ceil(0x1_0000)) * 0x1_0000
     }
 }

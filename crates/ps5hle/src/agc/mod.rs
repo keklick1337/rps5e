@@ -235,13 +235,12 @@ pub(crate) fn set_guest_call(f: GuestCallFn) {
     *GUEST_CALL.write().unwrap() = f;
 }
 
-fn remaining_dwords(up: u64, down: u64, reserved: u32) -> u32 {
-    let avail = if down >= up { ((down - up) / 4).min(u32::MAX as u64) } else { 0 };
-    if avail > reserved as u64 {
-        (avail - reserved as u64) as u32
-    } else {
-        0
-    }
+/// Free dwords between the cursors minus the reserved tail. The library
+/// computes `(cursorDown - cursorUp) >> 2` in unsigned 64-bit arithmetic, so
+/// a buffer whose cursorDown is 0 (titles set it so for a buffer they sized
+/// beforehand) never reports itself full.
+fn remaining_dwords(up: u64, down: u64, reserved: u32) -> u64 {
+    (down.wrapping_sub(up) >> 2).saturating_sub(reserved as u64)
 }
 
 /// Reserve `n` dwords in the command buffer at `cb`; with `advance` the
@@ -262,7 +261,7 @@ pub(crate) fn prepare_dwords(cb: u64, n: u32, advance: bool) -> Option<u64> {
     let callback = field(CB_CALLBACK);
     let user = field(CB_USER_DATA);
     let mut reserved = u32::from_le_bytes(header[(CB_RESERVED_DW - CB_CURSOR_UP) as usize..][..4].try_into().unwrap());
-    if n > remaining_dwords(up, down, reserved) {
+    if n as u64 > remaining_dwords(up, down, reserved) {
         if callback == 0 {
             log::warn!("[agc] command buffer 0x{cb:x} full (need {n} dwords) and no callback");
             return None;
@@ -274,7 +273,7 @@ pub(crate) fn prepare_dwords(cb: u64, n: u32, advance: bool) -> Option<u64> {
         up = mem::r64(cb + CB_CURSOR_UP)?;
         down = mem::r64(cb + CB_CURSOR_DOWN)?;
         reserved = mem::r32(cb + CB_RESERVED_DW)?;
-        if n > remaining_dwords(up, down, reserved) {
+        if n as u64 > remaining_dwords(up, down, reserved) {
             log::warn!("[agc] command buffer 0x{cb:x} still full after callback (need {n}, result 0x{r:x})");
             return None;
         }

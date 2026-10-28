@@ -11,8 +11,10 @@
 //!   downloaded, except *read-through* pages: their guest memory holds the
 //!   GPU contents as of an earlier point and every GPU write to them is
 //!   copied into guest memory after it (write-through), so the CPU reads
-//!   them like the GPU's memory on the console (the last completed write;
-//!   a synchronised read after the end-of-pipe signal sees the new data).
+//!   them like the GPU's memory on the console (the last completed write).
+//!   A label the command processor publishes ends read-through for pages
+//!   whose copy has not landed yet, so a read synchronised with the label
+//!   faults and sees the new data (`BufferCache::publish_point`).
 //!   CPU writes to them still fault.
 //! * A GPU-dirty page whose current contents are being copied into guest
 //!   memory (write-through, settling, a download into the guest pages'

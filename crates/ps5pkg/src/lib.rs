@@ -10,31 +10,46 @@
 //!   (AES-XTS with a key derived from the content id and the package
 //!   passcode, no console keys) and the inner `pfs_image.dat` (PFSC);
 //! - **raw PFS image** (`.ffpkg`, `.pfs`, `.img`, `pfs_image.dat`), with or
-//!   without a PFSC wrapper and with or without a nested `pfs_image.dat`.
+//!   without a PFSC wrapper and with or without a nested `pfs_image.dat`;
+//! - **disk images** of game dumps: an exFAT volume (`.exfat`, bare or
+//!   inside an MBR / GPT partition) or a UFS2 file system (`.ffpkg` dumps
+//!   made on the console), with the game folder anywhere inside;
+//! - **PFS containers** (`.ffpfsc`): a PFS image (PS5 superblock version 2)
+//!   holding one disk image file, usually PFSC-compressed;
+//! - **PS5 fake packages** ("\x7FFIH" made by homebrew tools in plain-text
+//!   mode): the outer PFS holds `pfs_image.dat`, the Kraken-compressed inner
+//!   image, mapped by `naps_pkg_layout.dat` ([`naps`]); the inner image is a
+//!   direct-offset PFS whose files may be Kraken PFSC files ([`pfsc`]).
 //!
 //! Retail-encrypted packages (PS4 packages whose key digest does not match
-//! a fake-package key, PS5 "\x7FFIH" packages) are detected and refused
-//! with [`Error::Encrypted`]. Nothing here contains or needs console keys.
+//! a fake-package key, PS5 packages whose outer image is encrypted) are
+//! detected and refused with [`Error::Encrypted`]. Nothing here contains or
+//! needs console keys.
 //!
 //! The launcher API is [`probe`] -> [`PackageInfo`]; the emulator opens a
 //! [`Package`] and reads its [`Pfs`] tree directly or extracts it.
 
 pub mod build;
 pub mod crypto;
+pub mod exfat;
+pub mod image;
 pub mod io;
+pub mod kraken;
+pub mod naps;
 pub mod param;
 pub mod pfs;
 pub mod pfsc;
 pub mod pkg;
+pub mod ufs;
 
 pub use io::{ReadAt, Source};
 pub use param::TitleParams;
-pub use pfs::{FileData, Node, NodeId, Pfs};
+pub use pfs::{FileData, FsKind, Node, NodeId, Pfs};
 pub use pkg::PkgHeader;
 
 use crate::io::{read_at, HostFile, Slice};
 use crate::pfs::{is_pfs, PfsKey};
-use crate::pfsc::{is_pfsc, Pfsc};
+use crate::pfsc::is_pfsc;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -72,6 +87,8 @@ impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         if e.kind() == std::io::ErrorKind::InvalidData {
             Error::Format(e.to_string())
+        } else if e.kind() == std::io::ErrorKind::Unsupported {
+            Error::Unsupported(e.to_string())
         } else {
             Error::Io(e)
         }
@@ -89,6 +106,12 @@ pub enum Container {
     PfsImage,
     /// PFS image inside a PFSC stream.
     PfscImage,
+    /// exFAT disk image (`.exfat`).
+    ExFatImage,
+    /// UFS2 disk image.
+    Ufs2Image,
+    /// PFS image holding a disk image file (`.ffpfsc`).
+    PfsContainer,
 }
 
 /// What a package installs.
@@ -173,7 +196,7 @@ impl Default for OpenOptions {
 }
 
 /// File extensions the launcher should consider.
-pub const PACKAGE_EXTENSIONS: &[&str] = &["pkg", "ffpkg", "pfs"];
+pub const PACKAGE_EXTENSIONS: &[&str] = &["pkg", "ffpkg", "pfs", "exfat", "ffpfsc"];
 
 /// True when `path` has a package extension (case-insensitive).
 pub fn has_package_extension(path: &Path) -> bool {
@@ -195,25 +218,12 @@ pub fn sniff(head: &[u8]) -> Option<Container> {
     }
 }
 
-/// True when the file at `path` starts like a package or PFS image.
+/// True when the file at `path` is a package, a PFS image or a disk image
+/// (exFAT, UFS2).
 pub fn is_package_file(path: &Path) -> bool {
-    let Ok(f) = fs::File::open(path) else { return false };
+    let Ok((src, _)) = open_source(path) else { return false };
     let mut head = [0u8; 16];
-    io::file_read_exact_at(&f, &mut head, 0).is_ok() && sniff(&head).is_some()
-}
-
-/// A recognized image format this crate does not read.
-fn foreign_image(src: &dyn ReadAt) -> Option<&'static str> {
-    let mut head = [0u8; 16];
-    if read_at(src, &mut head, 0).ok()? >= 11 && &head[3..11] == b"EXFAT   " {
-        return Some("exFAT disk image");
-    }
-    // UFS2: superblock at 64 KiB, magic at +0x55C.
-    let mut m = [0u8; 4];
-    if read_at(src, &mut m, 0x1_0000 + 0x55C).ok()? == 4 && u32::from_le_bytes(m) == 0x1954_0119 {
-        return Some("UFS2 disk image");
-    }
-    None
+    read_at(&*src, &mut head, 0).is_ok_and(|n| n == 16) && sniff(&head).is_some() || image::detect(&src).is_some()
 }
 
 /// An opened package with its game file tree.
@@ -240,26 +250,98 @@ fn open_source(path: &Path) -> Result<(Source, u64)> {
     Ok((Arc::new(src), len))
 }
 
+/// The disk image a PFS container holds: a file named `*.exfat`, else the
+/// largest file, when its contents (PFSC-decompressed) are an exFAT or UFS2
+/// file system. None when the tree is a game itself.
+fn inner_disk_image(pfs: &Pfs) -> Result<Option<Pfs>> {
+    let root = pfs.root();
+    if pfs.child(root, "eboot.bin").is_some() || pfs.child(root, "sce_sys").is_some() {
+        return Ok(None);
+    }
+    let files: Vec<NodeId> = pfs.walk().into_iter().filter(|&i| !pfs.node(i).is_dir).collect();
+    let pick = files
+        .iter()
+        .copied()
+        .find(|&i| pfs.node(i).name.to_ascii_lowercase().ends_with(".exfat"))
+        .or_else(|| files.iter().copied().max_by_key(|&i| pfs.node(i).size));
+    let Some(id) = pick else { return Ok(None) };
+    let mut data = pfs.open_file(id)?.source();
+    let mut head = [0u8; 16];
+    read_at(&*data, &mut head, 0)?;
+    if is_pfsc(&head) {
+        data = pfsc::open(data)?;
+    }
+    match image::detect(&data) {
+        Some(kind) => Ok(Some(image::open(data, kind)?)),
+        None => Ok(None),
+    }
+}
+
 /// Descend into a nested `pfs_image.dat` (the outer PFS of a package holds
 /// only that file; the game tree lives in the inner image).
 fn descend(mut pfs: Pfs) -> Result<Pfs> {
     for _ in 0..2 {
         let root = pfs.root();
-        let Some(id) = pfs.child(root, "pfs_image.dat") else { break };
+        let Some(id) = pfs.child(root, naps::IMAGE_FILE) else { break };
         if pfs.child(root, "eboot.bin").is_some() || pfs.child(root, "sce_sys").is_some() {
             break;
         }
         let data = pfs.open_file(id)?.source();
+        if let Some(layout) = pfs.child(root, naps::LAYOUT_FILE) {
+            let layout = pfs.open_file(layout)?.read_all()?;
+            let inner = Arc::new(naps::NapsImage::new(data, &layout)?);
+            let sb = find_inner_superblock(&inner)?;
+            pfs = Pfs::open_at(inner, sb, None)?;
+            continue;
+        }
         let mut head = [0u8; 16];
         read_at(&*data, &mut head, 0)?;
-        let inner: Source = if is_pfsc(&head) { Arc::new(Pfsc::new(data)?) } else { data };
+        let inner: Source = if is_pfsc(&head) { pfsc::open(data)? } else { data };
         pfs = Pfs::open(inner, None)?;
     }
     Ok(pfs)
 }
 
+/// The superblock of a NAPS inner image: at 4 MiB, or at the start of one
+/// of its file ranges (the metadata usually comes last).
+fn find_inner_superblock(img: &naps::NapsImage) -> Result<u64> {
+    const BLOCK: u64 = 0x1_0000;
+    let mut tried = std::collections::HashSet::new();
+    let starts = img.layout().file_starts().iter().rev().copied();
+    for off in std::iter::once(4 << 20).chain(starts) {
+        if off % BLOCK != 0 || off + BLOCK > img.len() || !tried.insert(off) {
+            continue;
+        }
+        let mut head = [0u8; 16];
+        img.read_exact_at(&mut head, off)?;
+        if is_pfs(&head) {
+            return Ok(off);
+        }
+    }
+    Err(Error::Format("the inner image of the PS5 package has no superblock where its layout says".into()))
+}
+
 fn open_image(src: Source, key: Option<PfsKey>) -> Result<Pfs> {
     descend(Pfs::open(src, key)?)
+}
+
+/// A bare or PFSC-wrapped PFS image: the game tree, or the disk image it
+/// contains (then reported as a [`Container::PfsContainer`]).
+fn open_pfs_any(src: Source, wrapped: bool) -> Opened {
+    let mut container = if wrapped { Container::PfscImage } else { Container::PfsImage };
+    let fs = (|| {
+        let src: Source = if wrapped { pfsc::open(src)? } else { src };
+        let pfs = open_image(src, None)?;
+        Ok(match inner_disk_image(&pfs)? {
+            Some(inner) => {
+                container = Container::PfsContainer;
+                inner
+            }
+            None => pfs,
+        })
+    })()
+    .map(Arc::new);
+    Opened { container, header: None, params: TitleParams::default(), icon: None, fs }
 }
 
 fn open_any(path: &Path, opts: &OpenOptions) -> Result<Opened> {
@@ -268,26 +350,26 @@ fn open_any(path: &Path, opts: &OpenOptions) -> Result<Opened> {
     read_at(&*src, &mut head, 0)?;
     match sniff(&head) {
         Some(Container::Pkg) => open_pkg(src, opts),
-        Some(Container::PfsImage) => Ok(Opened {
-            container: Container::PfsImage,
-            header: None,
-            params: TitleParams::default(),
-            icon: None,
-            fs: open_image(src, None).map(Arc::new),
-        }),
-        Some(Container::PfscImage) => {
-            let fs = Pfsc::new(src).map_err(Error::from).and_then(|p| open_image(Arc::new(p), None)).map(Arc::new);
-            Ok(Opened { container: Container::PfscImage, header: None, params: TitleParams::default(), icon: None, fs })
-        }
-        None => match foreign_image(&*src) {
-            Some(kind) => Err(Error::Unsupported(format!("{kind} (only PKG and PFS images are supported)"))),
+        Some(Container::PfscImage) => Ok(open_pfs_any(src, true)),
+        Some(_) => Ok(open_pfs_any(src, false)),
+        None => match image::detect(&src) {
+            Some(kind) => {
+                let container = if kind == image::DiskKind::Ufs2 { Container::Ufs2Image } else { Container::ExFatImage };
+                let fs = image::open(src, kind).map(Arc::new);
+                Ok(Opened { container, header: None, params: TitleParams::default(), icon: None, fs })
+            }
             None if len == 0 => Err(Error::Format("empty file".into())),
-            None => Err(Error::Format("not a PKG or PFS image".into())),
+            None => Err(Error::Format("not a PKG, PFS, exFAT or UFS2 image".into())),
         },
     }
 }
 
 fn open_pkg(src: Source, opts: &OpenOptions) -> Result<Opened> {
+    let mut magic = [0u8; 4];
+    read_at(&*src, &mut magic, 0)?;
+    if magic == pkg::FIH_MAGIC {
+        return open_fih(src);
+    }
     let hdr = PkgHeader::parse(&*src)?;
     let mut params = hdr
         .read_entry(&*src, pkg::ENTRY_PARAM_SFO)
@@ -300,6 +382,54 @@ fn open_pkg(src: Source, opts: &OpenOptions) -> Result<Opened> {
     let icon = hdr.read_entry(&*src, pkg::ENTRY_ICON0_PNG);
     let fs = open_pkg_fs(&hdr, &src, opts).map(Arc::new);
     Ok(Opened { container: Container::Pkg, header: Some(hdr), params, icon, fs })
+}
+
+/// A PS5 package: metadata from the embedded CNT container, the game tree
+/// from the outer image when it is stored in plain text.
+fn open_fih(src: Source) -> Result<Opened> {
+    let unreadable = |e: Error| match e {
+        Error::Io(e) if e.kind() != std::io::ErrorKind::InvalidData => Error::Io(e),
+        Error::Encrypted(m) => Error::Encrypted(m),
+        e => Error::Encrypted(format!("PS5 package that cannot be read ({e}); retail packages are encrypted with console keys")),
+    };
+    let fih = pkg::FihHeader::parse(&*src).map_err(unreadable)?;
+    let cnt: Source = Arc::new(Slice::new(src.clone(), fih.cnt_offset, src.len() - fih.cnt_offset)?);
+    let hdr = PkgHeader::parse(&*cnt).map_err(unreadable)?;
+    let mut params = hdr
+        .entries
+        .iter()
+        .find(|e| e.id == pkg::ENTRY_PS5_PARAM_JSON || e.name == "param.json")
+        .and_then(|e| hdr.read_entry(&*cnt, e.id))
+        .and_then(|b| TitleParams::from_json(&String::from_utf8_lossy(&b)))
+        .unwrap_or_default();
+    if params.content_id.is_none() && !hdr.content_id.is_empty() {
+        params.content_id = Some(hdr.content_id.clone());
+    }
+    let icon = hdr.read_entry(&*cnt, pkg::ENTRY_ICON0_PNG);
+    let fs = (|| {
+        if fih.retail {
+            return Err(Error::Encrypted("PS5 retail package: encrypted with console keys".into()));
+        }
+        let outer: Source = Arc::new(Slice::new(src.clone(), fih.image_offset, fih.image_size)?);
+        let mut fs = descend(Pfs::open_at(outer, fih.superblock_in_image(), None)?)?;
+        add_cnt_system_files(&mut fs, &hdr, &cnt);
+        Ok(fs)
+    })()
+    .map(Arc::new);
+    Ok(Opened { container: Container::Pkg, header: Some(hdr), params, icon, fs })
+}
+
+/// The installer puts the plain metadata entries of a PS5 package (param.json,
+/// icons, trophy and UDS data, PlayGo files) into `sce_sys/`; the image
+/// itself does not carry them.
+fn add_cnt_system_files(fs: &mut Pfs, hdr: &PkgHeader, cnt: &Source) {
+    for e in &hdr.entries {
+        if e.id < pkg::ENTRY_PARAM_SFO || e.is_encrypted() || e.name.is_empty() || e.name.starts_with("entry_") {
+            continue;
+        }
+        let Ok(data) = Slice::new(cnt.clone(), e.offset as u64, e.size as u64) else { continue };
+        fs.add_file(&format!("sce_sys/{}", e.name), Arc::new(data));
+    }
 }
 
 fn open_pkg_fs(hdr: &PkgHeader, src: &Source, opts: &OpenOptions) -> Result<Pfs> {
@@ -336,7 +466,7 @@ fn classify(header: Option<&PkgHeader>, params: &TitleParams) -> ContentKind {
         if h.is_patch() || cat.starts_with("gp") {
             return ContentKind::Patch;
         }
-        if h.content_type == pkg::CONTENT_TYPE_GD || cat.starts_with("gd") {
+        if h.is_game() || cat.starts_with("gd") {
             return ContentKind::Game;
         }
         return ContentKind::Unknown;
@@ -553,5 +683,7 @@ impl Package {
     }
 }
 
+#[cfg(test)]
+mod image_tests;
 #[cfg(test)]
 mod tests;

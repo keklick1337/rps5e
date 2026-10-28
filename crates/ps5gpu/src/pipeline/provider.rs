@@ -4931,6 +4931,10 @@ impl ShaderPipelines {
     ) -> Result<FixedFunctionKey, Failure> {
         let topology = if mesh { vk::PrimitiveTopology::TRIANGLE_LIST } else { state::host_topology(d.primitive_type, rect).ok_or(Failure::Skip)? };
         let (depth_clip, depth_clamp) = state::depth_clip(d.raster.clip_cntl);
+        // The guest clamps depth to ZMIN/ZMAX also while clipping; the host
+        // clamp is added where it is exact and clipping stays on through
+        // VK_EXT_depth_clip_enable.
+        let depth_clamp = depth_clamp || (self.dev.caps.depth_clip_enable && state::viewport_depth_clamp_exact(d, viewport_count));
         let has_depth = depth.0 != vk::Format::UNDEFINED || depth.1 != vk::Format::UNDEFINED;
         let centered_samples = match state::sample_placement(samples, d.msaa_enable, topology, has_depth, alpha_to_coverage) {
             state::SamplePlacement::Standard => false,

@@ -55,6 +55,11 @@ const GUEST_PAGE_SIZE: u64 = 0x4000;
 
 /// Region for HLE-provided data symbols (canary, progname, etc.).
 const HLE_DATA_REGION: u64 = 0x0000_6D00_0000_0000;
+/// Size of the HLE data region (one guest page).
+const HLE_DATA_SIZE: u64 = GUEST_PAGE_SIZE;
+/// Offset in the region of the HLE libraries' data objects
+/// (`ps5hle::data_objects`); the fixed symbols sit below it.
+const HLE_OBJECTS_OFFSET: u64 = 0x400;
 /// Inaccessible page that unresolved data imports point at, so a use of a
 /// missing object faults at a recognisable address.
 pub const INVALID_MEMORY: u64 = 0x0000_6D00_0010_0000;
@@ -344,7 +349,7 @@ pub type HleData = HashMap<String, HleDataSymbol>;
 
 /// HLE data symbols guest code imports.
 fn hle_data_symbols(vm: &VirtualMemory, progname: &str) -> HleData {
-    let _ = vm.map(HLE_DATA_REGION, 0x1000, MemProtect::RW);
+    let _ = vm.map(HLE_DATA_REGION, HLE_DATA_SIZE, MemProtect::RW);
     let mut map = HleData::new();
     let mut add = |nid: &str, addr: u64, fallback: bool| {
         map.insert(nid.to_string(), HleDataSymbol { addr, fallback });
@@ -373,6 +378,19 @@ fn hle_data_symbols(vm: &VirtualMemory, progname: &str) -> HleData {
     // LibcInternal `stdout`: an opaque FILE object that the HLE stdio
     // functions recognise by address (zero-filled, 0x100 bytes).
     add("2sWzhYqFH4E", HLE_DATA_REGION + 0x200, true);
+    // Data objects of the HLE libraries, each with its initial contents.
+    let mut next = HLE_DATA_REGION + HLE_OBJECTS_OFFSET;
+    for o in ps5hle::data_objects::objects() {
+        let addr = align_up(next, o.align);
+        let end = addr + o.bytes.len() as u64;
+        if end > HLE_DATA_REGION + HLE_DATA_SIZE {
+            log::error!("[load] no room for HLE data object {} ({})", o.name, o.library);
+            break;
+        }
+        let _ = vm.write(addr, o.bytes);
+        add(&ps5nid::compute_nid(o.name), addr, true);
+        next = end;
+    }
     map
 }
 

@@ -202,12 +202,35 @@ fn label_mode() -> LabelMode {
 
 /// Whether an end-of-pipe label is written after the GPU finished the work
 /// recorded before it, for executor `ex`.
+/// In the write-through mode, a label is also deferred while an earlier
+/// deferred label is still unwritten: labels land in the order the queues
+/// wrote them (a deferred older value must not overwrite a newer one written
+/// at once, e.g. a cross-queue timeline counter).
 fn label_after_gpu(ex: &dyn RenderExecutor) -> bool {
-    match label_mode() {
+    defer_in_mode(label_mode(), ex)
+}
+
+pub(crate) fn defer_in_mode(mode: LabelMode, ex: &dyn RenderExecutor) -> bool {
+    match mode {
         LabelMode::Recorded => false,
         LabelMode::AfterGpu => true,
-        LabelMode::AfterWriteThroughs => ex.writes_through_pending(),
+        LabelMode::AfterWriteThroughs => DEFERRED_LABELS.load(Ordering::Acquire) != 0 || ex.writes_through_pending(),
     }
+}
+
+/// Deferred label writes not yet made.
+static DEFERRED_LABELS: AtomicU64 = AtomicU64::new(0);
+
+/// Queue `write` after the GPU work recorded so far, counted in
+/// [`DEFERRED_LABELS`] until it ran.
+pub(crate) fn defer_label(ex: &dyn RenderExecutor, write: impl FnOnce() + Send + 'static) {
+    DEFERRED_LABELS.fetch_add(1, Ordering::AcqRel);
+    ex.after_pipe(Box::new(move || {
+        write();
+        DEFERRED_LABELS.fetch_sub(1, Ordering::AcqRel);
+        // Queues waiting on the label poll it again.
+        super::queue::global().retry_blocked();
+    }))
 }
 
 /// 100 MHz reference clock (EOP / COPY_DATA timestamps): the clock shaders
@@ -1109,10 +1132,9 @@ impl Interpreter {
         match &self.executor {
             Some(ex) if label_after_gpu(ex.as_ref()) => {
                 note_gpu_label(addr);
-                ex.after_pipe(Box::new(move || {
+                defer_label(ex.as_ref(), move || {
                     let _ = mem::write(addr, &v.to_le_bytes());
-                    super::queue::global().retry_blocked();
-                }))
+                })
             }
             _ => self.write32(addr, v),
         }
@@ -1164,11 +1186,7 @@ impl Interpreter {
                 }
             };
             match &self.executor {
-                Some(ex) if label_after_gpu(ex.as_ref()) => ex.after_pipe(Box::new(move || {
-                    write();
-                    // Queues waiting on the label poll it again.
-                    super::queue::global().retry_blocked();
-                })),
+                Some(ex) if label_after_gpu(ex.as_ref()) => defer_label(ex.as_ref(), write),
                 Some(ex) => {
                     // Written behind the work queued before it (the clock
                     // as the packet is processed).

@@ -241,3 +241,45 @@ fn pixel_inputs_uint16_export() {
         }
     }
 }
+
+/// FP16_ABGR, UNORM16_ABGR and SNORM16_ABGR exports into 16_16_16_16 UINT
+/// and SINT targets: each exported 16-bit field is stored as it is (a
+/// G-buffer clear program writing half-float 1.0 into an integer target
+/// leaves 0x3c00, not 1 or 0xffff).
+#[test]
+#[ignore]
+fn pixel_inputs_float16_export_into_integer_target() {
+    const W: u32 = 64;
+    const H: u32 = 2;
+    // Half 1.0, half 0.5, half -2.0, 0xffff; and a row of mixed fields.
+    const ROWS: [(u32, u32); 2] = [(0x3800_3c00, 0xffff_c000), (0x8001_7bff, 0x0000_1234)];
+    let mut b = Bench::new();
+    let vs = b.words(&VERTEX);
+    let cover = b.positions(&COVER);
+    for (number_type, number_name) in [(4u32, "UINT"), (5, "SINT")] {
+        for (col_format, format_name) in [(4u32, "FP16_ABGR"), (5, "UNORM16_ABGR"), (6, "SNORM16_ABGR")] {
+            let target = b.target_of(W, H, 12, number_type, 0, 0x5a);
+            for (row, &(low, high)) in ROWS.iter().enumerate() {
+                // v4 = low; v5 = high; exp mrt0 v4, v5 compr done vm.
+                let ps = b.words(&[0x7e0802ff, low, 0x7e0a02ff, high, 0xf8001c0f, 0x00000504, 0xbf810000]);
+                b.draw(target, vs, &cover, ps, &[0; 8], 3, false, |d| {
+                    d.shader_col_format = col_format;
+                    let r = Rect { x0: 0, y0: row as i32, x1: W as i32, y1: row as i32 + 1 };
+                    d.scissor = r;
+                    d.scissors[0] = r;
+                });
+            }
+            let texels = b.texels(&target, 8);
+            for (y, &(low, high)) in ROWS.iter().enumerate() {
+                let want = [low as u16, (low >> 16) as u16, high as u16, (high >> 16) as u16];
+                for x in 0..W {
+                    let o = ((y as u32 * W + x) * 8) as usize;
+                    for c in 0..4usize {
+                        let got = u16::from_le_bytes([texels[o + 2 * c], texels[o + 2 * c + 1]]);
+                        assert_eq!(got, want[c], "a {format_name} export into a 16_16_16_16 {number_name} target stored {got:#x} in component {c} of pixel ({x}, {y}), expected {:#x}", want[c]);
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1514,6 +1514,11 @@ fn cb_create_transaction_resource(ctx: &mut CpuContext) -> HleResult {
 }
 
 /// rdi: mount point, rsi: SceSaveDataPrepareParam {resource@0, prepareMode@4}.
+/// sceSaveDataPrepare and sceSaveDataPrepareForTransferring (same
+/// arguments: the library checks both pointers, then hands the 16-byte
+/// mount point and the 0x28-byte parameter to the save data service, which
+/// differ only in the request code). There is no service-side transaction
+/// state here, so a valid request succeeds.
 fn cb_prepare(ctx: &mut CpuContext) -> HleResult {
     if ctx.rdi() == 0 || ctx.rsi() == 0 {
         return ERR_PARAMETER;
@@ -1661,6 +1666,7 @@ pub fn register(reg: &mut HleRegistry) {
     reg.register_fn("gjRZNnw0JPE", "sceSaveDataCreateTransactionResource", L, cb_create_transaction_resource);
     reg.register_fn("lJUQuaKqoKY", "sceSaveDataDeleteTransactionResource", L, cb_ok);
     reg.register_fn("sDCBrmc61XU", "sceSaveDataPrepare", L, cb_prepare);
+    reg.register_fn("RvID8BVeg+g", "sceSaveDataPrepareForTransferring", L, cb_prepare);
     reg.register_fn("ie7qhZ4X0Cc", "sceSaveDataCommit", L, cb_commit);
 
     reg.register_fn("v7AAAMo0Lz4", "sceSaveDataSetupSaveDataMemory", L, cb_setup_memory);

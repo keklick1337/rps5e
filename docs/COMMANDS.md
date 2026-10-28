@@ -19,7 +19,7 @@ Only one emulator process runs at a time: `run`, `replay`, `precompile`, `shader
 | (none) | Open the launcher. |
 | `gui [--settings]` | Open the launcher; `--settings` opens its settings at start. |
 | `run <game>` | Run a game. |
-| `info-pkg <pkg>` | Show what a package contains. |
+| `info-pkg <pkg>` | Show what a package or disk image contains. |
 | `install-pkg <pkg>` | Extract a package into a game folder. |
 | `precompile <game>` | Build a game's shaders and pipelines without running it. |
 | `shader-cache <action>` | Export, import, inspect or clear a game's shader cache. |
@@ -39,7 +39,7 @@ Paths named `<game>` accept a game folder (holding `eboot.bin` and `sce_sys/`), 
 rps5e-cli run <PATH> [options]
 ```
 
-Runs a game. `PATH` is a game folder, its `eboot.bin`, or a package (`.pkg`, `.ffpkg`, raw PFS image) that is mounted read-only as `/app0`. Only game packages run; an update package must be installed over the game with `install-pkg` first.
+Runs a game. `PATH` is a game folder, its `eboot.bin`, a package (`.pkg`, `.ffpkg`, raw PFS image) or a disk image (`.exfat`, `.ffpfsc`, UFS2 `.ffpkg`) that is mounted read-only as `/app0`. In a disk image the game folder (the one with `eboot.bin` and `sce_sys/param.json`) may sit in a subfolder. Only game packages run; an update package must be installed over the game with `install-pkg` first.
 
 Before the game starts, the shaders and pipelines it used on earlier runs are compiled, with a progress panel (see `--no-prewarm-wait`). Logs go to the terminal; set `RUST_LOG=info` for more than errors.
 
@@ -129,7 +129,7 @@ Opens the launcher. `--settings` opens the settings at start. Games started from
 rps5e-cli info-pkg <PATH> [--passcode PASSCODE] [--no-files]
 ```
 
-Shows what a package or PFS image contains: title, version, content ID, container details and every file with its size. `--no-files` leaves out the file list.
+Shows what a package, PFS image or disk image (`.exfat`, `.ffpfsc`, UFS2) contains: title, version, content ID, container details and every file with its size. `--no-files` leaves out the file list.
 
 ## install-pkg
 
@@ -137,7 +137,7 @@ Shows what a package or PFS image contains: title, version, content ID, containe
 rps5e-cli install-pkg <PATH> [--into DIR] [--data-dir DIR] [--passcode PASSCODE]
 ```
 
-Extracts a game package into a folder that then runs like any dump. An update package is extracted over the installed game.
+Extracts a game package or disk image into a folder that then runs like any dump. An update package is extracted over the installed game.
 
 | Option | Meaning | Default |
 |---|---|---|

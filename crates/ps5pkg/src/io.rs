@@ -200,6 +200,104 @@ impl ReadAt for Blocks {
     }
 }
 
+/// A file made of runs of another source, in file order; a run without a
+/// physical offset is a hole that reads as zeros. Used for files whose
+/// data is described by cluster chains or block maps (exFAT, UFS2).
+pub struct Extents {
+    inner: Source,
+    /// (logical start, length, physical offset or hole), sorted, gapless.
+    runs: Vec<(u64, u64, Option<u64>)>,
+    len: u64,
+}
+
+/// Collects the runs of an [`Extents`], merging neighbours that continue
+/// each other on disk (a contiguous file ends up as one run).
+#[derive(Default)]
+pub struct ExtentList {
+    runs: Vec<(u64, u64, Option<u64>)>,
+    len: u64,
+}
+
+impl ExtentList {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `len` bytes stored at `phys` (`None`: a hole).
+    pub fn push(&mut self, len: u64, phys: Option<u64>) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.runs.last_mut() {
+            let continues = match (last.2, phys) {
+                (Some(a), Some(b)) => a.checked_add(last.1) == Some(b),
+                (None, None) => true,
+                _ => false,
+            };
+            if continues {
+                last.1 += len;
+                self.len += len;
+                return;
+            }
+        }
+        self.runs.push((self.len, len, phys));
+        self.len += len;
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Number of runs after merging.
+    pub fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// The finished file. Every run must lie inside `inner`.
+    pub fn build(self, inner: Source) -> io::Result<Source> {
+        for &(_, len, phys) in &self.runs {
+            if let Some(p) = phys {
+                if p.checked_add(len).is_none_or(|e| e > inner.len()) {
+                    return Err(invalid(format!("extent {p:#x}+{len:#x} lies outside the image")));
+                }
+            }
+        }
+        match self.runs.as_slice() {
+            [] => Ok(Arc::new(Memory(Vec::new()))),
+            [(_, len, Some(p))] => Ok(Arc::new(Slice::new(inner, *p, *len)?)),
+            _ => Ok(Arc::new(Extents { inner, runs: self.runs, len: self.len })),
+        }
+    }
+}
+
+impl ReadAt for Extents {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        check_range(self.len, offset, buf.len())?;
+        let mut idx = self.runs.partition_point(|r| r.0 + r.1 <= offset);
+        let mut done = 0usize;
+        while done < buf.len() {
+            let (start, len, phys) = self.runs[idx];
+            let pos = offset + done as u64;
+            let within = pos - start;
+            let n = ((len - within) as usize).min(buf.len() - done);
+            match phys {
+                Some(p) => self.inner.read_exact_at(&mut buf[done..done + n], p + within)?,
+                None => buf[done..done + n].fill(0),
+            }
+            done += n;
+            idx += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Little-endian field readers over a byte slice; out-of-range reads give 0
 /// (callers validate sizes first).
 pub(crate) fn le_u16(b: &[u8], o: usize) -> u16 {
@@ -243,5 +341,32 @@ mod tests {
         let mut mid = [0u8; 4];
         f.read_exact_at(&mut mid, 6).unwrap();
         assert_eq!(mid, [30, 31, 0, 1]);
+    }
+
+    #[test]
+    fn extents_with_holes() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let mem: Source = Arc::new(Memory(data));
+        let mut l = ExtentList::new();
+        l.push(4, Some(10));
+        l.push(4, Some(14)); // continues the first run
+        l.push(3, None);
+        l.push(2, None);
+        l.push(5, Some(40));
+        assert_eq!(l.run_count(), 3);
+        let f = l.build(mem.clone()).unwrap();
+        assert_eq!(f.len(), 18);
+        let mut all = [0u8; 18];
+        f.read_exact_at(&mut all, 0).unwrap();
+        let want: Vec<u8> = (10..18).chain([0; 5]).chain(40..45).collect();
+        assert_eq!(all.to_vec(), want);
+        let mut mid = [0u8; 4];
+        f.read_exact_at(&mut mid, 11).unwrap();
+        assert_eq!(mid, [0, 0, 40, 41]);
+        assert!(f.read_exact_at(&mut mid, 15).is_err());
+
+        let mut bad = ExtentList::new();
+        bad.push(8, Some(60));
+        assert!(bad.build(mem).is_err());
     }
 }

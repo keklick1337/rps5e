@@ -136,8 +136,9 @@ enum Cmd {
     HleExports,
     /// Load the image, then attempt to execute it from its entry point.
     Run {
-        /// Path to eboot.bin / SELF, the game folder that contains it, or a
-        /// fake package / PFS image (.pkg, .ffpkg), mounted read-only as /app0.
+        /// Path to eboot.bin / SELF, the game folder that contains it, a
+        /// fake package / PFS image (.pkg, .ffpkg) or a disk image (.exfat,
+        /// .ffpfsc, UFS2 .ffpkg), mounted read-only as /app0.
         path: String,
         /// Passcode of a fake package (32 characters; default all zeros).
         #[arg(long, value_name = "PASSCODE")]
@@ -151,10 +152,11 @@ enum Cmd {
         #[arg(long)]
         settings: bool,
     },
-    /// Show what a package or PFS image contains: title, version, content
-    /// id, container details and every file with its size.
+    /// Show what a package, PFS image or disk image contains: title,
+    /// version, content id, container details and every file with its size.
     InfoPkg {
-        /// Path to a .pkg / .ffpkg / PFS image.
+        /// Path to a .pkg / .ffpkg / PFS image, or an .exfat / .ffpfsc / UFS2
+        /// disk image.
         path: String,
         /// Passcode of a fake package (32 characters; default all zeros).
         #[arg(long, value_name = "PASSCODE")]
@@ -215,7 +217,8 @@ enum Cmd {
     /// Extract a game package into a folder that then runs like any dump.
     /// An update package is extracted over the installed game.
     InstallPkg {
-        /// Path to a .pkg / .ffpkg / PFS image.
+        /// Path to a .pkg / .ffpkg / PFS image, or an .exfat / .ffpfsc / UFS2
+        /// disk image.
         path: String,
         /// Destination folder [default: <data>/games/<TITLE_ID>].
         #[arg(long, value_name = "DIR")]
@@ -487,7 +490,14 @@ fn resolve_eboot(path: &str) -> String {
     path.to_string()
 }
 
+/// Bytes of an executable: the file itself, or eboot.bin inside a package or
+/// disk image (never the whole package).
 fn read_file(path: &str) -> Result<Vec<u8>> {
+    let p = std::path::Path::new(path);
+    if p.is_file() && ps5pkg::is_package_file(p) {
+        let pkg = pkg_cli::open_game(p, &ps5pkg::OpenOptions::default())?;
+        return pkg.read("eboot.bin").map_err(|e| anyhow!("{path}: eboot.bin: {e}"));
+    }
     std::fs::read(path).map_err(|e| anyhow!("read {path}: {e}"))
 }
 

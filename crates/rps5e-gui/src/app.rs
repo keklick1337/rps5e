@@ -872,7 +872,7 @@ impl App {
             path
         };
         let Some(game) = library::read_entry(&path) else {
-            self.status = format!("'{}' is not a game folder (eboot.bin), a package (.pkg, .ffpkg) or an executable (.elf, .self)", path.display());
+            self.status = format!("'{}' is not a game folder (eboot.bin), a package (.pkg, .ffpkg), a disk image (.exfat, .ffpfsc) or an executable (.elf, .self)", path.display());
             return;
         };
         if !self.settings.extra_games.contains(&path) {
@@ -892,10 +892,10 @@ impl App {
             FilePurpose::AddLibraryFolder => egui_file::FileDialog::select_folder(start).title("Add library folder (searched for games)"),
             FilePurpose::AddGameFolder => egui_file::FileDialog::select_folder(start).title("Add game folder (with eboot.bin)"),
             FilePurpose::AddGame => egui_file::FileDialog::open_file(start)
-                .title("Add game (eboot.bin, .pkg, .ffpkg, .elf, .self)")
+                .title("Add game (eboot.bin, .pkg, .ffpkg, .exfat, .ffpfsc, .elf, .self)")
                 .show_files_filter(Box::new(|p: &Path| library::is_package_file(p) || library::is_executable_file(p))),
             FilePurpose::InstallPackage => egui_file::FileDialog::open_file(start)
-                .title("Install package (.pkg, .ffpkg)")
+                .title("Install package (.pkg, .ffpkg, .exfat, .ffpfsc)")
                 .show_files_filter(Box::new(library::is_package_file)),
             FilePurpose::ImportConfigs => egui_file::FileDialog::open_file(None).title("Import game configs").show_files_filter(Box::new(json)),
             FilePurpose::ImportCheat => egui_file::FileDialog::open_file(None).title("Import cheat file").show_files_filter(Box::new(json)),

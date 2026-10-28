@@ -247,6 +247,10 @@ pub struct BufferCache {
     /// GPU-written ranges to write through at the next submit (or CPU
     /// access), after the work writing them.
     pending_through: Vec<(u64, u64)>,
+    /// Write-throughs recorded since the last publish point, as (start,
+    /// end, tick): their read-through pages show the guest the bytes of an
+    /// earlier GPU write until the copy lands ([`Self::publish_point`]).
+    unpublished_through: Vec<(u64, u64, u64)>,
     /// Pages the CPU read back (downloaded on access) before: when a large
     /// GPU-written range covers them, just these pages are written through.
     readback: crate::scheduler::hazard::RangeSet,
@@ -566,6 +570,9 @@ pub(crate) fn parse_descriptor_window(v: Option<&str>) -> u64 {
 /// GPU-written ranges up to this size are written through to guest memory
 /// once per submit (counters, readback slots, small results the CPU polls).
 pub const WRITE_THROUGH_MAX_BYTES: u64 = 1 << 20;
+/// Write-throughs remembered for the next publish point; past this, the
+/// ones that already landed are dropped.
+const UNPUBLISHED_THROUGH_MAX: usize = 4096;
 
 /// Read-only ranges up to this size bound from a copy of their guest
 /// bytes when those are newer than the mirror ([`BufferCache::prefers_stream`]).
@@ -668,6 +675,7 @@ impl BufferCache {
             written_words: Default::default(),
             last_through_tick: 0,
             pending_through: Vec::new(),
+            unpublished_through: Vec::new(),
             readback: Default::default(),
             settling: Vec::new(),
             idle_threshold: IDLE_COLLECT_THRESHOLD,
@@ -1465,6 +1473,7 @@ impl BufferCache {
             self.written_words.written_through(start, end, addr, size, sched.current_tick());
             self.note_landing(start, end - start, sched.current_tick());
             self.last_through_tick = sched.current_tick();
+            self.note_unpublished_through(sched, start, end);
             return true;
         }
         let Some(host) = self.find_containing(start, end - start).and_then(|key| self.host_view(sched, key).map(|h| (key, h))) else {
@@ -1495,7 +1504,37 @@ impl BufferCache {
         self.written_words.written_through(start, end, addr, size, sched.current_tick());
         self.note_landing(start, end - start, sched.current_tick());
         self.last_through_tick = sched.current_tick();
+        self.note_unpublished_through(sched, start, end);
         true
+    }
+
+    /// A write-through of `[start, end)` was recorded in the current tick.
+    fn note_unpublished_through(&mut self, sched: &Scheduler, start: u64, end: u64) {
+        if self.unpublished_through.len() >= UNPUBLISHED_THROUGH_MAX {
+            let done = sched.timeline.completed_tick();
+            self.unpublished_through.retain(|&(_, _, t)| t > done);
+        }
+        self.unpublished_through.push((start, end, sched.current_tick()));
+    }
+
+    /// The command processor published a write the guest can observe (a
+    /// label, a fence value): for the guest the work recorded before it is
+    /// done, and a CPU read synchronised with it must see that work's
+    /// results, as on the console. Read-through pages whose write-through
+    /// has not landed by tick `completed` (still pending, or recorded in a
+    /// later tick) hold the bytes of an earlier GPU write in guest memory:
+    /// they stop being readable, so such a read faults and waits for the
+    /// copy. Reads not ordered by a label still see the earlier bytes
+    /// without a fault.
+    pub fn publish_point(&mut self, completed: u64) {
+        for &(a, n) in &self.pending_through {
+            self.tracker.end_read_through(a, n);
+        }
+        for (s, e, t) in self.unpublished_through.drain(..) {
+            if t > completed {
+                self.tracker.end_read_through(s, e - s);
+            }
+        }
     }
 
     /// A copy of the GPU-dirty pages of the range straight into guest

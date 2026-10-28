@@ -18,7 +18,7 @@ RustPS5Emu is a compatibility layer for PS5 games, in the spirit of Wine:
 - the system libraries (kernel, libc, graphics, audio, input, save data, networking, ...) are implemented in Rust (HLE);
 - the GPU command stream is translated to **Vulkan**, and RDNA shaders are recompiled to SPIR-V.
 
-**Status: alpha (0.1.1-alpha).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
+**Status: alpha (0.1.2-alpha).** Games start, many reach gameplay and are partly playable; there are graphical glitches and crashes, and everything needs more testing and work. 2D games run well: nearly all of them start and can be played through. Expect bugs, and please report them (see [Reporting issues](#reporting-issues)).
 
 `master` is the development branch: every change lands there first, so it has the newest fixes but can be unstable. Tagged versions on the [Releases](https://github.com/keklick1337/rps5e/releases) page come with prebuilt Linux and Windows archives. What comes next is in the [roadmap](ROADMAP.md).
 
@@ -33,7 +33,7 @@ RustPS5Emu is a compatibility layer for PS5 games, in the spirit of Wine:
 | Grand Theft Auto V | PPSA04263 | 🟡 Playable; low fps and shader-compile stutter for now |
 | Marvel's Spider-Man 2 | PPSA08338 | 🔴 Starts, but models render broken and without textures; not playable |
 
-The emulator runs **decrypted** game dumps (a folder with `eboot.bin` and `sce_sys/`) and fake packages (`.pkg`, `.ffpkg`). Retail-encrypted packages cannot be used. You need your own legally dumped games; none are provided.
+The emulator runs **decrypted** game dumps (a folder with `eboot.bin` and `sce_sys/`), fake packages (`.pkg`, `.ffpkg`) and disk images of game dumps (`.exfat`, `.ffpfsc`, UFS2 `.ffpkg`), read in place without extracting. Retail-encrypted packages cannot be used. You need your own legally dumped games; none are provided.
 
 ## Screenshots
 
@@ -132,7 +132,7 @@ rps5e-cli install-pkg game.pkg [--into DIR]  # extract into a game folder
 rps5e-cli run game.pkg                       # mount read-only as /app0 and start
 ```
 
-Fake PKGs, raw PFS images and PFSC-compressed images are supported; retail-encrypted packages, delta updates and DLC are not (yet).
+Fake PKGs, raw PFS images, PFSC-compressed images and disk images (exFAT `.exfat`, `.ffpfsc` containers, UFS2) are supported; retail-encrypted packages, delta updates and DLC are not (yet).
 
 Other commands: `info`, `imports` (which imports are HLE, the game's own module, or missing), `self2elf` (the ELF inside a decrypted module, for disassemblers), `replay` (a GPU frame capture as a benchmark).
 

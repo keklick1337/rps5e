@@ -88,3 +88,40 @@ fn info_install_update_and_refusals() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn info_and_install_from_disk_images() {
+    use ps5pkg::build::ExFatBuilder;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("rps5e-cli-img-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = format!(
+        r#"{{"titleId":"PPSA99999","contentId":"{CID}","contentVersion":"01.004.000",
+           "localizedParameters":{{"defaultLanguage":"en-US","en-US":{{"titleName":"Image CLI Test"}}}}}}"#
+    );
+    let vol = ExFatBuilder::new()
+        .file("games/PPSA99999/eboot.bin", b"EBOOT img")
+        .file("games/PPSA99999/sce_sys/param.json", json.as_bytes())
+        .file("games/PPSA99999/Data/b.bin", &[2u8; 5000])
+        .build();
+    let exfat = dir.join("game.exfat");
+    vol.write_to(&exfat).unwrap();
+    let mut c = PfsBuilder::new().compressed_file("PPSA99999.exfat", &vol.to_vec());
+    c.version = ps5pkg::pfs::PFS_VERSION_PS5;
+    let ffpfsc = dir.join("game.ffpfsc");
+    std::fs::write(&ffpfsc, c.build()).unwrap();
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    for (path, format) in [(&exfat, "exFAT disk image"), (&ffpfsc, "PFS container holding a disk image")] {
+        let (ok, out) = cli(&["info-pkg", &s(path)]);
+        assert!(ok, "{out}");
+        for want in [format, "File system: exFAT", "PPSA99999", "Image CLI Test", "01.004.000", "Status:      ready", "Data/b.bin", "5000"] {
+            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+        }
+        let dest = dir.join(format!("installed-{}", path.extension().unwrap().to_string_lossy()));
+        let (ok, out) = cli(&["install-pkg", &s(path), "--into", &s(&dest)]);
+        assert!(ok, "{out}");
+        assert_eq!(std::fs::read(dest.join("eboot.bin")).unwrap(), b"EBOOT img");
+        assert_eq!(std::fs::read(dest.join("Data/b.bin")).unwrap(), vec![2u8; 5000]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

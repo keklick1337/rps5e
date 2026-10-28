@@ -270,3 +270,62 @@ fn corrupt_images_fail_cleanly() {
         }
     }
 }
+
+/// A tree without sce_sys (a PS5 image keeps param.json in the container).
+fn ps5_game_tree() -> PfsBuilder {
+    PfsBuilder::new()
+        .file("eboot.bin", b"\x7FELF fake eboot")
+        .file("Data/Big.bin", &noise(0x4321, 1))
+        .file("Data/Zeros.bin", &vec![0u8; 0x8_0000])
+        .compressed_file("Data/Text.txt", &b"hello pfs ".repeat(30000))
+        .dir("Empty")
+}
+
+#[test]
+fn ps5_fake_package_opens_through_naps() {
+    let dir = tmp("ps5fih");
+    let path = dir.join("game.pkg");
+    fs::write(&path, crate::build::ps5_fake_pkg(&ps5_game_tree(), CID, PARAM_JSON.as_bytes(), Some(b"\x89PNG icon"), false))
+        .unwrap();
+    let info = probe(&path).unwrap();
+    assert_eq!(info.status, Status::Ready);
+    assert_eq!(info.platform, Platform::Ps5);
+    assert_eq!(info.kind, ContentKind::Game);
+    assert_eq!(info.title_id.as_deref(), Some("PPSA99999"));
+    assert_eq!(info.name.as_deref(), Some("Test Game"));
+    assert_eq!(info.icon.as_deref(), Some(&b"\x89PNG icon"[..]));
+    let p = Package::open(&path).unwrap();
+    let fs = p.fs();
+    assert_eq!(fs.read("eboot.bin").unwrap(), b"\x7FELF fake eboot");
+    assert_eq!(fs.read("Data/Big.bin").unwrap(), noise(0x4321, 1));
+    assert_eq!(fs.read("Data/Zeros.bin").unwrap(), vec![0u8; 0x8_0000]);
+    // A Kraken-format PFSC file: logical size and contents.
+    let text = fs.lookup("Data/Text.txt").unwrap();
+    assert_eq!(fs.node(text).size, 300000);
+    assert_eq!(fs.read("Data/Text.txt").unwrap(), b"hello pfs ".repeat(30000));
+    // The container's plain entries appear under sce_sys like an installed title.
+    assert_eq!(fs.read("sce_sys/param.json").unwrap(), PARAM_JSON.as_bytes());
+    assert_eq!(fs.read("sce_sys/icon0.png").unwrap(), b"\x89PNG icon");
+    assert!(fs.node(fs.lookup("Empty").unwrap()).is_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ps5_retail_and_encrypted_packages_are_refused() {
+    let dir = tmp("ps5retail");
+    // The retail byte.
+    let path = dir.join("retail.pkg");
+    fs::write(&path, crate::build::ps5_fake_pkg(&ps5_game_tree(), CID, PARAM_JSON.as_bytes(), None, true)).unwrap();
+    assert!(matches!(Package::open(&path), Err(Error::Encrypted(_))));
+    let info = probe(&path).unwrap();
+    assert!(matches!(info.status, Status::Encrypted(_)));
+    assert_eq!(info.title_id.as_deref(), Some("PPSA99999"), "metadata still shows");
+    // An outer image with a real (non plain-text) seed.
+    let mut raw = crate::build::ps5_fake_pkg(&ps5_game_tree(), CID, PARAM_JSON.as_bytes(), None, false);
+    let sb = u64::from_le_bytes(raw[0x20..0x28].try_into().unwrap()) as usize;
+    raw[sb + 0x370..sb + 0x380].copy_from_slice(&[0x5A; 16]);
+    let path = dir.join("enc.pkg");
+    fs::write(&path, &raw).unwrap();
+    assert!(matches!(Package::open(&path), Err(Error::Encrypted(_))));
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -138,7 +138,7 @@ impl App {
                     };
                     item(ui, "Library folder...", "A folder searched (with its subfolders) for games and packages", FilePurpose::AddLibraryFolder);
                     item(ui, "Game folder...", "One game folder with eboot.bin", FilePurpose::AddGameFolder);
-                    item(ui, "Game file...", "eboot.bin, a package (.pkg / .ffpkg) or an executable (.elf / .self)", FilePurpose::AddGame);
+                    item(ui, "Game file...", "eboot.bin, a package (.pkg / .ffpkg), a disk image (.exfat / .ffpfsc) or an executable (.elf / .self)", FilePurpose::AddGame);
                     if self.pkg_install == Some(true) {
                         ui.separator();
                         item(
@@ -196,7 +196,7 @@ impl App {
             ui.label(RichText::new("Your library is empty").size(22.0).strong());
             let roots = self.settings.library_roots();
             let text = if roots.is_empty() {
-                "Add a folder with games: it is searched, with its subfolders, for game folders (eboot.bin and sce_sys/param.json) and game packages (.pkg, .ffpkg).".to_string()
+                "Add a folder with games: it is searched, with its subfolders, for game folders (eboot.bin and sce_sys/param.json) game packages (.pkg, .ffpkg) and disk images (.exfat, .ffpfsc).".to_string()
             } else {
                 let list: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
                 format!("No games found in {}. Put game folders (eboot.bin and sce_sys/) or packages there, or add them below.", list.join(", "))

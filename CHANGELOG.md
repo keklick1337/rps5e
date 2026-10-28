@@ -2,6 +2,28 @@
 
 All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.2-alpha] - 2026-10-28
+
+### Added
+
+- Games run straight from disk images of game dumps, without extracting them: exFAT images (`.exfat`, also inside an MBR or GPT partition), `.ffpfsc` containers (a PS5 PFS image holding a compressed exFAT image) and UFS2 images (`.ffpkg` dumps made on the console). The game folder is found anywhere inside the image.
+- The launcher lists `.exfat` and `.ffpfsc` files with their title, version and icon, and its file pickers accept them; `info-pkg` and `install-pkg` read them too.
+- PS5 fake packages ("\x7FFIH" packages made in plain-text mode) run straight from the `.pkg`, without extracting them: the Kraken-compressed game image is decoded on demand, and the package's metadata (title, version, icon, `sce_sys/param.json`) is read from it. `info-pkg` and the launcher show them; PS5 retail packages are still reported as encrypted. Silent Hill 2 (Remake) starts from its 48 GB package and reaches the main menu and the New Game settings at about 1 fps; it can still crash right after the start screen (with `RPS5E_LABELS_AT_EOP=through` it does not), and loading a new game stalls.
+- Kraken-compressed PFSC files (the PS5 per-file compression) are read; other PS5 compression formats are reported as unsupported instead of failing to read.
+- `imports`, `info` and `load` on a package read its `eboot.bin` instead of loading the whole package file.
+- libSceNpAuthAuthorizedAppDialog (open, status, result, close), libSceHttp2 WebSockets (offline: requests fail as without a network), `sceSaveDataPrepareForTransferring`, libSceTextToSpeech2 `Speak`/`Close`/`Terminate`, and the libc thread-destructor calls `_sceLibcInternalThreadDtors` and `_sceLibcInternalForceTlsDestructor`.
+
+### Fixed
+
+- Minecraft no longer crashes right at start: system libraries now provide their data objects (the IPv6 addresses `in6addr_any`, `in6addr_loopback` and the others of libSceNet) with real memory. Minecraft reaches the menus and gameplay.
+- libSceNpAuth checks its arguments in the console's order and returns its error codes (invalid argument, invalid size, signed out) without writing the outputs on failure.
+- Thread-local destructors run the way the console runs them: newest first, in up to four passes, and only while their module is still loaded.
+- Minecraft: the sky and distant terrain are no longer pink or magenta and the screen is no longer split in two shades. A 16-bit colour export into an integer render target now keeps its bits, as the console's colour block stores them.
+- Minecraft: the daytime sky is blue instead of black, and the large red and white glow bands are gone. Fragment depth is clamped to the viewport's depth range, as on the console, so a depth clear drawn with a polygon offset stores the far plane exactly.
+- Unreal Engine 5 games (Silent Hill 2) no longer stop at start with "Command buffer overflow": a command buffer whose end cursor is 0 has room for any packet, as the console's library computes it.
+- With `RPS5E_LABELS_AT_EOP=through`, end-of-pipe labels land in the order the queues wrote them; before, an older value could overwrite a newer one and leave both GPU queues waiting forever.
+- Demon's Souls: foliage no longer vanishes for single frames, stray stretched triangles no longer flash across the screen and the tunnel exit no longer blows out. A CPU read of GPU results that the game makes after a command-buffer label now waits for those results to reach memory, as on the console; before, it could see an earlier frame's results.
+
 ## [0.1.1-alpha] - 2026-10-28
 
 ### Added
@@ -71,6 +93,7 @@ First public alpha.
 - The project is named RustPS5Emu (RPS5E): binaries `rps5e` and `rps5e-cli`, environment variables `RPS5E_*`, data, settings and caches under `rps5e` folders.
 - Release packages: `scripts/package.sh` (Linux tarball, Windows zip) with a `dist` build profile without debug info.
 
+[0.1.2-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.2-alpha
 [0.1.1-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.1-alpha
 [0.1.0-alpha.2]: https://github.com/keklick1337/rps5e/releases/tag/0.1.0-alpha.2
 [0.1.0-alpha.1]: https://github.com/keklick1337/rps5e/releases/tag/0.1.0-alpha.1

@@ -441,6 +441,7 @@ impl RenderExecutor for SliceExecutor {
         let serial = pending.add(addr, data.len() as u64, Some(EventData::Bytes(data.to_vec())));
         self.event(
             Entry::Call(Box::new(move || {
+                crate::backend::publish_point();
                 write();
                 pending.remove(serial);
             })),

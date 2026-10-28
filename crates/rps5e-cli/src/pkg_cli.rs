@@ -14,6 +14,9 @@ fn container_name(c: Container) -> &'static str {
         Container::Pkg => "PKG",
         Container::PfsImage => "PFS image",
         Container::PfscImage => "PFSC-compressed PFS image",
+        Container::ExFatImage => "exFAT disk image",
+        Container::Ufs2Image => "UFS2 disk image",
+        Container::PfsContainer => "PFS container holding a disk image",
     }
 }
 
@@ -86,14 +89,17 @@ pub fn info(path: &str, opts: &OpenOptions, list_files: bool) -> Result<()> {
         }
     }
     let fs = pkg.fs();
-    let sb = fs.superblock();
-    println!(
-        "PFS:         block size {:#x}, {} inodes, {}{}",
-        sb.block_size,
-        sb.inode_count,
-        if sb.mode & ps5pkg::pfs::MODE_SIGNED != 0 { "signed" } else { "unsigned" },
-        if sb.mode & ps5pkg::pfs::MODE_64BIT != 0 { ", 64-bit" } else { "" }
-    );
+    match fs.superblock() {
+        Some(sb) => println!(
+            "PFS:         version {}, block size {:#x}, {} inodes, {}{}",
+            sb.version,
+            sb.block_size,
+            sb.inode_count,
+            if sb.mode & ps5pkg::pfs::MODE_SIGNED != 0 { "signed" } else { "unsigned" },
+            if sb.mode & ps5pkg::pfs::MODE_64BIT != 0 { ", 64-bit" } else { "" }
+        ),
+        None => println!("File system: {} (game folder of the image)", fs.kind().name()),
+    }
     let files = pkg.files();
     let count = files.iter().filter(|f| !f.is_dir).count();
     let total: u64 = files.iter().map(|f| f.size).sum();

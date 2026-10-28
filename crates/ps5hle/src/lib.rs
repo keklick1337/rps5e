@@ -89,6 +89,7 @@ pub mod libc_ext;
 pub mod libc_string;
 pub mod libc_thrd;
 pub mod libc_random;
+pub mod data_objects;
 pub mod memops;
 mod lock_bench;
 pub mod disc_map;

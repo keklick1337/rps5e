@@ -1081,6 +1081,24 @@ fn pixel_color(e: &mut Emitter, target: u32, a: &ExportAttr, data: &[Word], exec
     for o in outputs {
         let var = if second { second_source(e, o.kind) } else { color_output(e, o.host_location, o.kind) };
         let one = if o.kind == PixelOutputKind::Float { 0x3f80_0000 } else { 1 };
+        // A 16-bit float or normalized export (FP16, UNORM16, SNORM16) into
+        // an integer target: the CB stores each exported 16-bit field as it
+        // is, without converting its value.
+        let raw_fields = a.compressed && matches!(fmt, 4..=6) && o.kind != PixelOutputKind::Float;
+        let comps: Vec<Option<Word>> = if raw_fields {
+            (0..4u32)
+                .map(|c| {
+                    (exported >> c & 1 != 0).then(|| {
+                        let w = data.get((c / 2) as usize).copied().unwrap_or_else(|| e.cu(0));
+                        let (off, n) = (e.cu(c % 2 * 16), e.cu(16));
+                        let op = if o.kind == PixelOutputKind::Sint { S::BitFieldSExtract } else { S::BitFieldUExtract };
+                        e.ins(op, tu, &[w, off, n])
+                    })
+                })
+                .collect()
+        } else {
+            comps.clone()
+        };
         let comps: Vec<Word> = comps
             .iter()
             .enumerate()

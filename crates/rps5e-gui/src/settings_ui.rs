@@ -61,7 +61,7 @@ impl App {
             theme::card_title(
                 ui,
                 "Library folders",
-                Some("Searched with their subfolders for game folders (eboot.bin and sce_sys/param.json) and runnable game packages (.pkg, .ffpkg). Turn a folder off to stop scanning it without removing it."),
+                Some("Searched with their subfolders for game folders (eboot.bin and sce_sys/param.json) runnable game packages (.pkg, .ffpkg) and disk images (.exfat, .ffpfsc). Turn a folder off to stop scanning it without removing it."),
             );
             let rows = self.settings.folder_rows();
             if rows.is_empty() {
@@ -146,7 +146,7 @@ impl App {
                 self.rescan();
             }
             ui.horizontal(|ui| {
-                if ui.button("Add game file...").on_hover_text("eboot.bin, .pkg / .ffpkg or .elf / .self").clicked() {
+                if ui.button("Add game file...").on_hover_text("eboot.bin, .pkg / .ffpkg, .exfat / .ffpfsc or .elf / .self").clicked() {
                     actions.push(Action::Pick(FilePurpose::AddGame));
                 }
                 if ui.button("Add game folder...").clicked() {

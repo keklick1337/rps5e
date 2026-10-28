@@ -393,8 +393,33 @@ impl GpuQueue {
                 if let Some(s) = ps5gpu::backend::summary() {
                     log::info!("[gpu] {s}");
                 }
+                let stuck = Self::stuck_heads(&self.lock(), Duration::from_secs(5));
+                if !stuck.is_empty() {
+                    log::warn!("[pm4] queues waiting on memory for 5 s or more: {stuck:?}");
+                }
             }
         }
+    }
+
+    /// Heads that have waited on memory without progress for `min` or more:
+    /// queue, packet, address, value, reference, function, and whether the
+    /// address was last written as an end-of-pipe label.
+    fn stuck_heads(st: &State, min: Duration) -> Vec<String> {
+        st.queues
+            .iter()
+            .filter_map(|q| q.front())
+            .filter(|s| s.blocked_since.is_some_and(|t| t.elapsed() >= min))
+            .filter_map(|s| {
+                let (addr, value, reference, mask, f) = s.exec.waiting_on?;
+                Some(format!(
+                    "q{}@0x{:x} [0x{addr:x}]=0x{value:x} f{f} ref 0x{reference:x} mask 0x{mask:x} gpu-label={} for {:.0} s",
+                    s.queue,
+                    s.exec.current_packet(),
+                    super::interp::is_gpu_label(addr),
+                    s.blocked_since.map_or(0.0, |t| t.elapsed().as_secs_f64())
+                ))
+            })
+            .collect()
     }
 
     fn unblock_all(st: &mut State) {

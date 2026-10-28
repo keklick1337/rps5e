@@ -385,6 +385,29 @@ fn buffer_full_invokes_guest_callback() {
     assert_eq!(e.cursor(), start + 16);
 }
 
+/// A buffer whose cursorDown is 0 (a title sizes the buffer beforehand and
+/// leaves the end cursor unset) counts as unbounded, as in the library's
+/// unsigned arithmetic: no callback, the packet is written.
+#[test]
+fn cursor_down_below_cursor_up_never_calls_the_callback() {
+    static CALLED: AtomicU64 = AtomicU64::new(0);
+    fn fail(_func: u64, _args: [u64; 6]) -> u64 {
+        CALLED.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    let _g = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = Env::new();
+    let start = e.a(CMD);
+    mem::w64(e.a(CB + CB_CURSOR_DOWN), 0);
+    mem::w64(e.a(CB + CB_CALLBACK), 0x1234);
+    set_guest_call(fail);
+    let r = e.call("sceAgcDcbResetQueue", &[e.cb(), 0x43f, 0], &[]);
+    set_guest_call(|f, a| ps5cpu::exec::call_guest_nested(f, a));
+    assert_eq!(r as u64, start);
+    assert_eq!(CALLED.load(Ordering::SeqCst), 0);
+    assert!(e.cursor() > start);
+}
+
 // ---------------------------------------------------------------------------
 // Interpreter
 // ---------------------------------------------------------------------------
@@ -2169,6 +2192,45 @@ fn cp_dispatch_indirect_with_thread_dimensions() {
     let d = rec.dispatches.lock().unwrap();
     assert_eq!((d[0].packet.groups, d[0].packet.indirect_address, d[0].packet.dispatch_initiator & 0x20), ([0, 0, 0], args, 0x20));
     assert_eq!((d[1].packet.groups, d[1].packet.indirect_address), ([0, 0, 0], args));
+}
+
+/// In the write-through label mode a label is deferred while an earlier
+/// deferred one is unwritten (labels keep their order), and written at once
+/// otherwise when no write-through is pending.
+#[test]
+fn deferred_labels_keep_their_order() {
+    use interp::{defer_in_mode, defer_label, LabelMode};
+    #[derive(Default)]
+    struct Held(Mutex<Vec<Box<dyn FnOnce() + Send>>>);
+    impl ps5gpu::render::RenderExecutor for Held {
+        fn draw(&self, _: &ps5gpu::render::ResolvedDraw) {}
+        fn dispatch(&self, _: &ps5gpu::render::ResolvedDispatch) {}
+        fn end_of_pipe(&self, done: Box<dyn FnOnce() + Send>) {
+            done();
+        }
+        fn after_pipe(&self, done: Box<dyn FnOnce() + Send>) {
+            self.0.lock().unwrap().push(done);
+        }
+    }
+    let _g = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ex = Held::default();
+    let through = LabelMode::AfterWriteThroughs;
+    assert!(!defer_in_mode(through, &ex), "nothing pending: written at once");
+    assert!(defer_in_mode(LabelMode::AfterGpu, &ex));
+    assert!(!defer_in_mode(LabelMode::Recorded, &ex));
+    let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let o = order.clone();
+    defer_label(&ex, move || o.lock().unwrap().push(1));
+    assert!(defer_in_mode(through, &ex), "an older label is still deferred");
+    let o = order.clone();
+    defer_label(&ex, move || o.lock().unwrap().push(2));
+    // The GPU completes: the callbacks run in queue order.
+    let held: Vec<_> = std::mem::take(&mut *ex.0.lock().unwrap());
+    for f in held {
+        f();
+    }
+    assert_eq!(*order.lock().unwrap(), [1, 2]);
+    assert!(!defer_in_mode(through, &ex), "all deferred labels written");
 }
 
 #[test]

@@ -741,6 +741,35 @@ fn descriptor_reads_download_their_window_once() {
     dev.wait_idle();
 }
 
+/// A label the command processor publishes after GPU work
+/// ([`BufferCache::publish_point`]) makes the read-through pages of that
+/// work wait for their write-through: a CPU read synchronised with the
+/// label sees the GPU's bytes, not the older bytes guest memory still holds.
+#[test]
+#[ignore]
+fn published_labels_order_reads_of_written_through_pages() {
+    let (view, dev, shared, _tracker) = setup(0x51);
+    let gw = view + 8 * PAGE_BYTES;
+    {
+        let mut g = shared.lock().unwrap();
+        let Shared { sched, cache } = &mut *g;
+        let s = cache.obtain(sched, gw, PAGE_BYTES, true).unwrap();
+        sched.full_barrier();
+        // SAFETY: recording buffer, range inside the buffer.
+        unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, PAGE_BYTES, 0x7777_7777) };
+        sched.full_barrier();
+        // Recorded, not submitted: the copy has not landed.
+        cache.flush_write_through(sched);
+        assert_eq!(perms(gw), "r--", "read-through: unsynchronised reads see the earlier bytes");
+        cache.publish_point(sched.timeline.completed_tick());
+        assert_eq!(perms(gw), "---");
+    }
+    // SAFETY: the read faults; the handler waits for the copy.
+    assert_eq!(unsafe { std::ptr::read_volatile((gw + 8) as *const u32) }, 0x7777_7777);
+    shared.lock().unwrap().sched.flush_and_wait();
+    dev.wait_idle();
+}
+
 /// A large GPU-written range the CPU read back (a fault downloaded it) is
 /// written through after the next GPU write of it, whatever its size: the
 /// next CPU access finds every page landed instead of waiting for the GPU

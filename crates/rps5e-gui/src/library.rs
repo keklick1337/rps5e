@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Vladislav Tislenko aka keklick1337
 // SPDX-License-Identifier: GPL-2.0-only
 
-//! Game library: finds game folders and package files (`.pkg`, `.ffpkg`)
+//! Game library: finds game folders, package files (`.pkg`, `.ffpkg`) and
+//! disk images (`.exfat`, `.ffpfsc`)
 //! under the library folders (recursively) and reads their metadata:
 //! `sce_sys/param.json` (PS5) or `sce_sys/param.sfo`, `sce_sys/icon0.png`;
 //! for a package what `ps5pkg::probe` reads from it (title, title id,
@@ -21,8 +22,8 @@ use std::path::{Path, PathBuf};
 /// Directories deeper than this below a library folder are not searched.
 pub const MAX_DEPTH: usize = 8;
 
-/// Package file extensions.
-pub const PACKAGE_EXTENSIONS: [&str; 2] = ["pkg", "ffpkg"];
+/// Package and disk image file extensions.
+pub const PACKAGE_EXTENSIONS: [&str; 4] = ["pkg", "ffpkg", "exfat", "ffpfsc"];
 
 /// Where a library entry comes from.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1111,6 +1112,40 @@ mod package_tests {
         assert!(!u.can_run());
         // Game folders are always runnable.
         assert!(Game::default().can_run());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disk_images_are_listed_as_games() {
+        use ps5pkg::build::{ExFatBuilder, PfsBuilder};
+        let root = crate::test_dir().join(format!("diskimg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let json = r#"{"titleId":"PPSA99997","contentVersion":"01.003.000",
+            "localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"Image Test"}}}"#;
+        let vol = ExFatBuilder::new()
+            .file("PPSA99997-app/eboot.bin", b"\x7fELF")
+            .file("PPSA99997-app/sce_sys/param.json", json.as_bytes())
+            .file("PPSA99997-app/sce_sys/icon0.png", &tiny_png())
+            .build();
+        let exfat = root.join("Image Test.EXFAT");
+        vol.write_to(&exfat).unwrap();
+        let container = root.join("sub/image.ffpfsc");
+        std::fs::create_dir_all(container.parent().unwrap()).unwrap();
+        std::fs::write(&container, PfsBuilder::new().compressed_file("game.exfat", &vol.to_vec()).build()).unwrap();
+        assert!(is_package_file(&exfat) && is_package_file(&container));
+        for path in [&exfat, &container] {
+            let (g, icon) = read_package_with_icon(path).unwrap();
+            assert_eq!(g.package, Some(PackageState::Runnable), "{}", path.display());
+            assert_eq!(g.title, "Image Test");
+            assert_eq!(g.title_id.as_deref(), Some("PPSA99997"));
+            assert_eq!(g.version.as_deref(), Some("01.003.000"));
+            assert_eq!(icon, Some(tiny_png()));
+        }
+        // One card per title id.
+        let (games, _) = scan_with_icons(&[root.clone()], &[]);
+        assert_eq!(games.len(), 1);
+        assert!(games[0].source.is_package());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

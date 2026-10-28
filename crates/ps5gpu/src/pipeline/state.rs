@@ -1047,6 +1047,28 @@ pub fn depth_clip(clip_cntl: u32) -> (bool, bool) {
     (clip, !clip)
 }
 
+/// The DB clamps every fragment depth (after the polygon offset) to the
+/// viewport's PA_SC_VPORT_ZMIN/ZMAX, also while primitives are clipped. A
+/// host depth clamp clamps to the host viewport's depth range instead, so
+/// it reproduces the guest clamp exactly when the first `count` viewports'
+/// [ZMIN, ZMAX] equal their host depth ranges; otherwise (a wider or other
+/// clamp range) no host clamp is closer than a wrong one.
+/// DB_RENDER_OVERRIDE.DISABLE_VIEWPORT_CLAMP (bit 16) turns the guest clamp off.
+pub fn viewport_depth_clamp_exact(d: &ResolvedDraw, count: u32) -> bool {
+    if d.depth_state.render_override & (1 << 16) != 0 {
+        return false;
+    }
+    let unrestricted = DEPTH_RANGE_UNRESTRICTED.load(std::sync::atomic::Ordering::Relaxed);
+    d.viewports.iter().take(count.max(1) as usize).all(|v| depth_clamp_range_matches(v.min_depth, v.max_depth, v.z_min, v.z_max, unrestricted))
+}
+
+/// Does a host viewport of guest depth range (`min_d`, `max_d`) clamp to
+/// exactly [`z_min`, `z_max`]?
+pub fn depth_clamp_range_matches(min_d: f32, max_d: f32, z_min: f32, z_max: f32, unrestricted: bool) -> bool {
+    let (n, f) = host_depth_range(min_d, max_d, unrestricted);
+    n.min(f) == z_min && n.max(f) == z_max
+}
+
 /// The export (MRT index) that feeds color target `slot`: the Nth export
 /// SPI_SHADER_COL_FORMAT gives a format goes to the Nth target
 /// CB_SHADER_MASK enables; when the two do not pair up, export N feeds
@@ -1066,6 +1088,25 @@ pub fn export_for_slot(col_format: u32, shader_mask: u32, slot: u32) -> Option<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_clamp_only_where_the_host_range_is_the_guest_clamp() {
+        // Clipping on: no clamp from the clip register alone.
+        assert_eq!(depth_clip(0), (true, false));
+        assert_eq!(depth_clip(1 << 26), (false, true));
+        // [-1, 1] viewport (OpenGL-style) whose ZMIN/ZMAX are [-1, 1]: a
+        // clear at z 1.0 pushed far by a polygon offset lands on 1.0.
+        assert!(depth_clamp_range_matches(-1.0, 1.0, -1.0, 1.0, true));
+        // [0, 1] viewport with ZMIN/ZMAX [0, 1], also reversed.
+        assert!(depth_clamp_range_matches(0.0, 1.0, 0.0, 1.0, false));
+        assert!(depth_clamp_range_matches(1.0, 0.0, 0.0, 1.0, true));
+        // A clamp range wider than the viewport range: the host clamp would
+        // cut depths the guest keeps.
+        assert!(!depth_clamp_range_matches(0.0, 1.0, -1.0, 2.0, true));
+        assert!(!depth_clamp_range_matches(0.0, 0.5, 0.0, 1.0, true));
+        // Without unrestricted ranges a [-1, 1] viewport becomes [0, 1].
+        assert!(!depth_clamp_range_matches(-1.0, 1.0, -1.0, 1.0, false));
+    }
 
     #[test]
     fn export_routing() {

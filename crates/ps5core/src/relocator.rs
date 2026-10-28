@@ -98,7 +98,10 @@ fn relocate_record(
         match SymbolType::from_st_type(sym.type_()) {
             SymbolType::Object => match resolve_object(p, programs, hle_data, &name, SymbolType::Object) {
                 Some(a) => (a, true),
-                None => (INVALID_MEMORY, false),
+                None => {
+                    log::warn!("[reloc] {}: data import {name} has no definition yet (points at {INVALID_MEMORY:#x})", p.name);
+                    (INVALID_MEMORY, false)
+                }
             },
             ty => {
                 let exact = (ty == SymbolType::NoType)

@@ -2501,6 +2501,13 @@ impl Backend {
         }
     }
 
+    /// The command processor publishes a write the guest can observe
+    /// (see [`BufferCache::publish_point`]).
+    pub fn publish_point(&mut self) {
+        let done = self.sched.timeline.completed_tick();
+        self.buffers.publish_point(done);
+    }
+
     /// Write-throughs recorded and not yet completed by the GPU (see
     /// [`RenderExecutor::writes_through_pending`]).
     pub fn writes_through_pending(&mut self) -> bool {
@@ -2994,6 +3001,13 @@ pub fn with_backend<R>(f: impl FnOnce(&mut Backend) -> R) -> Option<R> {
     let mut g = lock()?;
     let b = g.g.as_mut()?;
     Some(f(b))
+}
+
+/// A write of the command processor the guest can observe is about to be
+/// made (a label): GPU results it orders reach guest memory before a CPU
+/// read of them ([`Backend::publish_point`]).
+pub fn publish_point() {
+    with_ready_backend(|b| b.publish_point());
 }
 
 /// Run `f` only when the back-end already exists (fault / flip paths).
@@ -4196,6 +4210,11 @@ impl RenderExecutor for GpuExecutor {
         with_ready_backend(|b| b.writes_through_pending()).unwrap_or(false)
     }
 
+    fn write_ordered(&self, _addr: u64, _data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        publish_point();
+        write();
+    }
+
     fn memory_filled(&self, addr: u64, size: u64, value: u32) {
         shadow::item(shadow::Kind::MemoryFilled, 0, || profile::time(6, || with_backend(|b| b.memory_filled(addr, size, value))));
     }
@@ -4600,6 +4619,7 @@ impl RenderExecutor for QueuedExecutor {
         // after the draws and transfers before it were recorded (their
         // pages GPU-dirty, so a CPU read waits for their results).
         if !self.recording() {
+            publish_point();
             write();
             return;
         }
@@ -4607,6 +4627,7 @@ impl RenderExecutor for QueuedExecutor {
         let transfers = self.transfers.clone();
         let serial = transfers.add(addr, len, Some(crate::slices::pending::EventData::Bytes(data.to_vec())));
         self.send(Recorded::Call(Box::new(move || {
+            publish_point();
             write();
             transfers.remove(serial);
         })));

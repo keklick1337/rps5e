@@ -1426,34 +1426,155 @@ fn cb_ctime(ctx: &mut CpuContext) -> HleResult {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread destructors (__cxa_thread_atexit of LibcInternalExt)
+// Per-thread destructors (__cxa_thread_atexit of libSceLibcInternal)
 // ---------------------------------------------------------------------------
+//
+// The game's libc forwards `__cxa_thread_atexit(dtor, obj, dso)` to
+// `_sceLibcInternalThreadAtexit`, `exit` to `_sceLibcInternalThreadDtors`
+// and `__cxa_finalize(dso)` to `_sceLibcInternalForceTlsDestructor(module)`.
+// Every thread keeps its own list, newest entry first:
+// - registration fails with -1 when `dso` lies in no loaded module, and
+//   records the module that holds `dso`;
+// - an entry runs only while its `dso` is still inside a loaded module and
+//   still holds its own address (a live `__dso_handle`); otherwise it is
+//   dropped without a call;
+// - destructors run newest first in passes: entries a destructor registers
+//   go to the next pass, and after four passes whatever is left is dropped;
+// - forcing a module runs, in the same passes, only the calling thread's
+//   entries of that module, and stops after a pass that found none.
 
-thread_local! {
-    static THREAD_ATEXIT: std::cell::RefCell<Vec<(u64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+/// Passes over a thread's destructor list before the rest is dropped.
+const THREAD_DTOR_PASSES: u32 = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ThreadAtexitEntry {
+    /// Registration order; entries registered during a pass are newer than
+    /// the pass's boundary and wait for the next one.
+    seq: u64,
+    dtor: u64,
+    obj: u64,
+    dso: u64,
+    /// Handle of the module holding `dso` when the entry was registered.
+    module: i32,
 }
 
-/// (destructor, object, module_id) -> 0
+#[derive(Default)]
+struct ThreadAtexitList {
+    /// Oldest first.
+    entries: Vec<ThreadAtexitEntry>,
+    next_seq: u64,
+    /// Pass number and boundary of the thread-exit run in progress.
+    exit_pass: Option<(u32, u64)>,
+}
+
+impl ThreadAtexitList {
+    fn push(&mut self, dtor: u64, obj: u64, dso: u64, module: i32) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries.push(ThreadAtexitEntry { seq, dtor, obj, dso, module });
+    }
+
+    /// Remove and return the newest entry registered before `boundary`,
+    /// limited to one module when `module` is given.
+    fn take_before(&mut self, boundary: u64, module: Option<i32>) -> Option<ThreadAtexitEntry> {
+        let i = self.entries.iter().rposition(|e| e.seq < boundary && module.is_none_or(|m| e.module == m))?;
+        Some(self.entries.remove(i))
+    }
+
+    /// The next entry of the thread-exit run (every module), or None when
+    /// the run is over; the run then forgets whatever is left.
+    fn next_exit_entry(&mut self) -> Option<ThreadAtexitEntry> {
+        loop {
+            let (pass, boundary) = match self.exit_pass {
+                Some(p) => p,
+                None if self.entries.is_empty() => return None,
+                None => *self.exit_pass.insert((1, self.next_seq)),
+            };
+            if let Some(e) = self.take_before(boundary, None) {
+                return Some(e);
+            }
+            if self.entries.is_empty() || pass >= THREAD_DTOR_PASSES {
+                self.entries.clear();
+                self.exit_pass = None;
+                return None;
+            }
+            self.exit_pass = Some((pass + 1, self.next_seq));
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_ATEXIT: std::cell::RefCell<ThreadAtexitList> = std::cell::RefCell::new(ThreadAtexitList::default());
+}
+
+fn with_thread_atexit<R>(f: impl FnOnce(&mut ThreadAtexitList) -> R) -> R {
+    THREAD_ATEXIT.with(|l| f(&mut l.borrow_mut()))
+}
+
+/// Whether `dso` is still a live `__dso_handle`: inside a loaded module and
+/// holding its own address.
+fn dso_is_live(dso: u64) -> bool {
+    if crate::modules::module_by_address(dso).is_none() {
+        return false;
+    }
+    let mut word = [0u8; 8];
+    crate::pthread::guest_vm().is_some_and(|vm| vm.read(dso, &mut word).is_ok()) && u64::from_le_bytes(word) == dso
+}
+
+/// _sceLibcInternalThreadAtexit(dtor, obj, dso) -> 0, or -1 when `dso` is
+/// not inside a loaded module.
 fn cb_cxa_thread_atexit(ctx: &mut CpuContext) -> HleResult {
-    let (dtor, obj) = (ctx.rdi(), ctx.rsi());
-    THREAD_ATEXIT.with(|v| v.borrow_mut().push((dtor, obj)));
+    let (dtor, obj, dso) = (ctx.rdi(), ctx.rsi(), ctx.rdx());
+    let Some(module) = crate::modules::module_by_address(dso) else { return -1 };
+    with_thread_atexit(|l| l.push(dtor, obj, dso, module.handle));
+    OK
+}
+
+/// _sceLibcInternalThreadDtors(): run the calling thread's destructors.
+fn cb_thread_dtors(_ctx: &mut CpuContext) -> HleResult {
+    run_thread_atexit_destructors();
+    OK
+}
+
+/// _sceLibcInternalForceTlsDestructor(module): run the calling thread's
+/// destructors registered for `module` (its `__cxa_finalize`), newest first,
+/// in up to four passes; the other modules' entries stay.
+fn cb_force_tls_destructor(ctx: &mut CpuContext) -> HleResult {
+    let module = ctx.rdi() as i32;
+    for _ in 0..THREAD_DTOR_PASSES {
+        let boundary = with_thread_atexit(|l| l.next_seq);
+        let mut found = false;
+        while let Some(e) = with_thread_atexit(|l| l.take_before(boundary, Some(module))) {
+            found = true;
+            if e.dtor != 0 && dso_is_live(e.dso) {
+                ps5cpu::exec::call_guest_nested(e.dtor, [e.obj, 0, 0, 0, 0, 0]);
+            }
+        }
+        if !found {
+            break;
+        }
+    }
     OK
 }
 
 /// Run the calling thread's registered destructors, last registered first.
 /// Must be called on the guest thread, from an HLE dispatch.
 pub fn run_thread_atexit_destructors() {
-    while let Some((dtor, obj)) = THREAD_ATEXIT.with(|v| v.borrow_mut().pop()) {
-        if dtor != 0 {
-            ps5cpu::exec::call_guest_nested(dtor, [obj, 0, 0, 0, 0, 0]);
-        }
+    while let Some((dtor, obj)) = pop_thread_atexit_destructor() {
+        ps5cpu::exec::call_guest_nested(dtor, [obj, 0, 0, 0, 0, 0]);
     }
 }
 
-/// Take the calling thread's most recently registered destructor
-/// `(dtor, obj)`, for thread exit paths that run outside a dispatch.
+/// Take the calling thread's next destructor `(dtor, obj)` to run at
+/// thread exit, skipping entries whose module is gone; None ends the run
+/// (call until None). For exit paths that run outside a dispatch.
 pub fn pop_thread_atexit_destructor() -> Option<(u64, u64)> {
-    THREAD_ATEXIT.with(|v| v.borrow_mut().pop())
+    loop {
+        let e = with_thread_atexit(|l| l.next_exit_entry())?;
+        if e.dtor != 0 && dso_is_live(e.dso) {
+            return Some((e.dtor, e.obj));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,6 +1664,8 @@ pub fn register(reg: &mut HleRegistry) {
         reg.register_fallback_fn(nid, name, "libc", cb);
     }
     reg.register_fn("qBS714-Jr3g", "_sceLibcInternalThreadAtexit", "libSceLibcInternal", cb_cxa_thread_atexit);
+    reg.register_fn("OQ-dzhlnM28", "_sceLibcInternalThreadDtors", "libSceLibcInternal", cb_thread_dtors);
+    reg.register_fn("tB59hFLH3SA", "_sceLibcInternalForceTlsDestructor", "libSceLibcInternal", cb_force_tls_destructor);
 
     reg.register_fn("NWtTN10cJzE", "sceLibcHeapGetTraceInfo", "libc", cb_heap_get_trace_info);
 }
@@ -1588,6 +1711,92 @@ fn cb_heap_get_trace_info(ctx: &mut CpuContext) -> HleResult {
 mod tests {
     use super::*;
     use crate::context::CpuRegister::{Rdi, Rdx, Rsi};
+
+    fn exit_run(l: &mut ThreadAtexitList, mut on_call: impl FnMut(&mut ThreadAtexitList, u64)) -> Vec<u64> {
+        let mut order = Vec::new();
+        while let Some(e) = l.next_exit_entry() {
+            order.push(e.obj);
+            on_call(l, e.obj);
+        }
+        order
+    }
+
+    /// Thread exit: newest first; a destructor's own registrations run in
+    /// the next pass; after four passes the rest is dropped.
+    #[test]
+    fn thread_atexit_exit_passes() {
+        let mut l = ThreadAtexitList::default();
+        for obj in 1..=3 {
+            l.push(0x10, obj, 0x20, 1);
+        }
+        assert_eq!(exit_run(&mut l, |_, _| {}), vec![3, 2, 1]);
+        assert!(l.entries.is_empty() && l.exit_pass.is_none());
+
+        // Every destructor registers one more: passes 1..4 run, then stop.
+        l.push(0x10, 100, 0x20, 1);
+        let order = exit_run(&mut l, |l, obj| l.push(0x10, obj + 1, 0x20, 1));
+        assert_eq!(order, vec![100, 101, 102, 103]);
+        assert!(l.entries.is_empty(), "the fifth registration is dropped");
+
+        // Two registered in one pass run newest first in the next.
+        l.push(0x10, 1, 0x20, 1);
+        let order = exit_run(&mut l, |l, obj| {
+            if obj == 1 {
+                l.push(0x10, 10, 0x20, 1);
+                l.push(0x10, 11, 0x20, 1);
+            }
+        });
+        assert_eq!(order, vec![1, 11, 10]);
+        // A new list starts after a finished run.
+        l.push(0x10, 7, 0x20, 1);
+        assert_eq!(exit_run(&mut l, |_, _| {}), vec![7]);
+    }
+
+    /// Forcing a module takes only that module's entries, newest first,
+    /// and leaves the others in order.
+    #[test]
+    fn thread_atexit_force_one_module() {
+        let mut l = ThreadAtexitList::default();
+        l.push(0x10, 1, 0x20, 5);
+        l.push(0x10, 2, 0x30, 6);
+        l.push(0x10, 3, 0x20, 5);
+        let boundary = l.next_seq;
+        l.push(0x10, 4, 0x20, 5);
+        assert_eq!(l.take_before(boundary, Some(5)).map(|e| e.obj), Some(3));
+        assert_eq!(l.take_before(boundary, Some(5)).map(|e| e.obj), Some(1));
+        assert_eq!(l.take_before(boundary, Some(5)), None);
+        assert_eq!(l.take_before(boundary, Some(7)), None);
+        assert_eq!(exit_run(&mut l, |_, _| {}), vec![4, 2]);
+    }
+
+    /// Registration needs a `dso` inside a loaded module; none is loaded
+    /// here, so it fails with -1 and records nothing; with no entries both
+    /// runs do nothing.
+    #[test]
+    fn thread_atexit_rejects_dso_outside_modules() {
+        let vm = ps5vm::VirtualMemory::new();
+        let mut ctx = CpuContext::new(&vm);
+        ctx.set(Rdi, 0x1000);
+        ctx.set(Rsi, 0x2000);
+        ctx.set(Rdx, 0);
+        assert_eq!(cb_cxa_thread_atexit(&mut ctx), -1);
+        assert_eq!(with_thread_atexit(|l| l.entries.len()), 0);
+        assert_eq!(cb_thread_dtors(&mut ctx), OK);
+        ctx.set(Rdi, 3);
+        assert_eq!(cb_force_tls_destructor(&mut ctx), OK);
+        assert_eq!(pop_thread_atexit_destructor(), None);
+    }
+
+    #[test]
+    fn libc_internal_nids() {
+        for (nid, name) in [
+            ("qBS714-Jr3g", "_sceLibcInternalThreadAtexit"),
+            ("OQ-dzhlnM28", "_sceLibcInternalThreadDtors"),
+            ("tB59hFLH3SA", "_sceLibcInternalForceTlsDestructor"),
+        ] {
+            assert_eq!(ps5nid::compute_nid(name), nid, "{name}");
+        }
+    }
 
     /// sceLibcHeapGetTraceInfo: a mask word and a zeroed 65-slot table
     /// (the native libc writes slot 64 too); the second u32 is cleared.

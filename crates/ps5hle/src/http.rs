@@ -2120,6 +2120,48 @@ struct Http2Request {
     /// without a Content-Length header. Requests are never sent offline, so
     /// nothing reads the flag yet.
     no_content_length: bool,
+    /// Present on a request made by sceHttp2WebSocketCreateRequest.
+    websocket: Option<Http2WebSocket>,
+}
+
+impl Http2Request {
+    fn new(tmpl_id: i32, method: String, url: String, content_length: u64, websocket: Option<Http2WebSocket>) -> Self {
+        Http2Request {
+            tmpl_id,
+            method,
+            url,
+            content_length,
+            headers: Vec::new(),
+            send_result: HTTP2_ERROR_BEFORE_SEND,
+            status_code: 0,
+            response_body: Vec::new(),
+            read_offset: 0,
+            async_result: HTTP2_ERROR_BEFORE_SEND,
+            async_event: 0,
+            options: Http2Options::default(),
+            no_content_length: false,
+            websocket,
+        }
+    }
+}
+
+/// The WebSocket side of a request. The opening handshake is the request
+/// itself (sent with sceHttp2SendRequestAsync); messages flow only once it
+/// succeeded, which never happens offline, so the callbacks are never
+/// called and the receive buffer is never written.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Http2WebSocket {
+    text_callback: u64,
+    data_callback: u64,
+    close_callback: u64,
+    error_callback: u64,
+    recv_buffer: u64,
+    recv_buffer_size: u64,
+    user_data: u64,
+    /// sceHttp2WebSocketSetPingInterval / SetPingTimeout, microseconds.
+    ping_interval_us: u32,
+    ping_timeout_us: u32,
 }
 
 struct Http2State {
@@ -2154,6 +2196,14 @@ impl Http2State {
             return Some(&mut r.options);
         }
         self.templates.get_mut(&id).map(|t| &mut t.options)
+    }
+
+    /// Store a new request and return its id.
+    fn insert_request(&mut self, request: Http2Request) -> HleResult {
+        let id = self.next_request;
+        self.next_request += 1;
+        self.requests.insert(id, request);
+        id as i64
     }
 
     fn remove_template(&mut self, id: i32) -> bool {
@@ -2391,27 +2441,7 @@ fn cb_http2_create_request_with_url(ctx: &mut CpuContext) -> HleResult {
         return HTTP2_ERROR_INVALID_ID;
     }
     log::info!("[http2] request {method} {url} (offline)");
-    let id = st.next_request;
-    st.next_request += 1;
-    st.requests.insert(
-        id,
-        Http2Request {
-            tmpl_id,
-            method,
-            url,
-            content_length: ctx.rcx(),
-            headers: Vec::new(),
-            send_result: HTTP2_ERROR_BEFORE_SEND,
-            status_code: 0,
-            response_body: Vec::new(),
-            read_offset: 0,
-            async_result: HTTP2_ERROR_BEFORE_SEND,
-            async_event: 0,
-            options: Http2Options::default(),
-            no_content_length: false,
-        },
-    );
-    id as i64
+    st.insert_request(Http2Request::new(tmpl_id, method, url, ctx.rcx(), None))
 }
 
 /// sceHttp2AddRequestHeader(reqId, name, value, mode)
@@ -2672,6 +2702,107 @@ fn cb_http2_get_all_response_headers(ctx: &mut CpuContext) -> HleResult {
     }
 }
 
+/// Argument `i` past the six register arguments.
+fn stack_arg(ctx: &CpuContext, i: u64) -> u64 {
+    ctx.read_u64(ctx.get(crate::context::CpuRegister::Rsp) + 8 + 8 * i).unwrap_or(0)
+}
+
+/// sceHttp2WebSocketCreateRequest(tmplId, url, textCallback, dataCallback,
+/// closeCallback, errorCallback, recvBuffer, recvBufferSize, userData,
+/// option): a request whose opening handshake (a GET with the upgrade
+/// headers) the caller sends with sceHttp2SendRequestAsync, after adding
+/// its own headers such as Sec-WebSocket-Protocol.
+fn cb_http2_websocket_create_request(ctx: &mut CpuContext) -> HleResult {
+    let (tmpl_id, url_ptr) = (ctx.rdi() as i32, ctx.rsi());
+    if url_ptr == 0 {
+        return HTTP2_ERROR_NULL_POINTER;
+    }
+    let Some(url) = read_string(ctx, url_ptr) else {
+        return ERR_MEMORY_FAULT;
+    };
+    let websocket = Http2WebSocket {
+        text_callback: ctx.rdx(),
+        data_callback: ctx.rcx(),
+        close_callback: ctx.r8(),
+        error_callback: ctx.r9(),
+        recv_buffer: stack_arg(ctx, 0),
+        recv_buffer_size: stack_arg(ctx, 1),
+        user_data: stack_arg(ctx, 2),
+        ..Http2WebSocket::default()
+    };
+    let mut st = http2();
+    if !st.templates.contains_key(&tmpl_id) {
+        return HTTP2_ERROR_INVALID_ID;
+    }
+    log::info!("[http2] websocket {url} (offline)");
+    st.insert_request(Http2Request::new(tmpl_id, "GET".into(), url, 0, Some(websocket)))
+}
+
+/// Apply `f` to the WebSocket state of request `id`; an id that is not a
+/// WebSocket request is invalid.
+fn update_websocket(id: i32, f: impl FnOnce(&mut Http2WebSocket)) -> HleResult {
+    match http2().requests.get_mut(&id).and_then(|r| r.websocket.as_mut()) {
+        Some(ws) => {
+            f(ws);
+            0
+        }
+        None => HTTP2_ERROR_INVALID_ID,
+    }
+}
+
+/// sceHttp2WebSocketSetPingInterval(reqId, microseconds)
+fn cb_http2_websocket_set_ping_interval(ctx: &mut CpuContext) -> HleResult {
+    let us = ctx.rsi() as u32;
+    update_websocket(ctx.rdi() as i32, |ws| ws.ping_interval_us = us)
+}
+
+/// sceHttp2WebSocketSetPingTimeout(reqId, microseconds)
+fn cb_http2_websocket_set_ping_timeout(ctx: &mut CpuContext) -> HleResult {
+    let us = ctx.rsi() as u32;
+    update_websocket(ctx.rdi() as i32, |ws| ws.ping_timeout_us = us)
+}
+
+/// Common part of the WebSocket message and close calls on request `id`:
+/// frames go out only on an open connection, so before the handshake was
+/// sent the call fails with BEFORE_SEND and after a failed handshake with
+/// its error, the way reading the body of a failed request does. Offline
+/// the handshake never succeeds, so nothing is ever queued and neither
+/// `kqueueOption` nor sceHttp2WaitAsync sees a completion.
+fn websocket_send(id: i32) -> HleResult {
+    match http2().requests.get(&id) {
+        Some(r) if r.websocket.is_some() => {
+            debug_assert_ne!(r.send_result, 0, "offline WebSocket handshake succeeded");
+            r.send_result
+        }
+        _ => HTTP2_ERROR_INVALID_ID,
+    }
+}
+
+/// sceHttp2WebSocketSendTextMessageAsync(reqId, text, flags, kqueueOption,
+/// option)
+fn cb_http2_websocket_send_text_message_async(ctx: &mut CpuContext) -> HleResult {
+    if ctx.rsi() == 0 {
+        return HTTP2_ERROR_NULL_POINTER;
+    }
+    websocket_send(ctx.rdi() as i32)
+}
+
+/// sceHttp2WebSocketSendDataMessageAsync(reqId, data, size, flags,
+/// kqueueOption, option)
+fn cb_http2_websocket_send_data_message_async(ctx: &mut CpuContext) -> HleResult {
+    if ctx.rsi() == 0 && ctx.rdx() != 0 {
+        return HTTP2_ERROR_NULL_POINTER;
+    }
+    websocket_send(ctx.rdi() as i32)
+}
+
+/// sceHttp2WebSocketCloseAsync(reqId, const uint16_t* status, reason,
+/// flags, kqueueOption, option): starts the closing handshake, which is a
+/// frame on the open connection like a message.
+fn cb_http2_websocket_close_async(ctx: &mut CpuContext) -> HleResult {
+    websocket_send(ctx.rdi() as i32)
+}
+
 const HTTP_EXPORTS: &[(&str, &str, HleCallback)] = &[
     ("A9cVMUtEp4Y", "sceHttpInit", cb_http_init),
     ("Ik-KpLTlf7Q", "sceHttpTerm", cb_http_term),
@@ -2791,6 +2922,12 @@ const HTTP2_EXPORTS: &[(&str, &str, HleCallback)] = &[
     ("O9ync3F-JVI", "sceHttp2DeleteCookieBox", cb_http2_delete_cookie_box),
     ("IZ-qjhRqvjk", "sceHttp2AbortRequest", cb_http2_abort_request),
     ("5VlQSzXW-SQ", "sceHttp2CookieFlush", cb_http2_cookie_flush),
+    ("-0wUiGX74GQ", "sceHttp2WebSocketCreateRequest", cb_http2_websocket_create_request),
+    ("YfaXPnc8PJE", "sceHttp2WebSocketSetPingInterval", cb_http2_websocket_set_ping_interval),
+    ("-MU9L6S3Fj4", "sceHttp2WebSocketSetPingTimeout", cb_http2_websocket_set_ping_timeout),
+    ("WYszaHaIkWs", "sceHttp2WebSocketSendTextMessageAsync", cb_http2_websocket_send_text_message_async),
+    ("ksn0O9Iilb0", "sceHttp2WebSocketSendDataMessageAsync", cb_http2_websocket_send_data_message_async),
+    ("BlZ8niq3nHU", "sceHttp2WebSocketCloseAsync", cb_http2_websocket_close_async),
 ];
 
 pub fn register(reg: &mut HleRegistry) {
@@ -3751,6 +3888,109 @@ mod tests {
         args(&mut ctx, &[c]);
         assert_eq!(cb_http2_term(&mut ctx), 0);
         assert_eq!(cb_http2_term(&mut ctx), HTTP2_ERROR_INVALID_ID);
+    }
+
+    /// WebSocket requests: created on a template with the callbacks and the
+    /// receive buffer from the stack arguments, configured, and refused
+    /// frames until a handshake succeeds, which it never does offline.
+    #[test]
+    fn http2_websocket_offline() {
+        const BASE: u64 = 0x5D0E_0000_0000;
+        let mut ctx = guest(BASE);
+        args(&mut ctx, &[1, 2, 0x10000, 4]);
+        let c = cb_http2_init(&mut ctx) as u64;
+        ctx.write_bytes(BASE, b"agent\0wss://example.com/chat\0GET\0https://example.com/\0");
+        args(&mut ctx, &[c, BASE, 2, 0]);
+        let t = cb_http2_create_template(&mut ctx) as u64;
+        let url = BASE + 6;
+        // Stack arguments: recvBuffer, recvBufferSize, userData, option.
+        let rsp = BASE + 0x800;
+        for (i, v) in [BASE + 0x1000, 0x2000, 0xDA7A, 0].iter().enumerate() {
+            ctx.write_u64(rsp + 8 + 8 * i as u64, *v);
+        }
+        ctx.set(Rsp, rsp);
+        args(&mut ctx, &[t, 0, 0x100, 0x200, 0x300, 0x400]);
+        assert_eq!(cb_http2_websocket_create_request(&mut ctx), HTTP2_ERROR_NULL_POINTER);
+        args(&mut ctx, &[0x7777, url, 0x100, 0x200, 0x300, 0x400]);
+        assert_eq!(cb_http2_websocket_create_request(&mut ctx), HTTP2_ERROR_INVALID_ID);
+        args(&mut ctx, &[t, url, 0x100, 0x200, 0x300, 0x400]);
+        let ws = cb_http2_websocket_create_request(&mut ctx);
+        assert!(ws > 0);
+        let ws = ws as u64;
+        {
+            let st = http2();
+            let r = &st.requests[&(ws as i32)];
+            assert_eq!((r.method.as_str(), r.url.as_str()), ("GET", "wss://example.com/chat"));
+            let w = r.websocket.as_ref().unwrap();
+            assert_eq!(
+                (w.text_callback, w.data_callback, w.close_callback, w.error_callback),
+                (0x100, 0x200, 0x300, 0x400)
+            );
+            assert_eq!((w.recv_buffer, w.recv_buffer_size, w.user_data), (BASE + 0x1000, 0x2000, 0xDA7A));
+        }
+        // The caller adds its subprotocol header to the handshake.
+        ctx.write_bytes(BASE + 0x100, b"Sec-WebSocket-Protocol\0chat\0");
+        args(&mut ctx, &[ws, BASE + 0x100, BASE + 0x117, 0]);
+        assert_eq!(cb_http2_add_request_header(&mut ctx), 0);
+
+        args(&mut ctx, &[ws, 30_000_000]);
+        assert_eq!(cb_http2_websocket_set_ping_interval(&mut ctx), 0);
+        args(&mut ctx, &[ws, 10_000_000]);
+        assert_eq!(cb_http2_websocket_set_ping_timeout(&mut ctx), 0);
+        {
+            let st = http2();
+            let w = st.requests[&(ws as i32)].websocket.clone().unwrap();
+            assert_eq!((w.ping_interval_us, w.ping_timeout_us), (30_000_000, 10_000_000));
+        }
+        // A plain request is not a WebSocket.
+        args(&mut ctx, &[t, url + 23, url + 27, 0]);
+        let plain = cb_http2_create_request_with_url(&mut ctx) as u64;
+        for id in [plain, 0x7777] {
+            args(&mut ctx, &[id, 1]);
+            assert_eq!(cb_http2_websocket_set_ping_interval(&mut ctx), HTTP2_ERROR_INVALID_ID);
+            assert_eq!(cb_http2_websocket_set_ping_timeout(&mut ctx), HTTP2_ERROR_INVALID_ID);
+            args(&mut ctx, &[id, BASE, 0, 0, 0]);
+            assert_eq!(cb_http2_websocket_send_text_message_async(&mut ctx), HTTP2_ERROR_INVALID_ID);
+            args(&mut ctx, &[id, BASE, 4, 0, 0, 0]);
+            assert_eq!(cb_http2_websocket_send_data_message_async(&mut ctx), HTTP2_ERROR_INVALID_ID);
+            args(&mut ctx, &[id, 0, 0, 0, 0, 0]);
+            assert_eq!(cb_http2_websocket_close_async(&mut ctx), HTTP2_ERROR_INVALID_ID);
+        }
+
+        // NULL message pointers.
+        args(&mut ctx, &[ws, 0, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_text_message_async(&mut ctx), HTTP2_ERROR_NULL_POINTER);
+        args(&mut ctx, &[ws, 0, 4, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_data_message_async(&mut ctx), HTTP2_ERROR_NULL_POINTER);
+
+        // Before the handshake no frame can go out.
+        args(&mut ctx, &[ws, BASE, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_text_message_async(&mut ctx), HTTP2_ERROR_BEFORE_SEND);
+        args(&mut ctx, &[ws, 0, 0, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_data_message_async(&mut ctx), HTTP2_ERROR_BEFORE_SEND);
+        ctx.write_bytes(BASE + 0x180, &1000u16.to_le_bytes());
+        args(&mut ctx, &[ws, BASE + 0x180, 0, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_close_async(&mut ctx), HTTP2_ERROR_BEFORE_SEND);
+
+        // The handshake times out offline; frames then fail with its error.
+        args(&mut ctx, &[ws, 0, 0, 0, 0]);
+        assert_eq!(cb_http2_send_request_async(&mut ctx), 0);
+        args(&mut ctx, &[ws, BASE + 0x200, 0, 0]);
+        assert_eq!(cb_http2_wait_async(&mut ctx), 0);
+        assert_eq!(ctx.read_u32(BASE + 0x208), Some(HTTP2_ERROR_TIMEOUT as u32));
+        args(&mut ctx, &[ws, BASE, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_text_message_async(&mut ctx), HTTP2_ERROR_TIMEOUT);
+        args(&mut ctx, &[ws, BASE, 4, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_send_data_message_async(&mut ctx), HTTP2_ERROR_TIMEOUT);
+        args(&mut ctx, &[ws, BASE + 0x180, 0, 0, 0, 0]);
+        assert_eq!(cb_http2_websocket_close_async(&mut ctx), HTTP2_ERROR_TIMEOUT);
+
+        args(&mut ctx, &[ws]);
+        assert_eq!(cb_http2_delete_request(&mut ctx), 0);
+        args(&mut ctx, &[ws, 1]);
+        assert_eq!(cb_http2_websocket_set_ping_interval(&mut ctx), HTTP2_ERROR_INVALID_ID);
+        args(&mut ctx, &[c]);
+        assert_eq!(cb_http2_term(&mut ctx), 0);
     }
 
     /// sceHttp2SetRequestNoContentLength sets the flag on a request; an

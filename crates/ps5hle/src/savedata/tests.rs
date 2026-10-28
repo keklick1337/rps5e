@@ -698,7 +698,7 @@ fn nids_match_names() {
         assert_eq!(ps5nid::compute_nid(name), nid, "NID mismatch for {name}");
         count += 1;
     }
-    assert_eq!(count, 47);
+    assert_eq!(count, 48);
 }
 
 #[test]
@@ -1066,4 +1066,18 @@ fn search_sort_keys_and_free_blocks() {
     assert_eq!(h.lib.mount3(&h.ctx, m, r), ERR_NOT_FOUND);
     assert_eq!(h.read(r, MOUNT_RESULT_SIZE), vec![0x5A; MOUNT_RESULT_SIZE]);
     fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// sceSaveDataPrepare / sceSaveDataPrepareForTransferring: both pointers
+/// are required.
+#[test]
+fn prepare_checks_both_pointers() {
+    use crate::context::CpuRegister::{Rdi, Rsi};
+    let vm = ps5vm::VirtualMemory::new();
+    let mut ctx = CpuContext::new(&vm);
+    for (rdi, rsi, want) in [(0, 0, ERR_PARAMETER), (0x1000, 0, ERR_PARAMETER), (0, 0x2000, ERR_PARAMETER), (0x1000, 0x2000, OK)] {
+        ctx.set(Rdi, rdi);
+        ctx.set(Rsi, rsi);
+        assert_eq!(cb_prepare(&mut ctx), want, "{rdi:#x} {rsi:#x}");
+    }
 }

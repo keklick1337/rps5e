@@ -182,7 +182,13 @@ impl HleDispatcher for CoreDispatcher {
         ctx.regs = *regs;
         ctx.rip = stub_addr;
 
-        let rax = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (export.callback)(&mut ctx))) {
+        // `RPS5E_HLE_PROFILE`: per-export call counts and time.
+        let profile = ps5hle::registry::profile::enabled().then(std::time::Instant::now);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (export.callback)(&mut ctx)));
+        if let Some(start) = profile {
+            ps5hle::registry::profile::record(export.nid, export.name, start.elapsed());
+        }
+        let rax = match result {
             Ok(r) => r as u64,
             Err(payload) => {
                 let msg = payload
