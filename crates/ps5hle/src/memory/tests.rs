@@ -1501,6 +1501,30 @@ fn posix_munmap_rounds_the_range_like_the_kernel() {
     assert_eq!(t.call(cb_posix_munmap, &[u64::MAX, PAGE]).0, -1, "range overflow");
 }
 
+/// sceKernelMunmap is the munmap system call with an SCE error code: the
+/// length rounds up to whole pages (a sub-page tail used to stay behind as
+/// a range whose host pages were gone), the start rounds down.
+#[test]
+fn sce_munmap_rounds_the_range_like_the_kernel() {
+    let t = T::new();
+    let before = t.available_flexible();
+    let f = t.flex_ok(PAGE * 3, PROT_RW3, "sce_munmap_unaligned");
+    t.write(f + PAGE * 2, 7);
+    assert_eq!(t.call(cb_munmap, &[f, PAGE + 0xa0]).0, OK, "the end rounds up");
+    t.expect_unmapped(f);
+    t.expect_unmapped(f + PAGE);
+    t.expect_unmapped(f + PAGE + 0xa0);
+    let q = t.query(f + PAGE * 2, 0);
+    assert_eq!((q.start, q.end), (f + PAGE * 2, f + PAGE * 3), "the rest stays one whole page");
+    assert_eq!(t.read(f + PAGE * 2), 7);
+    assert_eq!(t.available_flexible(), before - PAGE, "two pages returned to the budget");
+    assert_eq!(t.call(cb_munmap, &[f + PAGE * 2 + 8, 8]).0, OK, "the start rounds down");
+    t.expect_unmapped(f + PAGE * 2);
+    assert_eq!(t.available_flexible(), before);
+    assert_eq!(t.call(cb_munmap, &[f, 0]).0, EINVAL, "a zero length is EINVAL");
+    assert_eq!(t.call(cb_munmap, &[u64::MAX, PAGE]).0, EINVAL, "range overflow");
+}
+
 #[test]
 fn msync_contracts() {
     let t = T::new();

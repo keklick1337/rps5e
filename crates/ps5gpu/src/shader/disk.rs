@@ -90,6 +90,7 @@ pub fn translator_stamp(features: &super::Features) -> u64 {
     super::storage_resinfo_mips_enabled().hash(&mut h);
     super::float_rules().hash(&mut h);
     super::log_series_enabled().hash(&mut h);
+    super::present_exec_enabled().hash(&mut h);
     super::mesh::wave_layout(32).hash(&mut h);
     super::vertex_wave_info_enabled().hash(&mut h);
     super::image::const_texel_offsets_enabled().hash(&mut h);

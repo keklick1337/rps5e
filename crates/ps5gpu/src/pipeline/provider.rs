@@ -1445,6 +1445,27 @@ pub fn gpu_indirect_threads_enabled() -> bool {
 }
 
 /// An indirect dispatch whose record counts threads.
+/// `RPS5E_NARROW_LAUNCH_BARRIER`: the record kernel of an indirect
+/// dispatch (thread dimensions, group clamp) is ordered before the dispatch
+/// by a compute-to-compute and indirect-read barrier (every earlier compute
+/// write made visible to them) instead of a full barrier: graphics work in
+/// flight keeps running. `0`: a full barrier.
+fn narrow_launch_barrier() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_NARROW_LAUNCH_BARRIER").is_ok_and(|v| v == "1")) && crate::backend::ab::release_fast("RPS5E_NARROW_LAUNCH_BARRIER")
+}
+
+/// The barrier after a record kernel (see [`narrow_launch_barrier`]): its
+/// command and shader-data writes reach the dispatch's indirect read and
+/// its shader reads.
+fn launch_barrier(ctx: &mut DrawContext, narrow: bool) {
+    if narrow {
+        ctx.sched.dispatch_barrier_record(crate::scheduler::hazard::DispatchBarrier::Compute { graphics: false, transfer: false });
+    } else {
+        ctx.sched.full_barrier();
+    }
+}
+
 fn indirect_thread_dimensions(d: &ResolvedDispatch) -> bool {
     d.packet.indirect_address != 0 && d.packet.dispatch_initiator & crate::render::DISPATCH_USE_THREAD_DIMENSIONS != 0
 }
@@ -3878,7 +3899,7 @@ impl ShaderPipelines {
                             self.stats.stream_trimmed += (copied < size) as u64;
                             if let Some(info) = self.stream_guest(ctx, addr, copied) {
                                 if trace::active() {
-                                    self.trace_notes.push(format!("    buffer {addr:#x}+{size:#x} streamed V# {words:08x?}{}", trace::guest_words(addr, size.min(0x60))));
+                                    self.trace_notes.push(format!("    buffer {addr:#x}+{size:#x} streamed V# {words:08x?}{}", trace::guest_words(addr, size)));
                                 }
                                 writes.buffer(info);
                                 continue;
@@ -3913,7 +3934,7 @@ impl ShaderPipelines {
                                     writes.overwritten.push((addr, size));
                                 }
                                 if trace::active() {
-                                    self.trace_notes.push(format!("    buffer {addr:#x}+{size:#x} V# {words:08x?}{}{}", if written { " written" } else { "" }, trace::guest_words(addr, size.min(0x60))));
+                                    self.trace_notes.push(format!("    buffer {addr:#x}+{size:#x} V# {words:08x?}{}{}", if written { " written" } else { "" }, trace::guest_words(addr, size)));
                                 }
                                 let aligned = slice.offset - slice.offset % align;
                                 let adjustment = slice.offset - aligned;
@@ -6796,9 +6817,10 @@ impl ShaderPipelines {
         let record = crate::tiler::TilerBuffer { buffer: record.buffer, offset: record.offset, size: indirect_threads::RECORD_BYTES };
         let command_slot = crate::tiler::TilerBuffer { buffer: command.buffer, offset: command.offset, size: indirect_threads::COMMAND_BYTES };
         let scratch_slot = crate::tiler::TilerBuffer { buffer: scratch.buffer, offset: scratch.offset, size: 16 };
-        let cb = ctx.sched.cmd();
+        let narrow = narrow_launch_barrier();
+        let cb = if narrow { ctx.sched.ordered_cmd() } else { ctx.sched.cmd() };
         kernel.record(cb, record, command_slot, scratch_slot, 0, &rules);
-        ctx.sched.full_barrier();
+        launch_barrier(ctx, narrow);
         self.stats.gpu_group_clamps += 1;
         Ok((command.buffer, command.offset))
     }
@@ -6817,9 +6839,10 @@ impl ShaderPipelines {
         let record = crate::tiler::TilerBuffer { buffer: record.buffer, offset: record.offset, size: indirect_threads::RECORD_BYTES };
         let command_slot = crate::tiler::TilerBuffer { buffer: command.buffer, offset: command.offset, size: indirect_threads::COMMAND_BYTES };
         let data_slot = crate::tiler::TilerBuffer { buffer: data.buffer, offset: data.offset, size: data.range };
-        let cb = ctx.sched.cmd();
+        let narrow = narrow_launch_barrier();
+        let cb = if narrow { ctx.sched.ordered_cmd() } else { ctx.sched.cmd() };
         kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
-        ctx.sched.full_barrier();
+        launch_barrier(ctx, narrow);
         self.stats.gpu_thread_dispatches += 1;
         if trace::active() {
             self.trace_notes.push(format!("    gpu-indirect threads {rules:?} limits at dword {}", cs.layout.dispatch_thread_limits_dword()));

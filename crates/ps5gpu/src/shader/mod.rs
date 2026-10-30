@@ -592,8 +592,19 @@ fn apply_emit_options(options: &mut TranslateOptions, emit: &EmitOptions) {
     options.rewrites = (if emit.lean_flush { LEAN_FLUSH } else { 0 })
         | (if emit.subgroup_ops { LANE_ACTIVE_EXEC } else { 0 })
         | (if emit.flush_elision { FLUSH_ELISION } else { 0 })
-        | (if emit.half_fma_fast { HALF_FMA_FAST } else { 0 });
+        | (if emit.half_fma_fast { HALF_FMA_FAST } else { 0 })
+        | (if present_exec_enabled() { translate::rewrites::PRESENT_EXEC } else { 0 });
     options.fast_transcendental = emit.fast_transcendental;
+}
+
+/// `RPS5E_PRESENT_EXEC=0`: s_cbranch_execz/execnz test every EXEC bit, also
+/// those of lanes the host does not run, as before
+/// (`ps5shader::translate::rewrites::PRESENT_EXEC`: on, they test the lanes
+/// present at entry, so a waterfall loop over a wave whose missing lanes
+/// were enabled ends). Part of the disk-cache key.
+pub fn present_exec_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_PRESENT_EXEC").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
 }
 
 /// `RPS5E_NGG_VERTEX_WAVE_INFO=1` (opt-in): merged (ES+GS) programs on

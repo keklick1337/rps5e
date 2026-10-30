@@ -178,6 +178,15 @@ pub fn pin(handle: u64) -> Option<Arc<Equeue>> {
 
 static QUEUES_GENERATION: super::Generation = super::Generation::new();
 
+/// Diagnostics: the queue's name and registrations as
+/// `(ident, filter, triggered, disabled, pending)`.
+pub fn describe(handle: u64) -> Option<String> {
+    let q = QUEUES.read().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&handle).cloned()?;
+    let s = lock_state(&q);
+    let ev: Vec<String> = s.events.iter().map(|e| format!("({:#x},{},{},{},{})", e.event.ident, e.event.filter, e.triggered, e.disabled, e.pending.len())).collect();
+    Some(format!("'{}' [{}]", q.name, ev.join(" ")))
+}
+
 thread_local! {
     static QUEUE_LOOKUPS: super::LocalLookups<Equeue> = const { super::LocalLookups::new() };
 }

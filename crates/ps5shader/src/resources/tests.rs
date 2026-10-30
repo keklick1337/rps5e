@@ -235,6 +235,20 @@ fn undefined_sampler_fails_the_plan() {
     assert!(err.message.contains("SamplerHandle dword 0"), "{err}");
 }
 
+/// A V# whose record count the program computes (here a lane value read
+/// with v_readfirstlane) binds the buffer unbounded: base and stride come
+/// from user data, the access checks its own record count.
+#[test]
+fn computed_buffer_record_counts_bind_unbounded() {
+    // v_readfirstlane_b32 s6, v0 ; buffer_load_dword v1, v2, s[4:7]
+    let program = || assemble(&[&[0x7E0C_0500], &buffer_load_dword(1, 2, 4), &[S_ENDPGM]]);
+    let p = plan(program(), ShaderStage::Compute, 8);
+    assert_eq!(p.info.buffers.len(), 1);
+    let source = &p.descriptor_sources[p.info.buffers[0].source as usize];
+    assert_eq!(p.graph.constant_u32(source.dwords[2]), Some(u32::MAX));
+    assert!(source.dwords.iter().enumerate().filter(|&(i, _)| i != 2).all(|(_, &d)| p.graph.kind(d) == ValueKind::UserData));
+}
+
 #[test]
 fn extended_user_data_reads_are_flattened() {
     // s_load_dwordx8 s[16:23], s[2:3], 0x20 ; s_load_dwordx4 s[24:27], s[2:3], 0x40
@@ -1124,4 +1138,53 @@ fn quad_masks_extend_the_shader_data() {
     assert_eq!(full.push_data_start_dword, push_data::NO_START);
     assert!(full.find(DescriptorBindingKind::ShaderData).is_some());
     assert_eq!(full.shader_data_dword_count(), 18);
+}
+
+/// A V# whose NUM_RECORDS the program loads from memory (s_load into
+/// word 2 of the V# in s[4:7]): while GPU work still writes that word and
+/// the host has room for the buffer, the word is left to the GPU (its
+/// table slot deferred) and the descriptor gets the records the room
+/// holds; without room, or while the word is not GPU-written, it is read.
+#[test]
+fn replay_defers_a_gpu_written_record_count() {
+    let p = plan(assemble(&[&smem(SMEM_LOAD_DWORD, 6, 2, 0x10), &buffer_load_dword(1, 2, 4), &[S_ENDPGM]]), ShaderStage::Compute, 8);
+    assert!(ReplayProgram::eligible(&p));
+    let program = ReplayProgram::compile(&p).unwrap();
+    let m = TestMemory::new();
+    let table = 0x2_0000_0000u64;
+    let count = table + 0x10;
+    m.set(count, 64);
+    let user = srt_user_data(table, v_sharp(0x5000, 16, 0));
+    let resident = |a: u64, out: &mut [u8], _clean: bool| m.resident(a, out);
+    let read = |a: u64| m.read(a);
+    let probe = |a: u64| m.gpu_owned.borrow().contains(&a);
+    let room = |base: u64, stride: u32, word: u64| (base == 0x5000 && stride == 16 && word == count).then_some(0x1000u64);
+    let no_room = |_: u64, _: u32, _: u64| None;
+    let mut scratch = ReplayScratch::default();
+    let run = |reader: &ReplayReader<'_>, room: Option<RecordsRoom<'_>>, scratch: &mut ReplayScratch| {
+        let mut out = ReplayResult::default();
+        program.run_into_with(&user, 0, reader, Some(&probe), room, scratch, &mut out).map(|_| out)
+    };
+    let words = |r: &ReplayResult| r.words[..program.descriptor_words].to_vec();
+    // Not GPU-written: read.
+    let r = run(&ReplayReader::Resident(&resident, true), Some(&room), &mut scratch).unwrap();
+    assert_eq!(words(&r)[2], 64);
+    assert!(r.deferred.is_empty());
+    // GPU-written, with room: deferred, 0x1000 / 16 records, no CPU read.
+    m.gpu_owned.borrow_mut().insert(count);
+    let before = m.word_reads.get();
+    let r = run(&ReplayReader::Resident(&resident, true), Some(&room), &mut scratch).unwrap();
+    assert_eq!(words(&r)[2], 0x100);
+    assert_eq!(words(&r)[0], 0x5000);
+    assert_eq!(r.deferred.len(), 1, "{:?}", r.deferred);
+    assert_eq!(r.deferred[0].1, count);
+    assert_eq!(m.word_reads.get(), before);
+    // GPU-written, no room: the resident run refuses, the word reader reads it.
+    assert_eq!(run(&ReplayReader::Resident(&resident, true), Some(&no_room), &mut scratch), Err(ReplayAbort::Unreadable));
+    let r = run(&ReplayReader::Words(&read, Some(&read)), Some(&no_room), &mut scratch).unwrap();
+    assert_eq!(words(&r)[2], 64);
+    // Without the host's room function nothing changes: read.
+    let r = run(&ReplayReader::Words(&read, Some(&read)), None, &mut scratch).unwrap();
+    assert_eq!(words(&r)[2], 64);
+    assert!(r.deferred.is_empty());
 }

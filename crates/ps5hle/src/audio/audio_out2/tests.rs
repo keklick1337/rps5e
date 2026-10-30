@@ -362,6 +362,44 @@ fn synchronous_device_push_bypasses_modelled_queue() {
     h.finish();
 }
 
+/// The render/output protocol of audio middleware: the output thread
+/// pushes each rendered grain (blocking) and then wakes the render thread,
+/// which renders as many grains as the queue reports available. A blocking
+/// push that returned with the queue full (no advanced grain waiting) left
+/// nothing to render and nothing to push: both threads waited forever.
+#[test]
+fn blocking_push_leaves_a_free_slot() {
+    let h = Harness::new();
+    let context = h.context(4, 0);
+    let port = h.port(context, &h.param(STEREO_FLOAT));
+    h.write(0x1000, vec![0u8; 512 * 2 * 4]);
+    let available = |h: &Harness| {
+        let (mut level, mut available) = (0, 0);
+        h.out2.context_get_queue_level(context, Some(&mut level), Some(&mut available));
+        available
+    };
+    // Tokens the output thread may push.
+    let mut tokens = available(&h) - 1;
+    for _ in 0..tokens {
+        h.out2.context_advance(context);
+    }
+    for round in 0..64 {
+        assert!(tokens > 0, "round {round}: nothing rendered, nothing to push");
+        h.set_pcm(port, 0x1000);
+        assert_eq!(h.out2.context_push(context, true), 0);
+        tokens -= 1;
+        // The output thread wakes the render thread: it renders what is
+        // available.
+        for _ in 0..available(&h) {
+            h.out2.context_advance(context);
+            tokens += 1;
+        }
+    }
+    h.out2.port_destroy(port);
+    h.out2.context_destroy(context);
+    h.finish();
+}
+
 #[test]
 fn float_12_channel_port_outputs_pcm() {
     let h = Harness::new();

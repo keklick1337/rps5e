@@ -101,8 +101,9 @@ pub fn direct_draw(d: &ResolvedDraw, record: &[u32; 5], draw_index: u32) -> Opti
         write(regs.instance_offset, first_instance);
         write(regs.first_index, first_index);
         let kind = IndexType::from_raw(d.packet.index_type);
-        // INDEX_BUFFER_SIZE bounds the indices one record may read.
-        let count = if d.packet.index_buffer_size != 0 { count.min(d.packet.index_buffer_size) } else { count };
+        // INDEX_BUFFER_SIZE counts indices from the index base: a record
+        // starting at `first_index` may read the ones left after it.
+        let count = if d.packet.index_buffer_size != 0 { count.min(d.packet.index_buffer_size.saturating_sub(first_index)) } else { count };
         packet.kind = DrawKind::Index;
         packet.count = count;
         packet.index_address = d.packet.index_base + first_index as u64 * kind.bytes();
@@ -118,7 +119,7 @@ pub fn direct_draw(d: &ResolvedDraw, record: &[u32; 5], draw_index: u32) -> Opti
     // GE_INDEX_OFFSET is not added to the vertex IDs of indirect draws.
     sub.index_offset = 0;
     sub.packet = packet;
-    (count != 0 && instances != 0).then_some(sub)
+    (sub.packet.count != 0 && instances != 0).then_some(sub)
 }
 
 /// The outcome of several draws recorded for one packet.
@@ -201,9 +202,17 @@ mod tests {
             ..DrawPacket::default()
         });
         d.index_offset = 3;
-        let s = direct_draw(&d, &[6, 2, 5, (-17i32) as u32, 3], 0).unwrap();
+        let s = direct_draw(&d, &[6, 2, 1, (-17i32) as u32, 3], 0).unwrap();
         assert_eq!(s.packet.kind, DrawKind::Index);
-        assert_eq!((s.packet.count, s.packet.instance_count), (4, 2), "index count clamped to INDEX_BUFFER_SIZE");
+        assert_eq!((s.packet.count, s.packet.instance_count), (3, 2), "indices after the first one, up to INDEX_BUFFER_SIZE");
+        assert_eq!(s.index.unwrap().address, 0x1000 + 4);
+        assert!(direct_draw(&d, &[6, 2, 5, 0, 0], 0).is_none(), "a first index past INDEX_BUFFER_SIZE reads nothing");
+        let s = direct_draw(&d, &[6, 2, 5, (-17i32) as u32, 3], 0);
+        assert!(s.is_none());
+        let mut d5 = d.clone();
+        d5.packet.index_buffer_size = 64;
+        let s = direct_draw(&d5, &[6, 2, 5, (-17i32) as u32, 3], 0).unwrap();
+        assert_eq!(s.packet.count, 6);
         assert_eq!(s.index.unwrap().address, 0x1000 + 5 * 4);
         assert_eq!(s.index_offset, 0);
         assert_eq!(&s.shaders.gs.user_data[9..12], &[(-17i32) as u32, 3, 5]);

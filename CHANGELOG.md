@@ -2,6 +2,38 @@
 
 All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Silent Hill 2 (Remake) no longer hangs the GPU after START GAME. A small compute write (a 4-byte counter in reused transient memory) at an address where a render target once kept its fast-clear metadata was taken for a metadata clear, which overwrote the counter and left a GPU loop running for billions of iterations; only writes that cover a whole metadata slice count as clears now (`RPS5E_WHOLE_METADATA_WRITES`).
+- Silent Hill 2 (Remake): the ray-tracing acceleration-structure build after START GAME no longer loops forever on the GPU. Compute shaders whose buffer record count comes from a value computed at run time (here an atomic counter read back with `v_readfirstlane`) were skipped, so the sort before the tree build never ran; they are translated now (`RPS5E_RUNTIME_BUFFER_RECORDS`). The game loads and reaches "PRESS ANY BUTTON TO PLAY".
+- Silent Hill 2 (Remake) no longer freezes on the loading screen after START GAME (about one run in six). `sceAudioOut2ContextPush` in blocking mode returned with the context queue still full, so `sceAudioOut2ContextGetQueueLevel` right after it reported no free grain; Wwise renders only the free grains and pushes only rendered ones, so its audio thread stopped, and the garbage collector waited forever for an audio bank to unload while holding the loading screen's lock. A blocking push now returns once the queue has room for the next grain.
+- Silent Hill 2 (Remake): the picture after START GAME is no longer black; the opening cutscene and the lookout are drawn. Unreal Engine 5 clears the compression keys of its render targets with a small compute kernel that loads the clear code from a constant buffer; the emulator runs that kernel as a plain memory fill and read the code as out of range (it counted the buffer's records as bytes instead of 16-byte units), so the separate-translucency target was cleared to transparent black instead of (0, 0, 0, 1) and the anti-aliasing pass multiplied the whole scene by 0.
+- Silent Hill 2 (Remake) no longer crashes in the audio heap a few minutes into play. The `sceAcm` convolution-reverb shared-input job read its output array with a guessed layout and cleared the memory those words pointed at, which corrupted the Wwise heap; the job now only advances its batch cursor, like the other ACM job builders.
+
+- Shader subroutine calls through a table of code addresses are found when the shader keeps the table's descriptor in vector register lanes between loading it and the call (Silent Hill 2 (Remake)), and calls through user data when the code address was copied before a branch. A callee that returns with `s_swappc_b64` into the null register is linked too, and every table call's dispatch code comes before all callee code. The Silent Hill 2 shader that needed this still does not compile: its tables link more callee code (about 30 000 words per table) than a 16-bit call reaches.
+- `sceVideoOutIsOutputSupported` answers 0 for the 119.88 Hz output mode when the output has no 120 Hz, as the console does, instead of an error.
+
+- Flips that a game reserves with `sceVideoOutSubmitEopFlip` and releases with `sceAgcCbReleaseMem` are performed; the release packet our `sceAgcCbReleaseMem` writes was not recognised, so the flip never happened.
+- `COPY_DATA` packets that read memory on the prefetch engine read memory instead of GDS, and can load registers; the prefetch engine's atomic result and the clocks can be copied too. A `RELEASE_MEM` to an unsupported destination still raises its interrupt.
+- GPU results are no longer lost when a game unmaps part of the memory a GPU buffer covers (`RPS5E_UNMAP_WHOLE_BUFFERS`), or maps the same memory again at the same address (`RPS5E_SAME_BACKING_REMAP`).
+- Stencil add and subtract operations use the operation value from `DB_STENCILREFMASK` (a value of 0 leaves the stencil unchanged) (`RPS5E_STENCIL_ADD_OPVAL`).
+- Primitive restart honours `MATCH_ALL_BITS`: a restart index wider than the index type never restarts.
+- Fast clears of 5_6_5, 1_5_5_5, 5_5_5_1 and 4_4_4_4 render targets are decoded.
+- Multisampled render targets and depth buffers take their real size in memory (`RPS5E_MSAA_BLOCKS`); they were taken as larger than they are and seen to overlap the memory after them.
+
+- `sceKernelMunmap` rounds the range to whole pages like `munmap`; an unaligned length left part of a page mapped and charged to the flexible memory budget.
+- A texture with a shorter mip chain than a cached image at the same address no longer samples that image's levels, which lie at other bytes (`RPS5E_ALIAS_SAME_MIPS`).
+- Indirect indexed draws stop at the end of the index buffer (`INDEX_BUFFER_SIZE` counted from the index base); records with a first index read indices past it.
+- Shader loops that wait for EXEC to empty end when the shader enabled lanes the host does not run (partial waves, wave64 programs on 32-lane GPUs) (`RPS5E_PRESENT_EXEC`).
+- XOR wave reductions in graphics shaders are computed over the lanes the host subgroup has.
+- Small render targets that the CPU reads back (a linear target, or a tiled one of at most 64x64 texels) are copied to guest memory after draws and clears, not only after shader stores (`RPS5E_READBACK_TARGETS`).
+
+### Changed
+
+- Faster image refreshes between views of one array surface that start at different layers (a texture or render target addressed at a layer of an array, as Unreal Engine 5 does with its 4-layer 8K atlases): the shared layers are copied image to image instead of going through the guest memory layout (`RPS5E_LAYER_COPY`): about a quarter more frames per second in Silent Hill 2's gameplay, measured A/B in one run.
+
 ## [0.1.2-alpha] - 2026-10-28
 
 ### Added

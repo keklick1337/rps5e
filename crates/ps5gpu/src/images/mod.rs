@@ -207,15 +207,29 @@ impl ImageKey {
 }
 
 /// Plane fields of a surface of `key` shape: pitch, layer/slab stride and
-/// guest bytes from the GFX10 layout (`samples` multiplies the bytes of
-/// multisampled surfaces, which are not laid out here).
+/// guest bytes from the GFX10 layout. Multisampled surfaces are not laid
+/// out here: a one-level tiled one spans its multisampled blocks
+/// ([`crate::tiling::thin_surface_bytes`]), others `samples` times the
+/// one-sample bytes.
 pub fn plane(key_shape: &ImageKey, addr: u64, bytes_per_element: u32, swizzle: u32, aspect: vk::ImageAspectFlags) -> Plane {
     let mut p = Plane { addr, bytes_per_element, swizzle, pitch: key_shape.width, slice_size: 0, bytes: 0, aspect };
+    let samples = key_shape.samples.max(1);
     match key_shape.layout(&p) {
         Some(l) => {
             p.pitch = l.mips[0].pitch;
-            p.slice_size = l.layer_bytes * key_shape.samples.max(1) as u64;
-            p.bytes = l.guest_bytes * key_shape.samples.max(1) as u64;
+            let msaa = (samples > 1 && key_shape.levels == 1 && swizzle != crate::tiling::SWIZZLE_LINEAR)
+                .then(|| crate::tiling::thin_surface_bytes(swizzle, bytes_per_element as usize, key_shape.width, key_shape.height, samples))
+                .flatten();
+            match msaa {
+                Some(bytes) => {
+                    p.slice_size = bytes as u64;
+                    p.bytes = bytes as u64 * key_shape.slices() as u64;
+                }
+                None => {
+                    p.slice_size = l.layer_bytes * samples as u64;
+                    p.bytes = l.guest_bytes * samples as u64;
+                }
+            }
         }
         None => {
             let bd = if aspect == vk::ImageAspectFlags::COLOR { block_dim(key_shape.format) } else { 1 };
@@ -1089,6 +1103,27 @@ impl WatchTable {
         index.get(&id).is_none_or(|&i| v[i].cpu_written && (v[i].whole || !(v[i].partial || v[i].sparse) || !v[i].dirty.any()))
     }
 
+    /// The CPU (or a buffer write) changed bytes of the image inside
+    /// `[b, e)` since its last load: stale as a whole, or a written page
+    /// over the range.
+    fn written_within(&self, id: u64, b: u64, e: u64) -> bool {
+        self.with_index(|v, index| {
+            let Some(&i) = index.get(&id) else { return true };
+            let w = &v[i];
+            if !w.cpu_written {
+                return false;
+            }
+            if w.whole || !(w.partial || w.sparse) || !w.dirty.any() {
+                return true;
+            }
+            let (pb, _) = w.pages();
+            w.dirty.runs(w.page_count(), true).into_iter().any(|(f, t)| {
+                let (rb, re) = ((pb + f * PAGE_BYTES).max(w.begin), (pb + t * PAGE_BYTES).min(w.end));
+                rb < e && b < re
+            })
+        })
+    }
+
     /// `f` given [`Self::stale_whole`] of any image, all asked under one
     /// lock (`f` must not use the table otherwise).
     fn with_stale_whole<R>(&self, f: impl FnOnce(&dyn Fn(u64) -> bool) -> R) -> R {
@@ -1425,6 +1460,12 @@ pub struct ImageStats {
     pub upload_reasons: [u64; 5],
     /// Refreshes skipped because the caller overwrites the whole image.
     pub discards: u64,
+    /// Written page runs of newer aliases laid over their bytes during a
+    /// refill (instead of preparing those aliases first).
+    pub alias_overlays: u64,
+    /// Sampled DCC keys decided from the value of the GPU fill that wrote
+    /// them (no download).
+    pub known_fill_keys: u64,
     /// Images of fewer layers of an array surface merged into a new image
     /// of more layers.
     pub absorbed: u64,
@@ -1569,6 +1610,14 @@ pub struct ImageCache {
     /// `RPS5E_GPU_PROFILE`: refreshes from newer aliases per (image, newest
     /// source) — `(addr, format, w, h, layers)` each.
     retile_counts: HashMap<((u64, i32, u32, u32, u32), (u64, i32, u32, u32, u32), usize), u64>,
+    /// `RPS5E_GPU_PROFILE`: refreshes and uploads per caller of
+    /// [`Self::prepare`] (`cascade`: a newer alias prepared on the way):
+    /// count and guest bytes.
+    refill_callers: HashMap<(&'static std::panic::Location<'static>, &'static str), (u64, u64)>,
+    /// The caller of the [`Self::prepare`] running now (profile only).
+    prepare_caller: Option<&'static std::panic::Location<'static>>,
+    /// A newer alias is being prepared for the image the caller asked for.
+    prepare_cascade: bool,
     /// `RPS5E_GPU_PROFILE`: stale prepares per (address, reason).
     stale_reasons: HashMap<(u64, &'static str), u64>,
     /// `RPS5E_GPU_PROFILE`: invalidations per GPU-written range.
@@ -1854,9 +1903,71 @@ fn samples_flag(n: u32) -> vk::SampleCountFlags {
 /// `[b, e)` lies inside `[ob, oe)`.
 /// `RPS5E_ALIAS_MERGE=0`: a GPU-modified image the CPU wrote any page of
 /// is no source for refilling its aliases (they keep older contents).
+/// Whether the first `levels` mip levels of `key` lie at the same guest
+/// bytes in `other` (same address and element layout). GFX10 stores a
+/// layer's levels from the smallest to the largest, so a surface with a
+/// shorter mip chain at the same address has its level 0 (and every layer
+/// after the first) somewhere else: an image of the longer chain does not
+/// hold its texels.
+///
+/// `RPS5E_ALIAS_SAME_MIPS=0`: any image with enough levels is taken.
+fn same_level_placement(other: &ImageKey, key: &ImageKey, levels: u32) -> bool {
+    if other.levels == key.levels || !alias_same_mips_enabled() {
+        return true;
+    }
+    if key.layers > 1 && other.main.slice_size != key.main.slice_size {
+        return false;
+    }
+    match (other.layout(&other.main), key.layout(&key.main)) {
+        (Some(a), Some(b)) => (0..levels.min(key.levels) as usize).all(|l| match (a.mips.get(l), b.mips.get(l)) {
+            (Some(x), Some(y)) => x.offset == y.offset && x.pitch == y.pitch,
+            _ => false,
+        }),
+        // Not described (no tiled layout): only the level count decides.
+        _ => false,
+    }
+}
+
+/// Largest linear colour target (texels) enrolled for CPU read-back.
+const TARGET_READ_BACK_LINEAR_TEXELS: u64 = 256 * 256;
+/// Largest edge of a tiled colour target enrolled for CPU read-back.
+const TARGET_READ_BACK_TILED_EDGE: u32 = 64;
+
+fn readback_targets_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // A correctness rule: RPS5E_SAFE does not turn it off.
+    *ON.get_or_init(|| crate::backend::ab::switch_value(false, std::env::var("RPS5E_READBACK_TARGETS").ok().as_deref()))
+}
+
+fn alias_same_mips_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // A correctness rule: RPS5E_SAFE does not turn it off.
+    *ON.get_or_init(|| crate::backend::ab::switch_value(false, std::env::var("RPS5E_ALIAS_SAME_MIPS").ok().as_deref()))
+}
+
 fn alias_merge_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_ALIAS_MERGE"))
+}
+
+/// `RPS5E_ALIAS_PAGE_OVERLAY=0`: before an image is refilled from a newer
+/// alias with written pages over it, that alias is prepared (merged or
+/// refilled from its own newer aliases, all of it). On (the default), the
+/// refill lays the written pages over the alias's bytes in its window
+/// instead. A/B in one run with `RPS5E_AB_SCOPE=release
+/// RPS5E_AB_ONLY=alias-page-overlay`.
+fn alias_page_overlay_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_ALIAS_PAGE_OVERLAY")) && crate::backend::ab::release_fast("alias-page-overlay")
+}
+
+/// `RPS5E_NARROW_ALIAS_PREPARE=0`: preparing an image first prepares every
+/// newer alias with any CPU-written page, also when the image is
+/// discarded or the written pages lie outside it. On by default; A/B in
+/// one run with `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=narrow-alias-prepare`.
+fn narrow_alias_prepare_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_NARROW_ALIAS_PREPARE")) && crate::backend::ab::release_fast("narrow-alias-prepare")
 }
 
 /// `RPS5E_LOAD_RACE_CHECK=0`: a load clears the image's CPU-written marks
@@ -1951,8 +2062,62 @@ fn copy_compatible(maintenance8: bool, (sf, sa): (vk::Format, vk::ImageAspectFla
     }
 }
 
+/// Profile key of an image in the retile counts: address, format,
+/// extent, and slices | levels << 16 | colour transform << 30.
+fn retile_key(k: &ImageKey) -> (u64, i32, u32, u32, u32) {
+    (k.main.addr, k.format.as_raw(), k.width, k.height, k.layers.max(k.depth) & 0xFFFF | (k.levels & 0x3FFF) << 16 | ((k.transform != ColorTransform::None) as u32) << 30)
+}
+
 fn inside(b: u64, e: u64, ob: u64, oe: u64) -> bool {
     b >= ob && e <= oe
+}
+
+/// `x` and `y` are views of one thin array surface starting at different
+/// layers (a T# or render target addressed at layer `k` of an array
+/// lies at the array's address plus `k` layer strides): the same format,
+/// extent, levels, samples, element layout and layer stride, no stencil,
+/// and addresses a whole number of layers apart. Layer `i` of `y` is
+/// layer `i + shift` of `x`; returns `shift` when at least one layer is
+/// shared.
+fn layer_shift(x: &ImageKey, y: &ImageKey) -> Option<i64> {
+    let (a, b) = (&x.main, &y.main);
+    let same = x.dim != ImageDim::D3
+        && x.dim == y.dim
+        && x.format == y.format
+        && x.transform == y.transform
+        && x.width == y.width
+        && x.height == y.height
+        && x.depth == y.depth
+        && x.levels == y.levels
+        && x.samples == y.samples
+        && x.stencil.is_none()
+        && y.stencil.is_none()
+        && a.bytes_per_element == b.bytes_per_element
+        && a.swizzle == b.swizzle
+        && a.pitch == b.pitch
+        && a.aspect == b.aspect
+        && a.slice_size == b.slice_size
+        && a.slice_size != 0;
+    if !same {
+        return None;
+    }
+    let diff = b.addr as i128 - a.addr as i128;
+    if diff % a.slice_size as i128 != 0 {
+        return None;
+    }
+    let shift = (diff / a.slice_size as i128) as i64;
+    // Shared layers: i in [0, y.layers) with i + shift in [0, x.layers).
+    let lo = 0i64.max(-shift);
+    let hi = (y.layers as i64).min(x.layers as i64 - shift);
+    (lo < hi).then_some(shift)
+}
+
+/// `RPS5E_LAYER_COPY=0`: an image refreshed from a newer image of the
+/// same array surface starting at another layer goes through the guest
+/// layout (tile out, tile in) instead of one layer copy.
+fn layer_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LAYER_COPY")) && crate::backend::ab::release_fast("RPS5E_LAYER_COPY")
 }
 
 impl ImageCache {
@@ -1961,6 +2126,9 @@ impl ImageCache {
         Ok(ImageCache {
             upload_counts: HashMap::default(),
             retile_counts: HashMap::default(),
+            refill_callers: HashMap::default(),
+            prepare_caller: None,
+            prepare_cascade: false,
             invalidate_counts: HashMap::default(),
             stale_reasons: HashMap::default(),
             dev: dev.clone(),
@@ -2358,6 +2526,7 @@ impl ImageCache {
                     && i.key.main.swizzle == key.main.swizzle
                     && block_dim(i.key.format) == block_dim(key.format)
                     && i.key.transform == key.transform
+                    && same_level_placement(&i.key, key, levels_needed.max(1))
             })
             .chain(exact)
             .peekable();
@@ -2718,8 +2887,35 @@ impl ImageCache {
     pub fn retile_top(&self, n: usize) -> String {
         let mut v: Vec<_> = self.retile_counts.iter().map(|(k, c)| (*c, *k)).collect();
         v.sort_unstable_by(|a, b| b.cmp(a));
-        let f = |k: &(u64, i32, u32, u32, u32)| format!("{:#x}:{:?}:{}x{}x{}", k.0, vk::Format::from_raw(k.1), k.2, k.3, k.4);
+        let f = |k: &(u64, i32, u32, u32, u32)| format!("{:#x}:{:?}:{}x{}x{}{}{}", k.0, vk::Format::from_raw(k.1), k.2, k.3, k.4 & 0xFFFF, if k.4 >> 16 & 0x3FFF > 1 { format!("m{}", k.4 >> 16 & 0x3FFF) } else { String::new() }, if k.4 >> 30 != 0 { "t" } else { "" });
         v.iter().take(n).map(|(c, (y, x, others))| format!("{}<-{}(+{others})={c}", f(y), f(x))).collect::<Vec<_>>().join(" ")
+    }
+
+    /// `RPS5E_GPU_PROFILE`: refreshes from aliases and uploads per caller
+    /// of `prepare` (`file:line kind=count/MiB`).
+    pub fn refill_callers_top(&self, n: usize) -> String {
+        let mut v: Vec<_> = self.refill_callers.iter().map(|(k, c)| (c.1, c.0, *k)).collect();
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        v.iter()
+            .take(n)
+            .map(|(bytes, count, (loc, kind))| format!("{}:{} {kind}={count}/{}MiB", loc.file().rsplit('/').next().unwrap_or(""), loc.line(), bytes >> 20))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn note_refill(&mut self, kind: &'static str, bytes: u64) {
+        if let Some(loc) = self.prepare_caller {
+            let kind = match (self.prepare_cascade, kind) {
+                (false, k) => k,
+                (true, "retile") => "alias-retile",
+                (true, "upload") => "alias-upload",
+                (true, "merge") => "alias-merge",
+                (true, _) => "alias-other",
+            };
+            let e = self.refill_callers.entry((loc, kind)).or_default();
+            e.0 += 1;
+            e.1 += bytes;
+        }
     }
 
     /// `RPS5E_GPU_PROFILE`: the most uploaded images.
@@ -2870,10 +3066,15 @@ impl ImageCache {
     /// contents of overlapping images) and mark it used by the current
     /// tick. With `discard` the caller will overwrite the whole image, so
     /// nothing is loaded.
+    #[track_caller]
     pub fn prepare(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, discard: bool) -> bool {
+        if crate::backend::profile::on() {
+            self.prepare_caller = Some(std::panic::Location::caller());
+        }
         let t = sched.time_item_begin(crate::scheduler::gpu_timer::label::IMG_PREPARE);
         let r = self.prepare_timed(sched, buffers, id, discard);
         sched.time_item_end(t);
+        self.prepare_caller = None;
         r
     }
 
@@ -2883,6 +3084,9 @@ impl ImageCache {
 
     fn prepare_inner(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, discard: bool) -> bool {
         let tick = sched.current_tick();
+        // Newer aliases whose written pages over the image the refill lays
+        // over their bytes instead of preparing them first: (alias, runs).
+        let mut overlay: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
         // The common use: an initialised image without aliases that
         // revalidation leaves alone (no edge hash, or GPU-written). Its
         // write count and upload state are then read under one lock (the
@@ -2902,16 +3106,59 @@ impl ImageCache {
                 self.table.untouch(id);
             }
             let mut newer = self.newer_aliases(id);
-            if newer.iter().any(|&x| self.table.state(x).1) {
+            // Which newer aliases must take their CPU-written pages first.
+            // A discarded image takes nothing from them; otherwise only the
+            // bytes over this image are read from them (`refresh_from_aliases`
+            // tiles out just that window), so pages written elsewhere in a
+            // larger alias do not matter here (`RPS5E_NARROW_ALIAS_PREPARE`).
+            let narrow = narrow_alias_prepare_enabled();
+            let range = self.images.get(&id).map(|y| {
+                let (b, e) = y.main_range();
+                match &y.key.stencil {
+                    Some(p) => (b.min(p.addr), e.max(p.addr + p.size())),
+                    None => (b, e),
+                }
+            });
+            let must_prepare = |table: &WatchTable, x: u64| match (narrow, range) {
+                (true, _) if discard => false,
+                (true, Some((b, e))) => table.written_within(x, b, e),
+                _ => table.state(x).1,
+            };
+            // With `RPS5E_ALIAS_PAGE_OVERLAY` a newer alias whose written
+            // pages can be laid over its bytes in the refill is left as it
+            // is: the refill takes those pages from memory right after the
+            // alias's bytes (`refresh_from_aliases`), the same bytes a
+            // refresh of the whole alias would hand over in this window.
+            //
+            // A depth/stencil image is refilled through guest memory (the
+            // GPU path does not take stencil planes): a newer alias with
+            // some pages written keeps the CPU's claim on its memory after
+            // any refill, so it is never written back there and preparing
+            // it first changes nothing the image reads. Left alone too.
+            let overlay_on = alias_page_overlay_enabled();
+            let overlay_ok = !discard && overlay_on && self.images.get(&id).is_some_and(|y| y.key.samples == 1 && y.key.stencil.is_none());
+            let through_memory = !discard && overlay_on && self.images.get(&id).is_some_and(|y| y.key.stencil.is_some());
+            if newer.iter().any(|&x| must_prepare(&self.table, x)) {
                 // A newer alias with CPU-written pages takes them first (a
                 // merge raises its sequence; a full reload leaves it no longer
                 // newer), so the refill reads the bytes memory holds now.
                 for x in newer.clone() {
-                    if self.table.state(x).1 {
+                    if must_prepare(&self.table, x) {
+                        if let Some(runs) = overlay_ok.then(|| range.and_then(|(b, e)| self.overlay_runs(x, b, e))).flatten() {
+                            overlay.push((x, runs));
+                            continue;
+                        }
+                        if through_memory && self.table.dirty_runs(x).is_some() {
+                            self.stats.alias_overlays += 1;
+                            continue;
+                        }
+                        let outer = std::mem::replace(&mut self.prepare_cascade, true);
                         self.prepare_inner(sched, buffers, x, false);
+                        self.prepare_cascade = outer;
                     }
                 }
                 newer = self.newer_aliases(id);
+                overlay.retain(|(x, _)| newer.contains(x));
             }
             (since, newer, self.needs_upload(id))
         };
@@ -2941,6 +3188,10 @@ impl ImageCache {
         if stale && !discard {
             let modified = self.images.get(&id).is_some_and(|i| i.initialized && i.gpu_modified);
             if newer.is_empty() {
+                if self.prepare_caller.is_some() {
+                    let bytes = self.images.get(&id).map_or(0, |i| i.key.size());
+                    self.note_refill("merge", bytes);
+                }
                 if let Some(ok) = self.merge_cpu_pages(sched, buffers, id, false) {
                     if let Some(i) = self.images.get_mut(&id) {
                         i.last_use = tick;
@@ -3019,10 +3270,27 @@ impl ImageCache {
             };
             self.stats.upload_reasons[reason] += 1;
         }
+        if self.prepare_caller.is_some() {
+            let bytes = self.images.get(&id).map_or(0, |i| i.key.size());
+            self.note_refill(if discard { "discard" } else if !newer.is_empty() { "retile" } else { "upload" }, bytes);
+        }
         let ok = if discard {
             true
         } else if !newer.is_empty() {
-            match self.refresh_from_aliases(sched, buffers, id, &newer, stale) {
+            let mut refreshed = self.refresh_from_aliases(sched, buffers, id, &newer, stale, &overlay);
+            let mut newer = newer;
+            if refreshed.is_none() && !overlay.is_empty() {
+                // The refill could not lay the pages over: the aliases take
+                // them first, as without the overlay.
+                for (x, _) in std::mem::take(&mut overlay) {
+                    let outer = std::mem::replace(&mut self.prepare_cascade, true);
+                    self.prepare_inner(sched, buffers, x, false);
+                    self.prepare_cascade = outer;
+                }
+                newer = self.newer_aliases(id);
+                refreshed = if newer.is_empty() { None } else { self.refresh_from_aliases(sched, buffers, id, &newer, stale, &[]) };
+            }
+            match refreshed {
                 Some(ok) => {
                     if keep_touched {
                         self.table.touch(id);
@@ -3200,6 +3468,20 @@ impl ImageCache {
         Some(ok)
     }
 
+    /// The byte runs of the pages written into newer alias `x` since its
+    /// load that lie over `[b, e)`, when the refill can lay them over the
+    /// alias's bytes (`RPS5E_ALIAS_PAGE_OVERLAY`): a single-sampled colour
+    /// alias with some pages written (not stale as a whole). None: the
+    /// alias is prepared first.
+    fn overlay_runs(&self, x: u64, b: u64, e: u64) -> Option<Vec<(u64, u64)>> {
+        let k = &self.images.get(&x)?.key;
+        if k.samples != 1 || k.stencil.is_some() || k.is_depth() {
+            return None;
+        }
+        let runs: Vec<(u64, u64)> = self.table.dirty_runs(x)?.into_iter().map(|(rb, re)| (rb.max(b), re.min(e))).filter(|(rb, re)| rb < re).collect();
+        (!runs.is_empty()).then_some(runs)
+    }
+
     /// Refill `id` from the newer GPU contents of overlapping images
     /// (`newer`, oldest first) without a trip through guest memory: an image
     /// copy when the newest one is the same surface in another format,
@@ -3207,25 +3489,43 @@ impl ImageCache {
     /// guest layout (over the image's own current bytes, or guest memory
     /// when those are stale) and the image is detiled from it. None when
     /// the shapes need the guest-memory path.
-    fn refresh_from_aliases(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, newer: &[u64], stale: bool) -> Option<bool> {
-        let t = sched.time_item_begin(crate::scheduler::gpu_timer::label::IMG_RETILE);
-        let r = self.refresh_from_aliases_timed(sched, buffers, id, newer, stale);
+    ///
+    /// `overlay`: newer images with pages written into them since their
+    /// load, as (image, byte runs over this image): those runs are copied
+    /// from memory over the image's bytes right after it is tiled out, so
+    /// the scratch buffer holds what the image would hand over after taking
+    /// its pages (newer images still go over them).
+    fn refresh_from_aliases(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, newer: &[u64], stale: bool, overlay: &[(u64, Vec<(u64, u64)>)]) -> Option<bool> {
+        // With the profile's detail each target image is its own label.
+        let label = match self.images.get(&id) {
+            Some(i) if crate::backend::profile::detailed() => crate::scheduler::gpu_timer::retile_label(i.key.main.addr),
+            _ => crate::scheduler::gpu_timer::label::IMG_RETILE,
+        };
+        let t = sched.time_item_begin(label);
+        let r = self.refresh_from_aliases_timed(sched, buffers, id, newer, stale, overlay);
         sched.time_item_end(t);
         r
     }
 
-    fn refresh_from_aliases_timed(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, newer: &[u64], stale: bool) -> Option<bool> {
+    fn refresh_from_aliases_timed(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, id: u64, newer: &[u64], stale: bool, overlay: &[(u64, Vec<(u64, u64)>)]) -> Option<bool> {
         let ykey = self.images.get(&id)?.key;
         let &last = newer.last()?;
         let xkey = self.images.get(&last)?.key;
-        if xkey.same_geometry(&ykey) && xkey.stencil.is_none() && ykey.stencil.is_none() && xkey.samples == 1 && self.convert(sched, last, id) {
-            return Some(true);
-        }
-        if blit::can_reinterpret(&xkey, &ykey) && self.reinterpret_as_multisampled_depth(sched, last, id) {
-            return Some(true);
-        }
-        if direct_copy_enabled() && block_view_of(&xkey, &ykey) && self.copy_block_view(sched, last, id) {
-            return Some(true);
+        // The direct paths copy one image's contents: only without pages to
+        // lay over.
+        if overlay.is_empty() {
+            if layer_copy_enabled() && self.copy_layers(sched, id, newer, stale) {
+                return Some(true);
+            }
+            if xkey.same_geometry(&ykey) && xkey.stencil.is_none() && ykey.stencil.is_none() && xkey.samples == 1 && self.convert(sched, last, id) {
+                return Some(true);
+            }
+            if blit::can_reinterpret(&xkey, &ykey) && self.reinterpret_as_multisampled_depth(sched, last, id) {
+                return Some(true);
+            }
+            if direct_copy_enabled() && block_view_of(&xkey, &ykey) && self.copy_block_view(sched, last, id) {
+                return Some(true);
+            }
         }
         if ykey.samples > 1 || ykey.stencil.is_some() {
             return None;
@@ -3283,6 +3583,23 @@ impl ImageCache {
             seq = seq.max(xi.seq);
             // Only the source's bytes over this image are needed.
             ok &= self.tile_out_window(sched, k, *x, levels, l, yb, ye, tiled, k.main.addr - base);
+            // The pages written into it since its load go over them.
+            for &(b, e) in overlay.iter().filter(|(o, _)| o == x).flat_map(|(_, runs)| runs.iter()) {
+                let (b, e) = (b.max(yb), e.min(ye));
+                if b >= e {
+                    continue;
+                }
+                let Some((src, off)) = self.upload_source(sched, buffers, b, e - b) else {
+                    ok = false;
+                    continue;
+                };
+                before_buffer_work(sched);
+                let region = vk::BufferCopy { src_offset: off, dst_offset: b - base, size: e - b };
+                // SAFETY: recording buffer; both buffers alive for the tick.
+                unsafe { self.dev.device.cmd_copy_buffer(sched.ordered_cmd(), src, tiled, &[region]) };
+                after_buffer_writes(sched);
+                self.stats.alias_overlays += 1;
+            }
         }
         let levels = self.images[&id].image.mip_levels;
         if partial {
@@ -3301,10 +3618,69 @@ impl ImageCache {
         self.stats.retiles += 1;
         crate::slice_shadow::hole(crate::slice_shadow::Hole::ImageRetile);
         if crate::backend::profile::on() {
-            let k = |k: &ImageKey| (k.main.addr, k.format.as_raw(), k.width, k.height, k.layers.max(k.depth));
+            let k = retile_key;
             *self.retile_counts.entry((k(&ykey), k(&xkey), newer.len() - 1)).or_default() += 1;
         }
         Some(ok)
+    }
+
+    /// Refill `id` from newer images that are views of the same array
+    /// surface starting at other layers ([`layer_shift`]): each source's
+    /// shared layers go over in content order with image copies, instead
+    /// of tiling the sources out and `id` in through the guest layout.
+    /// The layers no source shares keep `id`'s own contents, so they must
+    /// be current (not stale, initialized). False leaves `id` untouched.
+    fn copy_layers(&mut self, sched: &mut Scheduler, id: u64, newer: &[u64], stale: bool) -> bool {
+        let Some(y) = self.images.get(&id) else { return false };
+        let (ykey, yinit) = (y.key, y.initialized);
+        let mut plan = Vec::with_capacity(newer.len());
+        let mut covered = vec![false; ykey.layers as usize];
+        for &x in newer {
+            let Some(xi) = self.images.get(&x) else { return false };
+            let Some(shift) = layer_shift(&xi.key, &ykey) else { return false };
+            if xi.image.mip_levels != y.image.mip_levels {
+                return false;
+            }
+            let lo = 0i64.max(-shift) as u32;
+            let hi = (ykey.layers as i64).min(xi.key.layers as i64 - shift) as u32;
+            covered[lo as usize..hi as usize].iter_mut().for_each(|c| *c = true);
+            plan.push((x, xi.image.image, xi.seq, lo, hi, shift));
+        }
+        if covered.iter().any(|c| !c) && (stale || !yinit) {
+            return false;
+        }
+        let (di, levels, aspect) = (y.image.image, y.image.mip_levels, ykey.main.aspect);
+        let mut seq = 0;
+        for &(x, si, xseq, lo, hi, shift) in &plan {
+            seq = seq.max(xseq);
+            let copies: Vec<vk::ImageCopy> = (0..levels)
+                .map(|level| {
+                    let sub = |base| vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: level, base_array_layer: base, layer_count: hi - lo };
+                    vk::ImageCopy::default().src_subresource(sub((lo as i64 + shift) as u32)).dst_subresource(sub(lo)).extent(ykey.level_extent(level))
+                })
+                .collect();
+            self.transit_pair(sched, (x, None), (id, None));
+            // SAFETY: recording buffer; source in TRANSFER_SRC, destination in TRANSFER_DST layout; one format, extent and sample count.
+            unsafe { self.dev.device.cmd_copy_image(sched.ordered_cmd(), si, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, di, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copies) };
+        }
+        let tracked = self.memory.is_watchable(ykey.main.addr, ykey.size());
+        self.table.set_partial(id, true);
+        self.table.rearm(id, tracked);
+        if let Some(i) = self.images.get_mut(&id) {
+            i.initialized = true;
+            i.gpu_modified = true;
+            i.seq = seq;
+        }
+        self.stats.retiles += 1;
+        self.stats.direct_copies += 1;
+        crate::slice_shadow::hole(crate::slice_shadow::Hole::ImageRetile);
+        if crate::backend::profile::on() {
+            let k = retile_key;
+            let xkey = self.images[&plan[plan.len() - 1].0].key;
+            // Marked +1000 in the profile: refilled by layer copies.
+            *self.retile_counts.entry((k(&ykey), k(&xkey), 1000 + plan.len() - 1)).or_default() += 1;
+        }
+        true
     }
 
     /// Refill block-compressed image `id` from the newer image `src` that
@@ -3337,7 +3713,7 @@ impl ImageCache {
         self.stats.retiles += 1;
         self.stats.direct_copies += 1;
         if crate::backend::profile::on() {
-            let k = |k: &ImageKey| (k.main.addr, k.format.as_raw(), k.width, k.height, k.layers.max(k.depth));
+            let k = retile_key;
             *self.retile_counts.entry((k(&ykey), k(&xkey), 0)).or_default() += 1;
         }
         true
@@ -4677,9 +5053,13 @@ impl ImageCache {
         i.initialized = true;
         i.last_use = tick;
         i.seq = self.seq;
-        if i.aliases.is_empty() {
+        let key = i.key;
+        let has_aliases = !i.aliases.is_empty();
+        self.enrol_target_read_back(id, &key);
+        if !has_aliases {
             return;
         }
+        let i = &self.images[&id];
         let (b, e) = i.main_range();
         let i = &self.images[&id];
         for a in &i.aliases {
@@ -4786,10 +5166,39 @@ impl ImageCache {
         ok
     }
 
+    /// Small colour images any GPU work wrote (draws, clears, copies,
+    /// resolves) reach guest memory for the CPU like storage images do:
+    /// titles keep data the CPU reads in render targets (a 128x128 linear
+    /// target of vehicle damage, a 1x1 tiled target the CPU reads back).
+    /// Linear ones follow the linear storage-image policy
+    /// ([`LinearReadback`]); tiled ones of at most 64x64 texels, one level
+    /// and one layer are written back when the CPU touches their pages.
+    /// Larger targets (display buffers, G-buffers) are not enrolled.
+    /// `RPS5E_READBACK_TARGETS=0`: only storage writes enrol.
+    fn enrol_target_read_back(&mut self, id: u64, key: &ImageKey) {
+        if !readback_targets_enabled() || key.samples != 1 || key.stencil.is_some() || key.main.aspect != vk::ImageAspectFlags::COLOR || key.levels != 1 || key.slices() != 1 {
+            return;
+        }
+        let texels = key.width as u64 * key.height as u64;
+        if key.main.swizzle == crate::tiling::SWIZZLE_LINEAR {
+            if texels <= TARGET_READ_BACK_LINEAR_TEXELS {
+                self.note_storage_write_inner(id);
+            }
+        } else if key.width <= TARGET_READ_BACK_TILED_EDGE && key.height <= TARGET_READ_BACK_TILED_EDGE && self.readback_linear != LinearReadback::Off {
+            for p in key.planes() {
+                self.table.watch_reads(id, p.addr, p.addr + p.size());
+            }
+        }
+    }
+
     /// A shader stored to image `id` (after [`Self::mark_gpu_written`]): a
     /// linear one reaches guest memory when the CPU touches it.
     pub fn note_storage_write(&mut self, id: u64) {
         crate::slice_shadow::hole(crate::slice_shadow::Hole::StorageImage);
+        self.note_storage_write_inner(id);
+    }
+
+    fn note_storage_write_inner(&mut self, id: u64) {
         let Some(i) = self.images.get(&id) else { return };
         if i.key.main.swizzle != crate::tiling::SWIZZLE_LINEAR || i.key.samples != 1 {
             return;

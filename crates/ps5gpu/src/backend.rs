@@ -397,6 +397,14 @@ fn eager_through_enabled() -> bool {
     ab::new_fast() && *ON.get_or_init(|| !ab::safe() && !std::env::var("RPS5E_EAGER_THROUGH").is_ok_and(|v| v == "0"))
 }
 
+/// `RPS5E_WHOLE_METADATA_WRITES=0`: a compute write of any size at a colour
+/// target's fast-clear metadata address is decided as a clear right away
+/// (default: only writes covering a whole metadata slice).
+fn whole_metadata_writes_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ab::switch_value(false, std::env::var("RPS5E_WHOLE_METADATA_WRITES").ok().as_deref()))
+}
+
 /// `RPS5E_EAGER_HOT_THROUGH=0`: write-throughs of ranges a CPU access
 /// waited for before no longer follow their writing dispatch at once
 /// (they wait for the next submit, like every other write-through).
@@ -781,7 +789,7 @@ mod slice_tests {
     #[test]
     fn dispatch_journal_entries_read_as_before() {
         let packet = crate::render::DispatchPacket { groups: [4, 1, 1], dispatch_initiator: 1, ..Default::default() };
-        let note = crate::scheduler::Note::Dispatch { n: 7, cs: 0x1234, packet, threads: [64, 1, 1] };
+        let note = crate::scheduler::Note::Dispatch { n: 7, cs: 0x1234, packet, threads: [64, 1, 1], user: [0; 16] };
         assert_eq!(note.to_string(), format!("dispatch #7 of cs={:#x} packet={:?} threads={:?}", 0x1234, packet, [64u32, 1, 1]));
     }
 }
@@ -2035,6 +2043,96 @@ impl Backend {
         Some(Some((base, bytes, pattern)))
     }
 
+    /// The SDK constant-fill kernel ([`crate::fill_kernels::detect_constant_fill`]):
+    /// one constant dword per thread through the V# in user data, as the
+    /// SDK clears metadata. `Some(None)` when it stores nothing,
+    /// `Some(Some((base, bytes, value)))` for the fill. Run as a buffer fill,
+    /// a clear code in DCC keys then clears the surface on the CPU's
+    /// decision (no GPU-decided clear, no refill of the surface before it).
+    /// `RPS5E_CONSTANT_FILL_HLE=0` (or `RPS5E_FILL_HLE=0`) runs it as a
+    /// dispatch.
+    fn constant_fill_kernel(&self, d: &ResolvedDispatch) -> Option<Option<(u64, u64, u32)>> {
+        use crate::fill_kernels::{detect_constant_fill, ComputeShape};
+        static OFF: OnceLock<bool> = OnceLock::new();
+        let off = *OFF.get_or_init(|| {
+            let zero = |name: &str| std::env::var(name).is_ok_and(|v| v == "0");
+            zero("RPS5E_CONSTANT_FILL_HLE") || zero("RPS5E_FILL_HLE")
+        });
+        let why = |r: &str| {
+            if crate::backend::profile::on() {
+                crate::log_once(&format!("ps5gpu: cs={:#x} is no constant fill: {r}", d.shader.address));
+            }
+        };
+        if off || d.packet.indirect_address != 0 || d.start != [0, 0, 0] || d.packet.groups[1] != 1 || d.packet.groups[2] != 1 {
+            why(&format!("dispatch shape start {:?} groups {:?}", d.start, d.packet.groups));
+            return None;
+        }
+        let shape = ComputeShape::from_rsrc2(d.threads, d.shader.rsrc2);
+        if shape.threads != [64, 1, 1] || !shape.group_id_x || shape.thread_id_components != 1 {
+            why(&format!("threads {:?} rsrc2 {:#x}", shape.threads, d.shader.rsrc2));
+            return None;
+        }
+        let mut bytes = [0u8; 64];
+        if !self.memory.read_backing(d.shader.address, &mut bytes) {
+            return None;
+        }
+        let program = ps5shader::program::decode_blob(&bytes, d.shader.address).ok()?;
+        let f = detect_constant_fill(&program)?;
+        why("(matched code)");
+        // The work-group id must sit in the first system SGPR (after the
+        // user data) and the V# must be user data.
+        if f.group != d.shader.user_sgpr_count() {
+            why(&format!("group sgpr {} vs user sgprs {}", f.group, d.shader.user_sgpr_count()));
+            return None;
+        }
+        let user = &d.shader.user_data;
+        let word = |r: u32| user.get(r as usize).copied();
+        let (w0, w1, w2, w3) = (word(f.resource)?, word(f.resource + 1)?, word(f.resource + 2)?, word(f.resource + 3)?);
+        // A plain dword V#: stride 4, no swizzle, no thread-id add, no
+        // out-of-bounds handling, a buffer, and a 32-bit format that
+        // stores the dword unchanged.
+        let base = w0 as u64 | ((w1 & 0xFFFF) as u64) << 32;
+        if (w1 >> 16) & 0x3FFF != 4 || w1 >> 31 != 0 || w3 >> 23 & 1 != 0 || w3 >> 24 & 3 != 0 || w3 >> 30 != 0 || base % 4 != 0 || !matches!((w3 >> 12) & 0x7F, 20 | 21 | 22) {
+            why(&format!("V# {w0:08x} {w1:08x} {w2:08x} {w3:08x}"));
+            return None;
+        }
+        let threads = if d.uses_thread_dimensions() { d.packet.groups[0] as u64 } else { d.packet.groups[0] as u64 * 64 };
+        let bytes = threads.min(w2 as u64) * 4;
+        if bytes == 0 {
+            return Some(None);
+        }
+        let value = match f.loaded {
+            None => f.value,
+            Some((r, offset)) => {
+                if !loaded_fill_enabled() {
+                    why("loaded value (RPS5E_LOADED_FILL_HLE=0)");
+                    return None;
+                }
+                // The scalar load of a plain V#: the dword at base + offset
+                // when inside the buffer (num_records units of the stride,
+                // bytes without one), else 0. Read on the CPU only when the
+                // GPU has not written it.
+                let (v0, v1, v2) = (word(r)?, word(r + 1)?, word(r + 2)?);
+                let src = (v0 as u64 | ((v1 & 0xFFFF) as u64) << 32) + offset as u64;
+                if (offset as u64) + 4 > crate::fill_kernels::scalar_buffer_bytes(v1, v2) {
+                    0
+                } else {
+                    if self.buffers.has_gpu_dirty(src & !3, 4) {
+                        why("loaded value written by the GPU");
+                        return None;
+                    }
+                    let mut b = [0u8; 4];
+                    if src % 4 != 0 || !self.memory.read_backing(src, &mut b) {
+                        why("loaded value unreadable");
+                        return None;
+                    }
+                    u32::from_le_bytes(b)
+                }
+            }
+        };
+        Some(Some((base, bytes, value)))
+    }
+
     /// The SDK image-copy kernel ([`crate::copy_kernels`]) run as a copy
     /// between the cached images of its T#s when that reproduces it
     /// exactly; false when the dispatch must run.
@@ -2193,6 +2291,19 @@ impl Backend {
             }
             None => {}
         }
+        match self.constant_fill_kernel(d) {
+            Some(None) => {
+                self.stats.pattern_fills += 1;
+                return;
+            }
+            Some(Some((base, bytes, value))) => {
+                if self.run_fill_kernel(base, bytes, [value; 4]) {
+                    self.stats.pattern_fills += 1;
+                    return;
+                }
+            }
+            None => {}
+        }
         if self.copy_kernel(d) {
             return;
         }
@@ -2225,7 +2336,9 @@ impl Backend {
                     let words: Vec<String> = bytes.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
                     log::info!("[gpu-trace] cs {:#x} #{n} user={:08x?} table {table:#x} ({ok}): {}", d.shader.address, &u[..16], words.join(" "));
                 }
-                self.sched.note(crate::scheduler::Note::Dispatch { n, cs: d.shader.address, packet: d.packet, threads: d.threads });
+                let mut user = [0u32; 16];
+                user.copy_from_slice(&d.shader.user_data[..16]);
+                self.sched.note(crate::scheduler::Note::Dispatch { n, cs: d.shader.address, packet: d.packet, threads: d.threads, user });
                 if submit_each() {
                     self.submit_isolated();
                 } else if eager_through_enabled() && self.buffers.has_pending_through() {
@@ -2263,8 +2376,16 @@ impl Backend {
             }
             if let Some(written) = self.dcc.get_mut(&addr) {
                 *written = true;
-                if let Some(t) = self.dcc_targets.get(&addr) {
+                // A clear kernel writes whole slices; a smaller write is other data over reused memory.
+                let whole = |t: &ColorTarget| t.clear_metadata().is_some_and(|(_, slice, _)| size >= slice) || !whole_metadata_writes_enabled();
+                if let Some(t) = self.dcc_targets.get(&addr).filter(|t| whole(t)) {
                     dcc_cleared.push(*t);
+                    if crate::backend::profile::on() {
+                        let mut code = [0u8; 64];
+                        let _ = self.memory.read_backing(d.shader.address, &mut code);
+                        let words: Vec<String> = code.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+                        crate::log_once(&format!("ps5gpu: DCC keys {addr:#x} written by cs={:#x} (decided on the GPU): code {}", d.shader.address, words.join(" ")));
+                    }
                 }
             }
         }
@@ -2657,6 +2778,22 @@ impl Backend {
         }
     }
 
+    /// A write of the command processor the guest can observe (a label,
+    /// WRITE_DATA), made where the queue is now: true when it was recorded
+    /// on the GPU because its page holds GPU-written bytes
+    /// (`RPS5E_CP_WRITES_ON_GPU`), false when the caller writes guest
+    /// memory itself.
+    ///
+    /// Such a page is protected until downloaded: writing it on the CPU
+    /// would fault, wait for all work recorded so far and download the
+    /// fault window, and leave the page CPU-dirty for its next GPU use.
+    /// On the GPU the bytes land in the page's mirror in order with that
+    /// work and reach guest memory with its write-through; a CPU read of
+    /// them before that waits as for any GPU result.
+    pub fn cp_write(&mut self, dst: u64, data: &[u8]) -> bool {
+        cp_writes_on_gpu_enabled() && self.write_memory(dst, data)
+    }
+
     /// A command-processor write: on the GPU when the range holds
     /// GPU-written pages.
     pub fn write_memory(&mut self, dst: u64, data: &[u8]) -> bool {
@@ -3010,6 +3147,15 @@ pub fn publish_point() {
     with_ready_backend(|b| b.publish_point());
 }
 
+/// An ordered write of the command processor (see [`Backend::cp_write`]):
+/// the publish point, then the write on the GPU, or `write` on the CPU.
+pub fn ordered_cp_write(addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
+    publish_point();
+    if !with_ready_backend(|b| b.cp_write(addr, data)).unwrap_or(false) {
+        write();
+    }
+}
+
 /// Run `f` only when the back-end already exists (fault / flip paths).
 pub fn with_ready_backend<R>(f: impl FnOnce(&mut Backend) -> R) -> Option<R> {
     if CELL.state.load(Ordering::Acquire) != READY {
@@ -3357,6 +3503,24 @@ impl UnmapListener for Unmap {
 /// scopes, the recording thread). Draws and recording-thread CPU time are
 /// counted per mode (`ab=` in the summary), so both modes see the same
 /// scenes and the same machine load.
+/// `RPS5E_LOADED_FILL_HLE=0`: a constant-fill kernel whose value is loaded
+/// through a V# runs as a dispatch (its DCC key fills are then decided on
+/// the GPU after refreshing the target). On by default; A/B in one run with
+/// `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=loaded-fill`.
+fn loaded_fill_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ab::switch_on("RPS5E_LOADED_FILL_HLE")) && ab::release_fast("loaded-fill")
+}
+
+/// `RPS5E_CP_WRITES_ON_GPU=0`: labels and WRITE_DATA into pages holding
+/// GPU-written bytes are written on the CPU (the store faults and downloads
+/// the page first). On by default ([`Backend::cp_write`]); A/B in one run
+/// with `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=cp-writes-on-gpu`.
+fn cp_writes_on_gpu_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ab::switch_on("RPS5E_CP_WRITES_ON_GPU")) && ab::release_fast("cp-writes-on-gpu")
+}
+
 pub mod ab {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
@@ -4091,7 +4255,57 @@ pub(crate) mod profile {
             .collect();
         faults.sort_unstable_by(|a, b| b.cmp(a));
         let top: Vec<String> = faults.iter().take(6).map(|(ns, n, a, w, rip)| format!("{a:#x}:{n}/{}ms{}@rip{rip:#x}{}", ns / 1_000_000, writer_of(*w), host_symbol(*rip))).collect();
-        format!( " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {} | full barriers: {} | gpu waits: {}", parts.join(" "), top.join(" "), iw.join(" "), write_fault_line(), download_line(), barrier_line(), wait_line())
+        format!(
+            " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {} | full barriers: {} | gpu waits: {}{}",
+            parts.join(" "),
+            top.join(" "),
+            iw.join(" "),
+            write_fault_line(),
+            download_line(),
+            barrier_line(),
+            wait_line(),
+            blocked_line()
+        )
+    }
+    /// `RPS5E_DESC_WAIT_WHY=1` (with the profile): the GPU-written words
+    /// materialisation waited for, per program and read, with what uses
+    /// them (`ps5shader::resources::BLOCKED_READS`).
+    pub fn desc_wait_why() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var("RPS5E_DESC_WAIT_WHY").is_ok_and(|v| v == "1");
+            ps5shader::resources::WHY_BLOCKED.store(on, Ordering::Relaxed);
+            on
+        })
+    }
+    fn blocked_line() -> String {
+        let st = &ps5shader::resources::RECORDS_STATS;
+        let records = if crate::pipeline::frontend::defer_records() {
+            let last = *st.last_over.lock().unwrap_or_else(|e| e.into_inner());
+            let largest = *st.largest.lock().unwrap_or_else(|e| e.into_inner());
+            let mut programs = st.programs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            programs.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            let programs: Vec<String> = programs.iter().take(12).map(|(p, n, o)| format!("{p:#x}:{n}/{o}")).collect();
+            format!(
+                " | deferred records: {} checked {} over {} last-over {:x?} largest {:x?} programs {}",
+                st.deferred.load(Ordering::Relaxed),
+                st.checked.load(Ordering::Relaxed),
+                st.over.load(Ordering::Relaxed),
+                last,
+                largest,
+                programs.join(" ")
+            )
+        } else {
+            String::new()
+        };
+        if !desc_wait_why() {
+            return records;
+        }
+        let g = ps5shader::resources::BLOCKED_READS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<_> = g.iter().collect();
+        v.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        let parts: Vec<String> = v.iter().take(16).map(|((p, op), uses, n, a)| format!("p{p:#x} op{op} n{n} @{a:#x} {uses}")).collect();
+        format!("{records} | blocked reads: {}", parts.join("; "))
     }
 }
 
@@ -4210,9 +4424,8 @@ impl RenderExecutor for GpuExecutor {
         with_ready_backend(|b| b.writes_through_pending()).unwrap_or(false)
     }
 
-    fn write_ordered(&self, _addr: u64, _data: &[u8], write: Box<dyn FnOnce() + Send>) {
-        publish_point();
-        write();
+    fn write_ordered(&self, addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        ordered_cp_write(addr, data, write);
     }
 
     fn memory_filled(&self, addr: u64, size: u64, value: u32) {
@@ -4619,16 +4832,15 @@ impl RenderExecutor for QueuedExecutor {
         // after the draws and transfers before it were recorded (their
         // pages GPU-dirty, so a CPU read waits for their results).
         if !self.recording() {
-            publish_point();
-            write();
+            ordered_cp_write(addr, data, write);
             return;
         }
         let len = data.len() as u64;
         let transfers = self.transfers.clone();
         let serial = transfers.add(addr, len, Some(crate::slices::pending::EventData::Bytes(data.to_vec())));
+        let bytes = data.to_vec();
         self.send(Recorded::Call(Box::new(move || {
-            publish_point();
-            write();
+            ordered_cp_write(addr, &bytes, write);
             transfers.remove(serial);
         })));
     }
@@ -4679,9 +4891,10 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | top uploads: {} | top invalidations: {}", b.images.upload_top(6), b.images.invalidate_top(6)));
             provider.push_str(&format!(" | stale: {}", b.images.stale_top(8)));
             provider.push_str(&format!(" | retiles: {}", b.images.retile_top(40)));
+            provider.push_str(&format!(" | refills by caller: {}", b.images.refill_callers_top(24)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -4706,6 +4919,8 @@ fn summary_locked() -> Option<String> {
             i.writebacks,
             i.conversions,
             i.retiles,
+            i.alias_overlays,
+            i.known_fill_keys,
             i.import_uploads,
             i.direct_copies,
             i.reused,

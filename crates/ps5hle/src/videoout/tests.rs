@@ -478,12 +478,14 @@ fn output_mode_queries_answer_console_codes() {
     let h = h as u64;
     assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[h, 1, opts, 0, 0]), 1);
     assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[h, 1, 0, 0, 0]), 1);
-    // Modes the measured display lacks (119.88 Hz only on a 120 Hz output).
+    // Modes the measured display lacks. 119.88 Hz is answered 0 (neither
+    // supported nor an error) on an output without 120 Hz.
     let high_rate = guest_refresh_rate() >= 119;
-    for mode in [0x4u64, 0x7, 0x8, 0xC, 0xD, 0xE, 0xF, 0x10, 0x11, 0x12, 0x13] {
-        if mode == 0xF && high_rate {
-            continue;
-        }
+    assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[h, 0xF, opts, 0, 0]), high_rate as i64);
+    if !high_rate {
+        assert_eq!(call("sceVideoOutConfigureOutput", &mut ctx, &[h, 0xF, opts, 0, 0]), ERROR_UNSUPPORTED_OUTPUT_MODE);
+    }
+    for mode in [0x4u64, 0x7, 0x8, 0xC, 0xD, 0xE, 0x10, 0x11, 0x12, 0x13] {
         assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[h, mode, opts, 0, 0]), ERROR_UNSUPPORTED_OUTPUT_MODE, "mode {mode:#x}");
         assert_eq!(call("sceVideoOutConfigureOutput", &mut ctx, &[h, mode, opts, 0, 0]), ERROR_UNSUPPORTED_OUTPUT_MODE, "mode {mode:#x}");
     }

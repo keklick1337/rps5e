@@ -22,9 +22,16 @@
 //!
 //! Queue model: a context holds `queueDepth` grains that drain one grain
 //! period at a time on the process clock. `Push` queues one grain: when the
-//! queue is full a non-blocking push fails with NOT_READY and a blocking one
-//! waits for a slot, except that a blocking push carrying PCM to a real
-//! device is paced by AudioOut's device queue instead.
+//! queue is full a non-blocking push fails with NOT_READY. A blocking push
+//! returns once the queue has room for another grain after its own (it
+//! waits for the grain playing to finish when its own fills the queue), so
+//! `GetQueueLevel` right after it reports a free slot unless advanced
+//! grains still wait for their push. Middleware that renders exactly the
+//! available grains when its output thread signals a push (Wwise: the
+//! output thread waits on a semaphore the render thread posts per grain,
+//! pushes, and wakes the render thread) relies on that; a push returning
+//! with the queue full left both threads waiting on each other. A push
+//! carrying PCM to a real device is also paced by AudioOut's device queue.
 
 use super::audio_out::{self, Format, OutputParam};
 use super::Export;
@@ -283,14 +290,6 @@ impl Port {
         self.samples_num as usize * data_format_channels(self.data_format) * bps
     }
 
-    /// The next push plays PCM.
-    fn has_next_pcm(&self) -> bool {
-        match self.pcm_queue.front() {
-            Some(next) => !next.is_empty(),
-            None => self.pcm_repeat && !self.pcm_data.is_empty(),
-        }
-    }
-
     /// Move to the PCM of the next grain: the oldest queued buffer, else
     /// the last one again if the port repeats it, else silence.
     fn advance_pcm(&mut self) {
@@ -479,15 +478,6 @@ impl<B: Backend> AudioOut2<B> {
         }
     }
 
-    fn has_queueable_device(&self, ports: &[Port], c: &Context) -> bool {
-        ports.iter().any(|p| {
-            p.used && p.context == c.handle && p.has_next_pcm() && {
-                let handle = if is_object_port(p.port_type) { c.object_audio_handle } else { p.audio_handle };
-                self.backend.has_device(handle)
-            }
-        })
-    }
-
     /// Submit every port of the context: beds as they are, objects as one mix.
     fn queue_context_audio(&self, ctx: u64, blocking: bool) {
         let (mut scratch, beds, object_handle) = {
@@ -623,17 +613,16 @@ impl<B: Backend> AudioOut2<B> {
             let sleep_micros;
             {
                 let mut s = locked(&self.state);
-                let State { contexts, ports, .. } = &mut *s;
-                let Some(c) = contexts.iter_mut().find(|c| c.used && c.handle == ctx) else {
+                let Some(c) = s.contexts.iter_mut().find(|c| c.used && c.handle == ctx) else {
                     return AUDIO_OUT2_ERROR_INVALID_PARAM;
                 };
-                // Only a blocking push carrying PCM to a real device can rely
-                // on the device queue for pacing; an asynchronous push keeps
-                // the queue-depth backpressure.
-                let use_device_clock = blocking && self.has_queueable_device(ports, c);
                 self.update_context(c);
-                sleep_micros = grain_micros(c.num_grains);
-                let accepted = c.queued < c.queue_depth || use_device_clock;
+                // Until the grain playing ends (the next slot frees).
+                let grain = grain_micros(c.num_grains);
+                sleep_micros = (c.last_update + grain).saturating_sub(self.backend.now_us()).clamp(100, grain);
+                // A blocking push leaves a free slot behind (see the module
+                // documentation); a non-blocking one only needs one.
+                let accepted = if blocking { c.queued.saturating_add(1) < c.queue_depth.max(2) } else { c.queued < c.queue_depth };
                 if accepted {
                     if c.queued == 0 {
                         c.last_update = self.backend.now_us();

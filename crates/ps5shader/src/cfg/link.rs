@@ -104,6 +104,11 @@ fn last_writer(p: &Program, end: usize, regs: &[u32], wave64: bool) -> Option<us
 /// writer. `None` when two writers reach `reader`, a path reaches the
 /// program's entry or a call target without one, or passes a call.
 fn reaching_writer(p: &Program, reader: usize, regs: &[u32], wave64: bool) -> Option<usize> {
+    reaching_writer_by(p, reader, |i| regs.iter().any(|&r| writes(i, r, wave64)))
+}
+
+/// [`reaching_writer`] for the instructions `writes_value` accepts.
+fn reaching_writer_by(p: &Program, reader: usize, writes_value: impl Fn(&Instruction) -> bool) -> Option<usize> {
     use std::collections::{BTreeMap, HashMap};
     let ins = &p.instructions;
     let by_pc: HashMap<u32, usize> = ins.iter().enumerate().map(|(k, i)| (i.pc, k)).collect();
@@ -151,7 +156,7 @@ fn reaching_writer(p: &Program, reader: usize, regs: &[u32], wave64: bool) -> Op
         if i.opcode == Opcode::SCallB64 || (i.opcode == Opcode::SSwappcB64 && direct_setpc_target(p, index).is_some()) {
             return None;
         }
-        if regs.iter().any(|&r| writes(i, r, wave64)) {
+        if writes_value(i) {
             if found.is_some_and(|f| f != index) {
                 return None;
             }
@@ -161,6 +166,70 @@ fn reaching_writer(p: &Program, reader: usize, regs: &[u32], wave64: bool) -> Op
         if !predecessors(index, &mut pending) {
             return None;
         }
+    }
+    found
+}
+
+/// The constant lane operand of a V_READLANE_B32 / V_WRITELANE_B32 (the
+/// hardware takes it modulo the wave size).
+fn constant_lane(o: Option<&Operand>, wave64: bool) -> Option<u32> {
+    let lane = match o? {
+        Operand { kind: OperandKind::EncodedConstant, value } => crate::inline_constants::decode(*value)?,
+        Operand { kind: OperandKind::LiteralConstant, value } => *value,
+        _ => return None,
+    };
+    Some(lane & if wave64 { 63 } else { 31 })
+}
+
+/// `i` may write lane `lane` of VGPR `vgpr`: a lane write of that lane (or
+/// of an unknown one), a relative write at or past a register below it, or
+/// any other write of a destination that may cover it. Vector ALU results
+/// name their first register (up to 2 wide), images their first data
+/// register (up to 5 with TFE); other memory results name each register.
+fn writes_lane(i: &Instruction, vgpr: u32, lane: u32, wave64: bool) -> bool {
+    let vector = |o: &Operand| o.kind == OperandKind::VectorRegister;
+    if i.opcode == Opcode::VWritelaneB32 {
+        return i.destinations.first().is_some_and(|d| vector(d) && d.value == vgpr) && constant_lane(i.sources.get(1), wave64).is_none_or(|l| l == lane);
+    }
+    if matches!(i.opcode, Opcode::VMovreldB32 | Opcode::VMovrelsdB32 | Opcode::VMovrelsd2B32 | Opcode::VSwaprelB32 | Opcode::VSwapB32) {
+        return i.destinations.iter().chain(&i.sources).any(|o| vector(o) && o.value <= vgpr);
+    }
+    let width = match i.encoding {
+        Encoding::Vop1 | Encoding::Vop2 | Encoding::Vop3 | Encoding::Vop3p | Encoding::Vopc => 2,
+        Encoding::Mimg => 5,
+        _ => 1,
+    };
+    i.destinations.iter().any(|d| vector(d) && d.value <= vgpr && vgpr - d.value < width)
+}
+
+/// The scalar load whose registers `first..first + count` reach `reader`
+/// through VGPR lanes: each register's last writer on every path is a
+/// V_READLANE_B32 of a constant lane, that lane's last writer a
+/// V_WRITELANE_B32 of an SGPR, and that SGPR's last writer the one load,
+/// at the same position of its destinations. Returns the load and its
+/// first destination register.
+fn unspilled_load(p: &Program, reader: usize, first: u32, count: u32, wave64: bool) -> Option<(usize, u32)> {
+    let mut found = None;
+    for j in 0..count {
+        let read = reaching_writer(p, reader, &[first + j], wave64)?;
+        let r = &p.instructions[read];
+        let vgpr = r.sources.first().filter(|o| o.kind == OperandKind::VectorRegister)?.value;
+        let lane = constant_lane(r.sources.get(1), wave64)?;
+        if r.opcode != Opcode::VReadlaneB32 || !is_scalar(r.destinations.first(), first + j) {
+            return None;
+        }
+        let write = reaching_writer_by(p, read, |i| writes_lane(i, vgpr, lane, wave64))?;
+        let w = &p.instructions[write];
+        let spilled = scalar(w.sources.first())?;
+        if w.opcode != Opcode::VWritelaneB32 || constant_lane(w.sources.get(1), wave64) != Some(lane) {
+            return None;
+        }
+        let load = reaching_writer(p, write, &[spilled], wave64)?;
+        let base = scalar(p.instructions[load].destinations.first())?;
+        if spilled.checked_sub(base) != Some(j) || found.is_some_and(|f| f != (load, base)) {
+            return None;
+        }
+        found = Some((load, base));
     }
     found
 }
@@ -231,9 +300,12 @@ pub fn find_user_data_calls(p: &Program, site: CallSite) -> Vec<UserDataCall> {
         let pair = if source != link && user_data(source) && user_data(source + 1) && unchanged(source, k) && unchanged(source + 1, k) {
             source
         } else {
-            let (Some(low), Some(high)) = (last_writer(p, k, &[source], wave64), last_writer(p, k, &[source + 1], wave64)) else { continue };
-            let first = low.min(high);
-            let in_block = same_block(p, &labels, first, k);
+            // The copy in the call's block, or the one copy every path into
+            // the call passes last (made before a branch).
+            let writer = |reg: u32| {
+                last_writer(p, k, &[reg], wave64).filter(|&w| same_block(p, &labels, w, k)).or_else(|| reaching_writer(p, k, &[reg], wave64))
+            };
+            let (Some(low), Some(high)) = (writer(source), writer(source + 1)) else { continue };
             let (lw, hw) = (&p.instructions[low], &p.instructions[high]);
             let mut from = None;
             if low == high && lw.opcode == Opcode::SMovB64 && is_scalar(lw.destinations.first(), source) {
@@ -246,7 +318,7 @@ pub fn find_user_data_calls(p: &Program, site: CallSite) -> Vec<UserDataCall> {
                 from = scalar(lw.sources.first()).filter(|&f| is_scalar(hw.sources.first(), f + 1));
             }
             let Some(from) = from else { continue };
-            if !in_block || from % 2 != 0 || !user_data(from) || !user_data(from + 1) || !unchanged(from, low) || !unchanged(from + 1, high) {
+            if from % 2 != 0 || !user_data(from) || !user_data(from + 1) || !unchanged(from, low) || !unchanged(from + 1, high) {
                 continue;
             }
             from
@@ -286,10 +358,13 @@ pub fn find_table_calls(p: &Program, site: CallSite) -> Vec<TableCall> {
         // The descriptor load in the call's block, or the one load every
         // path into the entry load passes (hoisted out of a loop).
         let descriptor_regs = [descriptor, descriptor + 1, descriptor + 2, descriptor + 3];
-        let Some(descriptor_load) = last_writer(p, low_load, &descriptor_regs, wave64)
+        let loaded = last_writer(p, low_load, &descriptor_regs, wave64)
             .filter(|&d| same_block(p, &labels, d, k))
             .or_else(|| reaching_writer(p, low_load, &descriptor_regs, wave64))
-        else {
+            .filter(|&d| p.instructions[d].opcode == Opcode::SLoadDwordx4)
+            .map(|d| (d, descriptor));
+        // Or the descriptor was spilled to VGPR lanes and read back.
+        let Some((descriptor_load, loaded_into)) = loaded.or_else(|| unspilled_load(p, low_load, descriptor, 4, wave64)) else {
             continue;
         };
         let table = &p.instructions[descriptor_load];
@@ -297,7 +372,7 @@ pub fn find_table_calls(p: &Program, site: CallSite) -> Vec<TableCall> {
         let Some(pointer) = scalar(table.sources.first()) else { continue };
         let table_offset = tm.immediate_offset_bytes;
         if table.opcode != Opcode::SLoadDwordx4
-            || !is_scalar(table.destinations.first(), descriptor)
+            || !is_scalar(table.destinations.first(), loaded_into)
             || tm.dynamic_offset_register.is_some()
             || !(0..0x10_0000).contains(&table_offset)
             || table_offset & 3 != 0
@@ -373,7 +448,9 @@ pub fn user_data_callee_length(callee: &[u32], link: u32) -> Result<Option<usize
             }
             furthest = furthest.max(target as usize / 4);
         }
-        if i.opcode != Opcode::SSetpcB64 {
+        // The return: S_SETPC_B64, or S_SWAPPC_B64 into the null register
+        // (a jump that keeps no return address).
+        if !branch::is_computed_jump(&i) {
             continue;
         }
         if !is_scalar(i.sources.first(), link) {
@@ -446,9 +523,15 @@ pub fn link_calls(
         linked[word] = 0xbb00_0000 | (call.link << 16) | offset as u32;
         linked.extend_from_slice(callee);
     }
+    // The dispatch code of every table call comes first and the callees
+    // after all of it, the tables with the least callee code first: the
+    // branches between a call and its dispatch stay short, and an
+    // S_CALL_B64 reaches as far as possible into the callee code.
+    let mut call_sites = Vec::new();
     for (table, callees) in table_calls.iter().zip(table_callees) {
         let word = call_word(table.pc, "table")?;
-        let at = format!("the table callees of the call at {:#x}", table.pc);
+        let callee_words: usize = callees.iter().map(|c| c.code.len()).sum();
+        let at = format!("the table callees of the call at {:#x} ({} callees, {callee_words} words)", table.pc, callees.len());
         let count = callees.len();
         let dispatch = linked.len();
         let zero = dispatch + 1;
@@ -485,6 +568,10 @@ pub fn link_calls(
         // S_ENDPGM: an unmatched target stops the wave.
         linked.push(0xbf81_0000);
         branch(&mut linked, 0xbf82_0000, word + 1)?;
+        call_sites.push((callee_words, table, callees, calls, at));
+    }
+    call_sites.sort_by_key(|site| site.0);
+    for (_, table, callees, calls, at) in call_sites {
         for (k, callee) in callees.iter().enumerate() {
             let site = calls + k * 2;
             let offset = linked.len() as i64 - site as i64 - 1;
@@ -615,6 +702,12 @@ pub fn read_callee(address: u64, link: u32, read: GuestReader<'_>) -> Result<Vec
         words.extend(buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])));
         if let Some(length) = user_data_callee_length(&words, link)? {
             words.truncate(length);
+            // The copy returns through S_SETPC_B64, the form the call
+            // model pairs with its call; a returning S_SWAPPC_B64 into
+            // null jumps the same way.
+            if let Some(ret) = words.last_mut().filter(|w| **w & 0xFFFF_FF00 == 0xBEFD_2100) {
+                *ret = 0xBE80_2000 | (*ret & 0xFF);
+            }
             return Ok(words);
         }
     }

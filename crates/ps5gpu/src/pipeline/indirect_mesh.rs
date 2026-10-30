@@ -16,7 +16,7 @@
 //! ```text
 //!   (count, instances, first, ...) = record          (one record)
 //!   draws  = count word present ? count word != 0 : true
-//!   count  = min(count, INDEX_BUFFER_SIZE)           (indexed)
+//!   count  = min(count, INDEX_BUFFER_SIZE - first)   (indexed; 0 past it)
 //!   groups = count >= size ? (count - size) / step / perGroup + 1 : 0
 //!   groups = 0 when over maxMeshWorkGroupCount / TotalCount
 //!   command = draws && instances != 0 && groups != 0 ? (groups, instances, 1) : 0
@@ -166,9 +166,13 @@ fn kernel() -> R<Vec<u32>> {
     let stored_some = s.b.i_not_equal(s.boolean, None, stored, zero)?;
     let true_ = s.b.constant_true(s.boolean);
     let draws = s.b.select(s.boolean, None, has_count, stored_some, true_)?;
-    // INDEX_BUFFER_SIZE bounds the indices one record may read.
-    let limit = s.arg(5)?;
-    let limit_set = s.b.i_not_equal(s.boolean, None, limit, zero)?;
+    // INDEX_BUFFER_SIZE bounds the indices one record may read, counted
+    // from the index base: the record's first index uses part of it.
+    let size_limit = s.arg(5)?;
+    let limit_set = s.b.i_not_equal(s.boolean, None, size_limit, zero)?;
+    let inside = s.b.u_less_than(s.boolean, None, first, size_limit)?;
+    let left = s.b.i_sub(s.uint, None, size_limit, first)?;
+    let limit = s.select(inside, left, zero)?;
     let above = s.b.u_greater_than(s.boolean, None, raw_count, limit)?;
     let limited = s.b.logical_and(s.boolean, None, limit_set, above)?;
     let clamp = s.b.logical_and(s.boolean, None, limited, indexed)?;
@@ -365,7 +369,7 @@ mod tests {
     /// shader-data words updated in `data`.
     fn resolve(a: &MeshIndirectArgs, record: [u32; 5], count_word: Option<u32>, data: &mut [u32]) -> [u32; 3] {
         let (first, vertex, instance) = if a.indexed { (record[2], record[3], record[4]) } else { (record[2], record[2], record[3]) };
-        let count = if a.indexed && a.index_limit != 0 { record[0].min(a.index_limit) } else { record[0] };
+        let count = if a.indexed && a.index_limit != 0 { record[0].min(a.index_limit.saturating_sub(first)) } else { record[0] };
         let command = if count_word.is_none_or(|c| c != 0) { launch(count, record[1], &a.rules) } else { [0; 3] };
         let draw = a.draw_dword as usize;
         data[draw] = count;
@@ -526,8 +530,10 @@ mod tests {
         let auto = MeshIndirectArgs { indexed: false, index_limit: 0, index_bytes: 0, index_base: 0, first_index_dword: NO_DWORD, ..indexed };
         // Both offsets to one register: the later write (first index) wins.
         let strip = MeshIndirectArgs { rules: rules(6, 8), vertex_dword: NO_DWORD, instance_dword: 1, first_index_dword: 1, ..indexed };
-        let cases: [(MeshIndirectArgs, [u32; 5], Option<u32>); 9] = [
+        let cases: [(MeshIndirectArgs, [u32; 5], Option<u32>); 10] = [
             (indexed, [96, 2, 5, (-17i32) as u32, 3], None),
+            // INDEX_BUFFER_SIZE 150 from the base: 140 indices after index 10.
+            (indexed, [148, 1, 10, 0, 0], None),
             (indexed, [200, 1, 0x4000_0001, 9, 1], None),
             (indexed, [0, 4, 5, 6, 7], None),
             (indexed, [96, 0, 5, 6, 7], None),

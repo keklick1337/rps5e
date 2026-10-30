@@ -1099,6 +1099,47 @@ fn compressed_stores_spend_stale_dcc_clear_codes() {
     assert_eq!((b.stats.recorded_draws, b.stats.color_clears), (2, 1), "the surface no store wrote is cleared to 0001");
 }
 
+/// A compute write of one dword at a colour target's CMASK address (an
+/// atomic counter over reused memory) is no metadata clear: the word keeps
+/// the value the program wrote, and nothing is decided or cleared.
+#[test]
+#[ignore]
+fn small_compute_writes_at_a_metadata_address_are_not_clears() {
+    let mut g = Guest::new(16 << 20);
+    let vs = g.program(&[asm::S_ENDPGM]);
+    let ps = solid_program(&mut g);
+    let verts = g.alloc(&floats(&[-1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0]));
+    let cmask = g.zeroed(0x1000);
+    let mut target = rgba8_target(g.zeroed(32 * 32 * 4), 32, 32);
+    target.fast_clear = true;
+    target.cmask_address = cmask;
+    target.clear_word0 = 0xFF00_00FF;
+    let dev = GpuDevice::create(false).expect("device");
+    if dev.conditional.is_none() {
+        eprintln!("no conditional rendering: skipped");
+        return;
+    }
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(TestCompiler::new().with(vs, TestProgram::PassthroughVertex { inputs: 1 }).with(ps, TestProgram::SolidPixel));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    p.set_vertex_input_resolver(Some(Box::new(FixedInputs(vec4_attrs(&[(verts, 48, 16, false)], &[(0, 0, 0)])))));
+    b.pipelines = Box::new(OverwritingDispatches { inner: p, overwrites: vec![(cmask, 4)], pending: Vec::new() });
+    let d = draw_into(target, stage(vs, &[]), stage(ps, &color_words([0.0, 0.0, 1.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    b.draw(&d);
+    let clears = b.stats.color_clears;
+    // The program's result on the GPU: the whole range reads as the CMASK clear state.
+    assert!(b.buffers.fill(&mut b.sched, cmask, 0x1000, 0).unwrap());
+    let shader = stage(0x1000, &[]);
+    let dispatch = ResolvedDispatch { packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() }, shader, rsrc3: 0, threads: [64, 1, 1], start: [0; 3] };
+    b.dispatch(&dispatch);
+    assert_eq!((b.stats.dcc_gpu_decisions, b.stats.color_clears), (0, clears), "no clear decided");
+    assert!(b.buffers.download(&mut b.sched, cmask, 4));
+    let mut word = [0xAAu8; 4];
+    assert!(g.mem.read_backing(cmask, &mut word));
+    assert_eq!(word, [0; 4], "the written word is kept");
+}
+
 #[test]
 #[ignore]
 fn compute_written_dcc_keys_clear_array_layers_on_the_gpu() {

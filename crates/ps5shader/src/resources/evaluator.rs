@@ -61,6 +61,10 @@ pub struct ResourceRuntimeInputs<'a> {
     /// `deferred_table_reads` and the host fills the slot on the GPU, after
     /// that work, instead of waiting for it.
     pub gpu_written: Option<GpuWrittenProbe<'a>>,
+    /// The room a buffer binding has from its base when its NUM_RECORDS is
+    /// a word GPU work is still writing and the program reads that word
+    /// itself (see `ReplayProgram::run_into_with`).
+    pub records_room: Option<super::replay::RecordsRoom<'a>>,
 }
 
 impl<'a> ResourceRuntimeInputs<'a> {
@@ -75,6 +79,7 @@ impl<'a> ResourceRuntimeInputs<'a> {
             read_resident_memory: None,
             reads_clean: false,
             gpu_written: None,
+            records_room: None,
         }
     }
 

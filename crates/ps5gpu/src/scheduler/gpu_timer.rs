@@ -81,6 +81,14 @@ pub mod label {
     pub const FULL_BARRIER: u64 = 25;
     /// Labels below this are categories, not shader addresses.
     pub const CATEGORIES: u64 = 0x100;
+    /// `RETILE_AT | address`: a refresh from newer aliases of the image at
+    /// that guest address (profile detail, see [`super::retile_label`]).
+    pub const RETILE_AT: u64 = 1 << 63;
+}
+
+/// The label charging a refresh of the image at `addr` to that image.
+pub fn retile_label(addr: u64) -> u64 {
+    label::RETILE_AT | addr
 }
 
 /// Name of a category label (`None` for a shader address).
@@ -412,14 +420,20 @@ impl GpuTimer {
         let fmt = |(l, (ns, k, max)): (&u64, &(u64, u64, u64))| format!("{}:{}ms/{k}/{:.1}ms", label_text(*l), ns / 1_000_000, *max as f64 / 1e6);
         let mut cats: Vec<_> = self.split.labels.iter().filter(|(l, _)| **l < label::CATEGORIES).collect();
         cats.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
-        let mut shaders: Vec<_> = self.split.labels.iter().filter(|(l, _)| **l >= label::CATEGORIES).collect();
+        let mut retiles: Vec<_> = self.split.labels.iter().filter(|(l, _)| **l & label::RETILE_AT != 0).collect();
+        retiles.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let retile_ns: u64 = retiles.iter().map(|r| r.1 .0).sum();
+        let mut shaders: Vec<_> = self.split.labels.iter().filter(|(l, _)| **l >= label::CATEGORIES && **l & label::RETILE_AT == 0).collect();
         shaders.sort_unstable_by(|a, b| b.1 .0.cmp(&a.1 .0));
         let total: u64 = shaders.iter().map(|s| s.1 .0).sum();
+        let rfmt = |(l, (ns, k, max)): (&u64, &(u64, u64, u64))| format!("{:#x}:{}ms/{k}/{:.1}ms", *l & !label::RETILE_AT, ns / 1_000_000, *max as f64 / 1e6);
         format!(
-            "{}; categories {}; draws/dispatches {} ms{}",
+            "{}; categories {}; draws/dispatches {} ms; retiles by target {} ms: {}{}",
             shaders.into_iter().take(n).map(fmt).collect::<Vec<_>>().join(" "),
             cats.into_iter().map(fmt).collect::<Vec<_>>().join(" "),
             total / 1_000_000,
+            retile_ns / 1_000_000,
+            retiles.into_iter().take(n * 2).map(rfmt).collect::<Vec<_>>().join(" "),
             if self.dropped != 0 { format!(", {} timestamps dropped", self.dropped) } else { String::new() }
         )
     }

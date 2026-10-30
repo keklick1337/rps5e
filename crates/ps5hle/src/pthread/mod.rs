@@ -22,7 +22,7 @@
 #[allow(unused_imports)]
 use crate::host::c as libc;
 mod posix_ext;
-mod sync;
+pub mod sync;
 
 use crate::context::CpuContext;
 use crate::registry::{HleRegistry, HleResult};

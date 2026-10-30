@@ -37,8 +37,9 @@ pub mod hazard;
 pub enum Note {
     Text(String),
     Draw { count: u32, instances: u32, vs: u64, ps: u64, colors: usize, depth: bool },
-    /// The `n`th dispatch of compute program `cs`.
-    Dispatch { n: u64, cs: u64, packet: crate::render::DispatchPacket, threads: [u32; 3] },
+    /// The `n`th dispatch of compute program `cs` (`user`: its first 16
+    /// user data registers, read by the stuck-tick report).
+    Dispatch { n: u64, cs: u64, packet: crate::render::DispatchPacket, threads: [u32; 3], user: [u32; 16] },
 }
 
 impl std::fmt::Display for Note {
@@ -48,7 +49,7 @@ impl std::fmt::Display for Note {
             Note::Draw { count, instances, vs, ps, colors, depth } => {
                 write!(f, "draw n={count} inst={instances} vs={vs:#x} ps={ps:#x} colors={colors} depth={depth}")
             }
-            Note::Dispatch { n, cs, packet, threads } => write!(f, "dispatch #{n} of cs={cs:#x} packet={packet:?} threads={threads:?}"),
+            Note::Dispatch { n, cs, packet, threads, .. } => write!(f, "dispatch #{n} of cs={cs:#x} packet={packet:?} threads={threads:?}"),
         }
     }
 }
@@ -225,6 +226,57 @@ impl Timeline {
         log::error!("ps5gpu: GPU tick {tick} does not complete; it contains {} journaled item(s):", work.len());
         for w in work {
             log::error!("ps5gpu:   tick {tick}: {w}");
+            // `RPS5E_STUCK_CODE_DIR=<dir>` (debug aid): the code of every
+            // compute program of the stuck tick, for `ps5shader-dis`.
+            if let (Note::Dispatch { cs, packet, user, n, .. }, Some(dir)) = (w, std::env::var_os("RPS5E_STUCK_CODE_DIR")) {
+                // The tables user data points at, with every buffer
+                // descriptor in them and its first words (guest memory:
+                // GPU results of unfinished work are not in there).
+                let mut out = format!("cs {cs:#x} #{n} user {user:08x?}\n");
+                for i in (0..user.len()).step_by(2) {
+                    let ptr = (user[i] as u64 | (user[i + 1] as u64) << 32) & 0xFFFF_FFFF_FFFF;
+                    let mut table = [0u8; 512];
+                    if ptr < 1 << 32 || !crate::memory::global().read_backing(ptr, &mut table) {
+                        continue;
+                    }
+                    let w: Vec<u32> = table.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                    out += &format!("s{i} table {ptr:#x}: {w:08x?}\n");
+                    for (k, d) in w.chunks(4).enumerate() {
+                        let base = d[0] as u64 | ((d[1] & 0xFFFF) as u64) << 32;
+                        let (stride, records) = ((d[1] >> 16) & 0x3FFF, d[2]);
+                        let bytes = if stride == 0 { records as u64 } else { stride as u64 * records as u64 };
+                        if base < 1 << 32 || bytes == 0 {
+                            continue;
+                        }
+                        let mut data = vec![0u8; bytes.min(1024) as usize & !3];
+                        if !crate::memory::global().read_backing(base, &mut data) {
+                            continue;
+                        }
+                        let v: Vec<u32> = data.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                        let page = crate::memory::global().describe_address(base).unwrap_or_default();
+                        out += &format!("  +{:#x}: V# base {base:#x} stride {stride} records {records} ({page}): {v:08x?}\n", k * 16);
+                    }
+                }
+                let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}-n{n}.txt"));
+                if let Err(e) = std::fs::write(&path, out) {
+                    log::error!("ps5gpu: {}: {e}", path.display());
+                }
+                if packet.indirect_address != 0 {
+                    // Guest memory only: GPU-written records may be newer in the mirror.
+                    let mut args = [0u8; 12];
+                    if crate::memory::global().read_backing(packet.indirect_address, &mut args) {
+                        let g: Vec<u32> = args.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                        log::error!("ps5gpu:     indirect record at {:#x} in guest memory: {g:?}", packet.indirect_address);
+                    }
+                }
+                let mut code = vec![0u8; 32 << 10];
+                if crate::memory::global().read_backing(*cs, &mut code) {
+                    let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}.bin"));
+                    if let Err(e) = std::fs::write(&path, &code) {
+                        log::error!("ps5gpu: {}: {e}", path.display());
+                    }
+                }
+            }
         }
     }
 }

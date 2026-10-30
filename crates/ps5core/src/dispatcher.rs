@@ -184,7 +184,14 @@ impl HleDispatcher for CoreDispatcher {
 
         // `RPS5E_HLE_PROFILE`: per-export call counts and time.
         let profile = ps5hle::registry::profile::enabled().then(std::time::Instant::now);
+        let stuck = stuck::enabled();
+        if stuck {
+            stuck::enter(export.name, [regs[7], regs[6], regs[2], regs[1]], regs[4], regs[5], [regs[3], regs[12], regs[13], regs[14], regs[15]]);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (export.callback)(&mut ctx)));
+        if stuck {
+            stuck::leave();
+        }
         if let Some(start) = profile {
             ps5hle::registry::profile::record(export.nid, export.name, start.elapsed());
         }
@@ -208,5 +215,172 @@ impl HleDispatcher for CoreDispatcher {
             trace_hle_call(slot.nid, [regs[7], regs[6], regs[2], regs[1]], rax, caller);
         }
         Some(rax)
+    }
+}
+
+/// `RPS5E_HLE_STUCK=1` (debug aid): every guest thread's HLE call in
+/// progress is recorded; [`stuck::report`] lists the calls running for 5 s
+/// or more (a thread blocked in a wait, with its arguments and caller).
+pub mod stuck {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    struct Call {
+        name: &'static str,
+        args: [u64; 4],
+        caller: u64,
+        /// Return addresses of the guest frames above (rbp chain).
+        frames: [u64; 12],
+        depth: usize,
+        since: Instant,
+        rsp: u64,
+        /// rbx, r12-r15 at the call.
+        saved: [u64; 5],
+    }
+
+    /// One guest thread's state; only that thread writes it (the report
+    /// reads it), so its lock is uncontended on the call path.
+    struct Slot {
+        key: u64,
+        thread: String,
+        call: Mutex<Option<Call>>,
+        /// HLE calls since the last busy report.
+        calls: AtomicU64,
+        sample: Mutex<String>,
+    }
+
+    fn slots() -> &'static Mutex<Vec<&'static Slot>> {
+        static S: OnceLock<Mutex<Vec<&'static Slot>>> = OnceLock::new();
+        S.get_or_init(Default::default)
+    }
+
+    thread_local! {
+        static SLOT: Cell<Option<&'static Slot>> = const { Cell::new(None) };
+    }
+
+    fn slot() -> &'static Slot {
+        SLOT.with(|c| match c.get() {
+            Some(s) => s,
+            None => {
+                let me = std::thread::current();
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    me.id().hash(&mut h);
+                    h.finish()
+                };
+                // The slot lives as long as the process (threads are few).
+                let s: &'static Slot = Box::leak(Box::new(Slot { key, thread: me.name().unwrap_or("").to_string(), call: Mutex::new(None), calls: AtomicU64::new(0), sample: Mutex::new(String::new()) }));
+                slots().lock().unwrap_or_else(|e| e.into_inner()).push(s);
+                c.set(Some(s));
+                s
+            }
+        })
+    }
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RPS5E_HLE_STUCK").is_ok_and(|v| v == "1"))
+    }
+
+    /// The calling thread enters HLE call `name`.
+    pub fn enter(name: &'static str, args: [u64; 4], rsp: u64, rbp: u64, saved: [u64; 5]) {
+        let caller = if ps5vm::ranges::accessible(rsp, 8, false) {
+            // SAFETY: readable guest stack slot (checked above).
+            unsafe { std::ptr::read_volatile(rsp as *const u64) }
+        } else {
+            0
+        };
+        let mut frames = [0u64; 12];
+        let mut depth = 0;
+        let mut fp = rbp;
+        while depth < frames.len() && fp & 7 == 0 && ps5vm::ranges::accessible(fp, 16, false) {
+            // SAFETY: readable guest stack words (checked above).
+            let (next, ret) = unsafe { (std::ptr::read_volatile(fp as *const u64), std::ptr::read_volatile((fp + 8) as *const u64)) };
+            frames[depth] = ret;
+            depth += 1;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        let s = slot();
+        if s.calls.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
+            *s.sample.lock().unwrap_or_else(|e| e.into_inner()) = format!("last {name} args {args:x?} caller {caller:#x} frames {:x?}", &frames[..depth]);
+        }
+        *s.call.lock().unwrap_or_else(|e| e.into_inner()) = Some(Call { name, args, caller, frames, depth, since: Instant::now(), rsp, saved });
+    }
+
+    /// The threads that made the most HLE calls since the last call of this
+    /// function (busy threads polling instead of waiting).
+    pub fn busy_report() -> Vec<String> {
+        let all = slots().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut v: Vec<(u64, String)> = all
+            .iter()
+            .map(|s| (s.calls.swap(0, Ordering::Relaxed), format!("'{}' {}", s.thread, s.sample.lock().unwrap_or_else(|e| e.into_inner()))))
+            .filter(|(n, _)| *n > 0)
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().take(6).map(|(n, s)| format!("{n} calls: {s}")).collect()
+    }
+
+    /// The calling thread left its HLE call.
+    pub fn leave() {
+        *slot().call.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// One line per HLE call running for at least `min`.
+    pub fn report(min: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let all = slots().lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut v: Vec<(Duration, String)> = all
+            .iter()
+            .filter_map(|s| {
+                let c = (*s.call.lock().unwrap_or_else(|e| e.into_inner()))?;
+                (now - c.since >= min).then_some((s, c))
+            })
+            .map(|(s, c)| {
+                let t = s.key;
+                let mut line = format!("thread {t:016x} '{}' in {} for {:.1} s args {:x?} caller {:#x} frames {:x?}", s.thread, c.name, (now - c.since).as_secs_f64(), c.args, c.caller, &c.frames[..c.depth]);
+                if c.name.contains("MutexLock") || c.name.contains("mutex_lock") {
+                    if let Some((owner, name, depth, at)) = ps5hle::pthread::sync::describe_mutex(c.args[0]) {
+                        line.push_str(&format!(" (mutex owner {owner:#x} '{name}' depth {depth}, locked at {:#x} <- {:#x})", at[0], at[1]));
+                    }
+                }
+                if now - c.since >= Duration::from_secs(20) && std::env::var("RPS5E_HLE_STUCK_STACK").is_ok_and(|t| t == s.thread) {
+                    // `RPS5E_HLE_STUCK_STACK=<thread name>`: the guest
+                    // stack of that thread's long wait (callee-saved
+                    // registers and locals of the frames above).
+                    let words: Vec<String> = (0..160u64)
+                        .map(|i| c.rsp + i * 8)
+                        .take_while(|&a| ps5vm::ranges::accessible(a, 8, false))
+                        // SAFETY: readable guest stack word (checked above).
+                        .map(|a| format!("{:x}", unsafe { std::ptr::read_volatile(a as *const u64) }))
+                        .collect();
+                    line.push_str(&format!(" regs rbx/r12-r15 {:x?} rsp {:#x} stack [{}]", c.saved, c.rsp, words.join(" ")));
+                }
+                if c.name == "sceKernelWaitEventFlag" {
+                    if let Some(d) = ps5hle::sync::event_flag::describe(c.args[0]) {
+                        line.push_str(&format!(" (flag {d})"));
+                    }
+                }
+                if c.name == "sceKernelWaitSema" {
+                    if let Some(d) = ps5hle::sync::sema::describe(c.args[0] as u32) {
+                        line.push_str(&format!(" (sema {d})"));
+                    }
+                }
+                if c.name == "sceKernelWaitEqueue" {
+                    if let Some(d) = ps5hle::sync::equeue::describe(c.args[0]) {
+                        line.push_str(&format!(" (queue {d})"));
+                    }
+                }
+                (now - c.since, line)
+            })
+            .collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0));
+        v.into_iter().map(|(_, s)| s).collect()
     }
 }

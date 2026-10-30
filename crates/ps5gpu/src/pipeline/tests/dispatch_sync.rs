@@ -311,3 +311,40 @@ fn dispatch_sync_bounded_stores_dirty_only_their_bytes() {
     assert!(g.mem.read_backing(out2, &mut w));
     assert!((7..7 + 64).contains(&u32::from_le_bytes(w)), "every lane stores to offset 0");
 }
+
+/// A label the command processor writes into a page a dispatch wrote
+/// (next to the dispatch's output) is recorded on the GPU after that work:
+/// the page is not downloaded for it, and the CPU then reads both the
+/// label and the dispatch's output (`RPS5E_CP_WRITES_ON_GPU`; with `=0` the
+/// write is left to the CPU and the first assertion fails).
+#[test]
+#[ignore]
+fn dispatch_sync_labels_next_to_gpu_results_are_written_on_the_gpu() {
+    let mut g = Guest::new(16 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    crate::backend::attach_faults(&b, g.mem);
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(Arc::new(crate::shader::SpirvCompiler::for_device(&dev, g.mem))), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    let st = store_program(&mut g);
+    let out = g.zeroed(4096);
+    b.dispatch(&store(st, out, 500));
+    // The label: right after the dispatch's output, in the same page.
+    let label = out + WORDS * 4 + 16;
+    assert!(b.tracker.has_gpu_dirty_pages(label, 8), "the dispatch wrote the label's page");
+    assert!(b.cp_write(label, &0x1234_5678_9abc_def0u64.to_le_bytes()), "written on the GPU");
+    assert!(b.tracker.has_gpu_dirty_pages(out, WORDS * 4), "the page was not downloaded");
+    b.flush();
+    b.sched.finish();
+    // SAFETY: a guest page of the test view; a read that faults waits for the GPU.
+    let v = unsafe { std::ptr::read_volatile(label as *const u64) };
+    assert_eq!(v, 0x1234_5678_9abc_def0);
+    let Backend { buffers, sched, .. } = &mut b;
+    assert_eq!(words(buffers, sched, g.mem, out), expect(500), "the dispatch's output is kept");
+    // A label in a page no GPU work wrote is left to the CPU.
+    let clean = g.zeroed(4096);
+    assert!(!b.cp_write(clean, &7u32.to_le_bytes()));
+    b.flush();
+    b.sched.finish();
+}

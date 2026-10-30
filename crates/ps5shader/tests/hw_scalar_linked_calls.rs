@@ -74,6 +74,8 @@ fn finds_user_data_calls() {
 fn user_data_callee_lengths() {
     assert_eq!(user_data_callee_length(&ADD_FIVE, 14), Ok(Some(2)));
     assert_eq!(user_data_callee_length(&[0x4a020285], 14), Ok(None));
+    // A return through S_SWAPPC_B64 into null (no return address kept).
+    assert_eq!(user_data_callee_length(&[0x4a020285, 0xbefd210e, 0x30306c73, 0xcf404000], 14), Ok(Some(2)));
     let err = |words: &[u32]| user_data_callee_length(words, 14).unwrap_err();
     assert!(err(&[0xbe901f00, 0xbe80200e]).contains("reads its program counter"));
     assert!(err(&[0xbe92210e, 0xbe80200e]).contains("makes a call"));
@@ -204,6 +206,32 @@ fn links_table_calls() {
     assert!(link_calls(&program, &TABLE_CALLER, &[], &[], &calls, &far).unwrap_err().contains("out of s_call_b64 range"));
 }
 
+#[test]
+fn table_callees_follow_all_dispatch_code() {
+    // Two table calls; the first links 34000 words of callees, the second 2.
+    let mut code: Vec<u32> = TABLE_CALLER[..10].to_vec();
+    code.extend_from_slice(&TABLE_CALLER[..10]);
+    code.push(0xbf810000);
+    let site = CallSite { user_data_count: 16, ..SITE };
+    let program = decode(&code);
+    let calls = find_table_calls(&program, site);
+    assert_eq!(calls.iter().map(|c| c.pc).collect::<Vec<_>>(), vec![0x24, 0x4c]);
+    let filler = |words: usize| {
+        let mut c = vec![0xbf800000u32; words];
+        c.push(0xbe80200e);
+        c
+    };
+    let callees = vec![
+        vec![TableCallee { target: 0x10, code: filler(17000) }, TableCallee { target: 0x20, code: filler(17000) }],
+        vec![TableCallee { target: 0x30, code: filler(1) }],
+    ];
+    let linked = link_calls(&program, &code, &[], &[], &calls, &callees).unwrap();
+    // Program, dispatch code (17 words per callee + 7 per table), callees, S_CODE_END.
+    assert_eq!(linked.code.len(), 21 + 41 + 24 + 2 + 2 * 17001 + 1);
+    // The second table's callee comes right after the dispatch code.
+    assert_eq!(&linked.code[21 + 41 + 24..21 + 41 + 24 + 2], &filler(1)[..]);
+}
+
 /// The driver test's caller: s[0:1] points at a buffer descriptor of a
 /// table with two 16-byte records holding code addresses, s2 selects the
 /// record, s3 the SCC the callee sees; the callee sets v1 by SCC and v1 is
@@ -252,6 +280,99 @@ fn linked_table_calls_execute() {
             assert!(out.iter().all(|&v| v == want), "wave{wave} record {index} scc {scc}: {out:?}, expected {want:#x}");
         }
     }
+}
+
+/// [`TABLE_STORING_CALLER`] with its table descriptor spilled to lanes 3..6
+/// of v70 (V_WRITELANE_B32), the SGPRs reused, and the descriptor read back
+/// (V_READLANE_B32) after a forward branch.
+const SPILLED_TABLE_CALLER: [u32; 37] = [
+    0x7e020280, 0xf4080400, 0xfa000000, 0xbf8cc07f, 0xd7610046, 0x00010610, 0xd7610046, 0x00010811, 0xd7610046, 0x00010a12, 0xd7610046, 0x00010c13,
+    0xbe900480, 0xbe920480, 0xbf880001, 0x7e040280, 0xd7600010, 0x00010746, 0xd7600011, 0x00010946, 0xd7600012, 0x00010b46, 0xd7600013, 0x00010d46,
+    0x8f148402, 0xf4280208, 0x28000000, 0xbf8cc07f, 0xbe8e0308, 0xbe8f0309, 0xbf068103, 0xbe8e210e, 0x34040082, 0xe0701000, 0x80010102, 0xbf810000,
+    0xbf9f0000,
+];
+
+#[test]
+fn finds_table_calls_through_spilled_descriptors() {
+    let site = CallSite { user_data_count: 8, ..SITE };
+    let calls = |code: &[u32]| find_table_calls(&decode(code), site);
+    let want = TableCall { pc: 31 * 4, link: 14, target_register: 14, user_data_register: 0, descriptor_offset: 0, entry_offset: 0, entry_stride: 16 };
+    assert_eq!(calls(&SPILLED_TABLE_CALLER), vec![want]);
+    for wave_size in [32, 64] {
+        assert_eq!(find_table_calls(&decode(&SPILLED_TABLE_CALLER), CallSite { wave_size, ..site }).len(), 1);
+    }
+    let changed = |word: usize, value: u32| {
+        let mut code = SPILLED_TABLE_CALLER;
+        code[word] = value;
+        calls(&code)
+    };
+    // Lane 4 read back from lane 7, which holds nothing of the load.
+    assert!(changed(19, 0x00010f46).is_empty());
+    // s17 spilled to lane 4 after the SGPRs were reused.
+    assert!(changed(7, 0x00010810).is_empty());
+    // A vector write of v70 between the spill and the read.
+    assert!(changed(15, 0x7e8c0280).is_empty());
+    // The same write of the register after it leaves the lanes alone.
+    assert_eq!(changed(15, 0x7e8e0280), vec![want]);
+    // A lane write of v70 through a lane chosen at run time.
+    let mut runtime_lane = SPILLED_TABLE_CALLER;
+    runtime_lane[14..16].copy_from_slice(&[0xbf800000, 0xbf800000]);
+    runtime_lane[12..14].copy_from_slice(&[0xd7610046, 0x00000410]);
+    assert!(calls(&runtime_lane).is_empty());
+}
+
+#[test]
+fn spilled_table_calls_execute() {
+    const DESCRIPTORS: u64 = 0x3_0000_0000;
+    const TABLE: u64 = 0x3_0000_1000;
+    const FIRST: u64 = 0x4_0000_0000;
+    const SECOND: u64 = 0x4_0000_2000;
+    let mut memory = Memory::default();
+    // The first callee returns through S_SWAPPC_B64 into null, followed
+    // by words that are not code.
+    memory.write_words(FIRST, &[SELECT_SIXTEEN[0], SELECT_SIXTEEN[1], 0xbefd210e, 0x30306c73, 0xcf404000]);
+    memory.write_words(SECOND, &SELECT_THIRTY_TWO);
+    let table = [FIRST as u32, (FIRST >> 32) as u32, 0, 0, SECOND as u32, (SECOND >> 32) as u32, 0, 0];
+    let descriptor = [TABLE as u32, ((TABLE >> 32) as u32 & 0xffff) | (16 << 16), 2, 0x3101_6fac];
+    memory.write_words(TABLE, &table);
+    memory.write_words(DESCRIPTORS, &descriptor);
+    let read = |address: u64, buf: &mut [u8]| {
+        for (k, b) in buf.iter_mut().enumerate() {
+            *b = memory.read_u8(address + k as u64);
+        }
+        true
+    };
+    let program = decode(&SPILLED_TABLE_CALLER);
+    for wave in [32, 64] {
+        for (index, scc, want) in [(0, 1, 17), (1, 0, 32)] {
+            let mut ud = user_data([0; 4], raw_desc(OUT_BASE, 64 * 4), 8);
+            ud[..4].copy_from_slice(&[DESCRIPTORS as u32, (DESCRIPTORS >> 32) as u32, index, scc]);
+            let site = CallSite { user_data_base: 0, user_data_count: 8, wave_size: wave };
+            let linked = link_program(&program, &SPILLED_TABLE_CALLER, site, &ud, &read).unwrap().unwrap();
+            assert_eq!(linked.callees.iter().map(|c| c.address).collect::<Vec<_>>(), vec![FIRST, SECOND]);
+            let out = Dispatch::new(&linked.linked.code, wave, 64, ud)
+                .buffer(DESCRIPTORS, descriptor.to_vec())
+                .buffer(TABLE, table.to_vec())
+                .output(OUT_BASE, 64)
+                .run()
+                .unwrap()
+                .remove(0);
+            assert!(out.iter().all(|&v| v == want), "wave{wave} record {index} scc {scc}: {out:?}, expected {want:#x}");
+        }
+    }
+}
+
+/// s_mov_b64 copy of the callee pointer s[0:1] into s[14:15], then a
+/// forward branch over a vector move, then the call.
+const COPY_BEFORE_BRANCH: [u32; 6] = [0xbe8e0300, 0xbe8f0301, 0xbf880001, 0x7e020280, 0xbe8e210e, 0xbf810000];
+
+#[test]
+fn finds_user_data_calls_copied_before_a_branch() {
+    assert_eq!(find_user_data_calls(&decode(&COPY_BEFORE_BRANCH), SITE), vec![UserDataCall { pc: 0x10, link: 14, user_data_register: 0 }]);
+    // Another copy on the branch's fall-through path only: two copies reach the call.
+    let mut two_copies = COPY_BEFORE_BRANCH;
+    two_copies[3] = 0xbe8e0302;
+    assert!(find_user_data_calls(&decode(&two_copies), SITE).is_empty());
 }
 
 #[test]

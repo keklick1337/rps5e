@@ -1614,6 +1614,30 @@ fn cp_private_release_mem_follows_the_native_layout() {
     assert_eq!(mem::r64(l64), Some(0x1122_3344_5566_7788));
 }
 
+/// RELEASE_MEM data selectors 3 and 4 store a 64-bit counter (GPU clock,
+/// system clock): both get the reference clock when the pipe drained.
+/// Selector 4 used to be dropped with a warning (the label kept its old
+/// value).
+#[test]
+fn cp_release_mem_counter_selectors_write_the_clock() {
+    let e = Env::new();
+    let (l3, l4) = (e.a(LABELS), e.a(LABELS + 0x10));
+    mem::w64(l3, 0);
+    mem::w64(l4, 0);
+    let release = |sel: u32, l: u64| [p4::make(8, op::RELEASE_MEM, 0), 0x28, sel << 29, l as u32, (l >> 32) as u32, 0, 0, 0];
+    let q = bare_queue();
+    let before = interp::reference_clock();
+    let mut w = Vec::new();
+    w.extend_from_slice(&release(3, l3));
+    w.extend_from_slice(&release(4, l4));
+    run_words(&q, e.a(CMD), &w);
+    let after = interp::reference_clock();
+    for (sel, l) in [(3, l3), (4, l4)] {
+        let v = mem::r64(l).unwrap();
+        assert!(before <= v && v <= after, "selector {sel}: {v} not in [{before}, {after}]");
+    }
+}
+
 /// Boolean predication reads the value whatever the wait bit; Z-pass
 /// predication waits for ready counters (or draws everything with the wait
 /// bit set).
@@ -2457,6 +2481,23 @@ fn cp_copy_data_to_context_registers() {
     });
 }
 
+/// COPY_DATA source selector 1 (memory) read by the PFP engine (bit 30) is
+/// memory, not GDS (raw selector 3), both into memory and into registers.
+#[test]
+fn cp_copy_data_memory_source_on_the_pfp() {
+    let e = Env::new();
+    let src = e.a(DATA + 0x640);
+    let dst = e.a(LABELS + 0x380);
+    assert!(mem::write_dwords(src, &[0x1234_5678, 0x9ABC_DEF0]));
+    assert!(mem::write_dwords(dst, &[0, 0]));
+    let q = bare_queue();
+    let to_mem = [p4::make(6, op::COPY_DATA, 0), 0x4001_0201, src as u32, (src >> 32) as u32, dst as u32, (dst >> 32) as u32];
+    let to_reg = [p4::make(6, op::COPY_DATA, 0), 0x4000_0001, src as u32, (src >> 32) as u32, 0xA030, 0];
+    run_words(&q, e.a(CMD + 0x1D00), &[to_mem, to_reg].concat());
+    assert_eq!((mem::r32(dst), mem::r32(dst + 4)), (Some(0x1234_5678), Some(0x9ABC_DEF0)));
+    q.with_interpreter(0, |i| assert_eq!(i.regs.context[0x30], 0x1234_5678));
+}
+
 /// sceAgcDcbClearState: CLEAR_STATE with the low four command bits
 /// (reference Commands.cpp testClearState).
 #[test]
@@ -3050,5 +3091,12 @@ fn eop_release_performs_the_reserved_flip() {
     // The token is single use.
     run_words(&q, e.a(CMD + 0x3300), &release(2, EOP_TEST_TOKEN));
     assert_eq!(EOP_FLIPS.lock().unwrap().as_slice(), &[77]);
+    // The private release packet sceAgcCbReleaseMem writes claims the flip
+    // too.
+    let mut private = release(2, EOP_TEST_TOKEN);
+    private[0] = p4::make(8, op::NOP, crate::agc::pm4::nop::RELEASE_MEM);
+    EOP_CLAIMED.store(0, Ordering::SeqCst);
+    run_words(&q, e.a(CMD + 0x3400), &private);
+    assert_eq!(EOP_FLIPS.lock().unwrap().as_slice(), &[77, 77]);
     crate::agc::set_eop_flip_hooks(None);
 }

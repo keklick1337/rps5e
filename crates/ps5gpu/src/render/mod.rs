@@ -1209,7 +1209,7 @@ pub fn resolve_color_target(b: &RegisterBanks, slot: u32, ignore_mask: bool) -> 
     }
     let bpe = format.bytes_per_element;
     let (pitch, slice_size) = match crate::tiling::thin_surface(swizzle, bpe as usize, width, height) {
-        Some((pitch, bytes)) => (pitch, bytes as u64 * samples as u64),
+        Some((pitch, bytes)) => (pitch, crate::tiling::thin_surface_bytes(swizzle, bpe as usize, width, height, samples).unwrap_or(bytes * samples as usize) as u64),
         None => (width, width as u64 * height as u64 * bpe as u64 * samples as u64),
     };
     let dcc_address = split_address(r(cx::CB_COLOR0_DCC_BASE), b.cx(cx::CB_COLOR0_DCC_BASE_EXT + slot));
@@ -1277,12 +1277,17 @@ pub fn resolve_depth_target(b: &RegisterBanks, ds: &DepthStencilState) -> Option
     let swizzle = if sw_mode != 0 { sw_mode } else { crate::tiling::SWIZZLE_64KB_Z_X };
     let samples = 1u32 << ((z_info >> 2) & 3);
     let (pitch, depth_slice_size) = match crate::tiling::thin_surface(swizzle, bpe as usize, width, height) {
-        Some((pitch, bytes)) => (pitch, bytes as u64 * samples as u64),
+        Some((pitch, bytes)) => (pitch, crate::tiling::thin_surface_bytes(swizzle, bpe as usize, width, height, samples).unwrap_or(bytes * samples as usize) as u64),
         None => (width, width as u64 * height as u64 * bpe as u64),
     };
-    let stencil_slice_size =
-        crate::tiling::thin_surface(swizzle, 1, width, height).map_or(0, |(_, bytes)| bytes as u64 * samples as u64);
+    let stencil_slice_size = crate::tiling::thin_surface_bytes(swizzle, 1, width, height, samples).map_or(0, |bytes| bytes as u64);
     let view = b.cx(cx::DB_DEPTH_VIEW);
+    // A mipped depth surface (DB_Z_INFO.MAXMIP) stores level 0 after the
+    // smaller levels, and DB_DEPTH_VIEW.MIPID picks the level drawn into;
+    // only level 0 of a one-level surface is modelled.
+    if (z_info >> 16) & 0xF != 0 || (view >> 26) & 0xF != 0 {
+        crate::log_once(&format!("ps5gpu: depth target with mip levels (MAXMIP {}, MIPID {}) drawn as a one-level surface at its base", (z_info >> 16) & 0xF, (view >> 26) & 0xF));
+    }
     let slice_start = (view & 0x7FF) | (((view >> 11) & 3) << 11);
     let slice_max = ((view >> 13) & 0x7FF) | (((view >> 30) & 3) << 11);
     Some(DepthTarget {
@@ -1674,23 +1679,40 @@ fn packet_index(packet: &DrawPacket) -> Option<IndexBuffer> {
     }
 }
 
-/// (primitive type, primitive restart, GE_INDEX_OFFSET) from the user-config bank.
-fn uconfig_fields(b: &RegisterBanks) -> (u32, bool, u32) {
+/// (primitive type, GE_INDEX_OFFSET) from the user-config bank.
+fn uconfig_fields(b: &RegisterBanks) -> (u32, u32) {
     // The legacy rectangle list encoding draws as a rectangle list.
     let primitive_type = match b.uc(uc::VGT_PRIMITIVE_TYPE) {
         primitive::RECT_LIST_LEGACY => primitive::RECT_LIST,
         p => p,
     };
-    let restart = b.uc(uc::GE_MULTI_PRIM_IB_RESET_EN) & 1 != 0
-        && matches!(primitive_type, primitive::LINE_STRIP | primitive::TRI_FAN | primitive::TRI_STRIP);
-    (primitive_type, restart, b.uc(uc::GE_INDEX_OFFSET))
+    (primitive_type, b.uc(uc::GE_INDEX_OFFSET))
+}
+
+/// Whether primitive restart applies to a draw of `packet`:
+/// GE_MULTI_PRIM_IB_RESET_EN.RESET_EN on a strip or fan. With MATCH_ALL_BITS
+/// (bit 1) the zero-extended index is compared with all 32 bits of the
+/// reset index, so a reset index wider than the index type never matches.
+/// Read for every draw: it depends on the packet's index type.
+fn primitive_restart(b: &RegisterBanks, primitive_type: u32, packet: &DrawPacket) -> bool {
+    let enable = b.uc(uc::GE_MULTI_PRIM_IB_RESET_EN);
+    if enable & 1 == 0 || !matches!(primitive_type, primitive::LINE_STRIP | primitive::TRI_FAN | primitive::TRI_STRIP) {
+        return false;
+    }
+    let width_mask = match IndexType::from_raw(packet.index_type) {
+        IndexType::U8 => 0xFF,
+        IndexType::U16 => 0xFFFF,
+        IndexType::U32 => u32::MAX,
+    };
+    enable & 2 == 0 || b.cx(cx::VGT_MULTI_PRIM_IB_RESET_INDX) & !width_mask == 0
 }
 
 /// Resolve a draw's full state from the register banks.
 pub fn resolve_draw(b: &RegisterBanks, packet: &DrawPacket) -> ResolvedDraw {
     let mut color_targets = smallvec::SmallVec::new();
     let c = context_fields(b, &mut color_targets);
-    let (primitive_type, primitive_restart, index_offset) = uconfig_fields(b);
+    let (primitive_type, index_offset) = uconfig_fields(b);
+    let primitive_restart = primitive_restart(b, primitive_type, packet);
     ResolvedDraw {
         packet: *packet,
         index: packet_index(packet),
@@ -1768,12 +1790,12 @@ pub fn resolve_draw_into(b: &RegisterBanks, packet: &DrawPacket, dirty: DirtyBan
         d.aa_mask = c.aa_mask;
     }
     if dirty.uconfig {
-        let (primitive_type, primitive_restart, index_offset) = uconfig_fields(b);
+        let (primitive_type, index_offset) = uconfig_fields(b);
         d.primitive_type = primitive_type;
         d.topology = topology(primitive_type);
-        d.primitive_restart = primitive_restart;
         d.index_offset = index_offset;
     }
+    d.primitive_restart = primitive_restart(b, d.primitive_type, packet);
     if dirty.any() {
         d.shaders = resolve_shaders(b);
     }
@@ -1901,6 +1923,18 @@ mod tests {
         let dirty = DirtyBanks { uconfig: true, ..DirtyBanks::NONE };
         resolve_draw_into(&RegisterBanks { context: &ctx, shader: &shr, uconfig: &ucr }, &p3, dirty, &mut cached);
         assert_eq!(cached, full(&ctx, &shr, &ucr, &p3));
+        assert!(cached.primitive_restart);
+        // MATCH_ALL_BITS: a 32-bit reset index never matches 16-bit
+        // indices; with 32-bit indices of the next draw it does.
+        ucr[uc::GE_MULTI_PRIM_IB_RESET_EN as usize] = 3;
+        ctx[cx::VGT_MULTI_PRIM_IB_RESET_INDX as usize] = u32::MAX;
+        let dirty = DirtyBanks { context: true, uconfig: true, ..DirtyBanks::NONE };
+        resolve_draw_into(&RegisterBanks { context: &ctx, shader: &shr, uconfig: &ucr }, &p3, dirty, &mut cached);
+        assert_eq!(cached, full(&ctx, &shr, &ucr, &p3));
+        assert!(!cached.primitive_restart);
+        let p4 = DrawPacket { index_type: 1, ..p3 };
+        resolve_draw_into(&RegisterBanks { context: &ctx, shader: &shr, uconfig: &ucr }, &p4, DirtyBanks::NONE, &mut cached);
+        assert_eq!(cached, full(&ctx, &shr, &ucr, &p4));
         assert!(cached.primitive_restart);
     }
 

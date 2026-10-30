@@ -263,6 +263,32 @@ fn buffer_download_through_staging_ring() {
     dev.wait_idle();
 }
 
+/// An unmap of part of a buffer drops the whole buffer: the GPU data it
+/// holds outside the unmapped range reaches guest memory first.
+#[test]
+#[ignore]
+fn partial_unmap_keeps_the_gpu_data_of_the_rest_of_the_buffer() {
+    let (view, dev, shared, tracker) = setup(0x33);
+    let gw = view + 0x10000;
+    let n = 4 * PAGE_BYTES;
+    {
+        let mut g = shared.lock().unwrap();
+        let Shared { sched, cache } = &mut *g;
+        let s = cache.obtain(sched, gw, n, true).unwrap();
+        let cb = sched.cmd();
+        // SAFETY: recording buffer, range inside the buffer.
+        unsafe { dev.device.cmd_fill_buffer(cb, s.buffer, s.offset, n, 0x0BAD_F00D) };
+        sched.flush();
+        assert!(cache.has_gpu_dirty(gw, n));
+        cache.unmap(sched, gw, PAGE_BYTES);
+        assert_eq!(cache.stats().buffers, 0);
+    }
+    assert!(!tracker.has_gpu_dirty_pages(gw + PAGE_BYTES, n - PAGE_BYTES), "GPU-dirty pages left without a buffer");
+    // SAFETY: the pages are mapped and no longer read-blocked.
+    assert_eq!(unsafe { std::ptr::read_volatile((gw + 3 * PAGE_BYTES) as *const u32) }, 0x0BAD_F00D);
+    dev.wait_idle();
+}
+
 #[test]
 #[ignore]
 fn command_processor_copy_fill_write_on_gpu() {
@@ -961,4 +987,39 @@ fn page_memo_front_matches_the_map() {
         }
         assert_eq!(memos.len(), model.len());
     }
+}
+
+/// A GPU fill's value is known for the bytes it covered until other GPU
+/// work writes over them (`RPS5E_KNOWN_FILLS`): the value equals what the
+/// download returns, and a range only partly filled, or written after the
+/// fill, is unknown.
+#[test]
+#[ignore]
+fn known_fills_last_until_the_next_gpu_write() {
+    let (view, dev, shared, _tracker) = setup(0x21);
+    let a = view + 8 * PAGE_BYTES;
+    let n = 4 * PAGE_BYTES;
+    let mut g = shared.lock().unwrap();
+    let Shared { sched, cache } = &mut *g;
+    assert!(cache.fill(sched, a, n, 0x4040_4040).unwrap());
+    assert_eq!(cache.known_fill(a, n), Some(0x4040_4040));
+    assert_eq!(cache.known_fill(a + PAGE_BYTES, 0x100), Some(0x4040_4040), "inside the fill");
+    assert_eq!(cache.known_fill(a, n + 4), None, "beyond the fill");
+    assert_eq!(cache.known_fill(a - 4, 8), None, "before the fill");
+    // The value is what the GPU wrote.
+    assert!(cache.download(sched, a, n));
+    // SAFETY: downloaded guest bytes of the test view.
+    assert_eq!(unsafe { std::ptr::read_volatile((a + 0x123c) as *const u32) }, 0x4040_4040);
+    // A later GPU write over part of the range: unknown.
+    assert!(cache.fill(sched, a, n, 0x8080_8080).unwrap());
+    let s = cache.obtain(sched, a + 2 * PAGE_BYTES, 16, true).unwrap();
+    sched.full_barrier();
+    // SAFETY: recording buffer, range inside the buffer.
+    unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, 16, 7) };
+    sched.full_barrier();
+    assert_eq!(cache.known_fill(a, n), None);
+    assert_eq!(cache.known_fill(a, PAGE_BYTES), None, "the whole fill is forgotten");
+    sched.flush_and_wait();
+    drop(g);
+    dev.wait_idle();
 }

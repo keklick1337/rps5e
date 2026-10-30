@@ -232,15 +232,16 @@ fn cb_open(ctx: &mut CpuContext) -> HleResult {
 }
 
 /// Answer for an output `mode` on a display refreshing at `refresh_rate`
-/// Hz: 1 when supported, else the console's error. Modes the console
-/// defines but the display lacks are UNSUPPORTED; other values are not
-/// modes at all. 0x12 answered UNSUPPORTED on one console and UNKNOWN on
-/// another; the first is used.
+/// Hz: 1 when supported, 0 for 119.88 Hz on an output without 120 Hz,
+/// else the console's error. The other modes the console defines but the
+/// display lacks are UNSUPPORTED; other values are not modes at all. 0x12
+/// answered UNSUPPORTED on one console and UNKNOWN on another; the first is
+/// used.
 pub(crate) fn output_mode_answer(mode: u64, refresh_rate: u32) -> HleResult {
     match mode {
         OUTPUT_MODE_DEFAULT => 1,
-        OUTPUT_MODE_119_88HZ if refresh_rate >= 119 => 1,
-        0x4 | 0x7 | 0x8 | 0xC | 0xD | 0xE | OUTPUT_MODE_119_88HZ | 0x10 | 0x11 | 0x12 | 0x13 => ERROR_UNSUPPORTED_OUTPUT_MODE,
+        OUTPUT_MODE_119_88HZ => (refresh_rate >= 119) as HleResult,
+        0x4 | 0x7 | 0x8 | 0xC | 0xD | 0xE | 0x10 | 0x11 | 0x12 | 0x13 => ERROR_UNSUPPORTED_OUTPUT_MODE,
         _ => ERROR_UNKNOWN_OUTPUT_MODE,
     }
 }
@@ -255,8 +256,7 @@ pub(crate) fn output_options_valid(bytes: &[u8]) -> bool {
 }
 
 /// sceVideoOutIsOutputSupported(handle, mode, options*, reserved*, reserved).
-/// Checks the handle, the reserved arguments, the mode, then the options;
-/// never answers 0.
+/// Checks the handle, the reserved arguments, the mode, then the options.
 fn cb_is_output_supported(ctx: &mut CpuContext) -> HleResult {
     let handle = handle_arg(ctx.rdi());
     let mode = ctx.rsi();
@@ -368,6 +368,11 @@ fn cb_configure_output(ctx: &mut CpuContext) -> HleResult {
     let supported = cb_is_output_supported(ctx);
     if supported < 0 {
         return supported;
+    }
+    // A mode the output lacks. A title that does not declare high frame
+    // rate output gets UNSUPPORTED here (no title attribute is read).
+    if supported == 0 {
+        return ERROR_UNSUPPORTED_OUTPUT_MODE;
     }
     let handle = handle_arg(ctx.rdi());
     let mode = ctx.rsi();

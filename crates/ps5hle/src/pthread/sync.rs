@@ -181,6 +181,9 @@ pub(super) struct HostMutex {
     /// adaptive mutex, 0 otherwise; they do not change how we wait.
     spinloops: AtomicI32,
     yieldloops: AtomicI32,
+    /// Diagnostics: guest return addresses of the last successful lock
+    /// call and of its caller's frame (reported by [`describe_mutex`]).
+    locked_at: [AtomicU64; 2],
 }
 
 /// Spin loops of a new adaptive mutex.
@@ -273,6 +276,7 @@ fn new_mutex(ctx: &CpuContext, kind: i32, protocol: i32) -> Option<(u64, &'stati
         cv: Condvar::new(),
         spinloops: AtomicI32::new(0),
         yieldloops: AtomicI32::new(0),
+        locked_at: [AtomicU64::new(0), AtomicU64::new(0)],
     })?;
     let (fast, spin_ns) = creation_mode(kind);
     {
@@ -307,6 +311,29 @@ pub(super) fn resolve_mutex(ctx: &CpuContext, ptr: u64) -> Result<&'static HostM
             new_mutex(ctx, kind, PRIO_NONE)
         },
     )
+}
+
+/// Diagnostics (`RPS5E_HLE_STUCK`): the owner of the guest mutex whose
+/// handle is stored at `ptr` — `(owner thread handle, owner name, depth)`,
+/// owner 0 while free, and where the last successful lock was made. None
+/// when `ptr` holds no live mutex.
+pub fn describe_mutex(ptr: u64) -> Option<(u64, String, u32, [u64; 2])> {
+    if ptr == 0 || !ps5vm::ranges::accessible(ptr, 8, false) {
+        return None;
+    }
+    // SAFETY: readable guest memory (checked above).
+    let val = unsafe { std::ptr::read_volatile(ptr as *const u64) };
+    let m = MUTEXES.get(val).filter(|m| m.live.load(Ordering::Acquire))?;
+    let (owner, depth) = if m.is_fast() {
+        let w = m.word.load(Ordering::Relaxed);
+        (w >> 1, m.depth.load(Ordering::Relaxed))
+    } else {
+        let st = lock(&m.state);
+        (if st.count > 0 { st.owner } else { 0 }, st.count)
+    };
+    let name = super::thread(owner).map(|i| i.name.lock().unwrap_or_else(|e| e.into_inner()).clone()).unwrap_or_default();
+    let at = [m.locked_at[0].load(Ordering::Relaxed), m.locked_at[1].load(Ordering::Relaxed)];
+    Some((owner, name, depth, at))
 }
 
 impl HostMutex {
@@ -832,16 +859,27 @@ pub(super) fn cb_mutex_destroy(ctx: &mut CpuContext) -> HleResult {
     OK
 }
 
+/// Remember where a successful lock was made: the return address of the
+/// call and the one of its caller's frame (two plain stores).
+fn note_locker(ctx: &CpuContext, m: &HostMutex, r: HleResult) -> HleResult {
+    if r == OK {
+        let (rsp, rbp) = (ctx.regs[4], ctx.regs[5]);
+        m.locked_at[0].store(ctx.read_u64(rsp).unwrap_or(0), Ordering::Relaxed);
+        m.locked_at[1].store(ctx.read_u64(rbp.wrapping_add(8)).unwrap_or(0), Ordering::Relaxed);
+    }
+    r
+}
+
 pub(super) fn cb_mutex_lock(ctx: &mut CpuContext) -> HleResult {
     match resolve_mutex(ctx, ctx.rdi()) {
-        Ok(m) => mutex_lock(m, None),
+        Ok(m) => note_locker(ctx, m, mutex_lock(m, None)),
         Err(e) => e,
     }
 }
 
 pub(super) fn cb_mutex_trylock(ctx: &mut CpuContext) -> HleResult {
     match resolve_mutex(ctx, ctx.rdi()) {
-        Ok(m) => mutex_trylock(m),
+        Ok(m) => note_locker(ctx, m, mutex_trylock(m)),
         Err(e) => e,
     }
 }
@@ -906,7 +944,7 @@ pub(super) fn cb_mutex_isowned(ctx: &mut CpuContext) -> HleResult {
 pub(super) fn cb_mutex_timedlock_usec(ctx: &mut CpuContext) -> HleResult {
     let usec = ctx.rsi() as u32 as u64;
     match resolve_mutex(ctx, ctx.rdi()) {
-        Ok(m) => mutex_lock(m, Some(usec)),
+        Ok(m) => note_locker(ctx, m, mutex_lock(m, Some(usec))),
         Err(e) => e,
     }
 }

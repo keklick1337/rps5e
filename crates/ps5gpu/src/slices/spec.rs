@@ -929,6 +929,7 @@ impl Images<'_> {
         }
     }
 
+    #[track_caller]
     pub fn prepare(&mut self, sched: &mut Scheduler, buffers: &mut Buffers, id: u64, discard: bool) -> bool {
         match self {
             Images::Exact(i) => match buffers.exact() {

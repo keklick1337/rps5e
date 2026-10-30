@@ -632,7 +632,6 @@ impl Interpreter {
             | op::DRAW_INDEX_2
             | op::DRAW_INDIRECT_MULTI
             | op::DRAW_INDEX_AUTO
-            | op::DRAW_INDEX_MULTI_AUTO
             | op::DRAW_INDEX_OFFSET_2
             | op::DRAW_INDEX_INDIRECT_MULTI
             | op::DISPATCH_DRAW_PREAMBLE => {
@@ -726,8 +725,12 @@ impl Interpreter {
             op::ACQUIRE_MEM
             | op::PFP_SYNC_ME
             | op::CONTEXT_CONTROL
-            | op::PRIME_UTCL2
-            | op::ATOMIC_GDS => Ok(rest),
+            | op::PRIME_UTCL2 => Ok(rest),
+            // GDS atomics from the command processor are not modelled (GDS
+            // lives on the GPU); DRAW_INDEX_MULTI_AUTO ([prim count,
+            // initiator, control]) is not decoded. Both are logged once by
+            // the arm below instead of being skipped silently or drawn with
+            // a wrong layout.
             other => {
                 // Once per opcode (a bit per opcode, no formatting per packet).
                 let bit = 1u64 << (other & 63);
@@ -834,8 +837,8 @@ impl Interpreter {
                 draw_initiator: at(7),
                 ..self.draw_state(DrawKind::IndexMultiInstanced, p.addr)
             },
-            // DRAW_INDEX_MULTI_AUTO: counted, not decoded.
-            _ => DrawPacket { count: at(0), ..self.draw_state(DrawKind::Auto, p.addr) },
+            // Only the draw opcodes above reach here.
+            _ => return,
         };
         if let Some(s) = self.slices() {
             // The slice thread takes the instance count from its own state
@@ -1270,7 +1273,12 @@ impl Interpreter {
     #[allow(clippy::too_many_arguments)]
     fn release_mem(&self, dst_sel: u32, data_sel: u32, int_sel: u32, dst: u64, value: u64, context_id: u32) {
         if dst_sel > 1 {
+            // Destinations 2/3 (queue write pointer) are not modelled; the
+            // interrupt is independent of the write and is still raised.
             crate::agc::log_once("pm4.release.dst", || log::warn!("[pm4] RELEASE_MEM destination {dst_sel} unsupported"));
+            if matches!(int_sel, 1..=4) {
+                self.interrupt(context_id);
+            }
             return;
         }
         if data_sel == 0 || int_sel == 4 || (dst_sel == 0 && dst == 0) {
@@ -1280,7 +1288,9 @@ impl Interpreter {
             return;
         }
         match data_sel {
-            1 | 2 | 3 => self.end_of_pipe(data_sel != 1, data_sel, dst, value, int_sel, context_id),
+            // 3: the 64-bit GPU clock, 4: the 64-bit system clock (both the
+            // reference clock here).
+            1..=4 => self.end_of_pipe(data_sel != 1, data_sel, dst, value, int_sel, context_id),
             5 => self.end_of_shader_gds(dst, value, int_sel, context_id),
             other => crate::agc::log_once(&format!("pm4.release.sel.{other}"), || {
                 log::warn!("[pm4] RELEASE_MEM data selector {other} unsupported");
@@ -1296,10 +1306,11 @@ impl Interpreter {
         let int_sel = (control >> 24) & 7;
         // The low two address bits are a cache-policy field, not address.
         self.release_mem((control >> 16) & 3, (control >> 29) & 7, int_sel, addr64(pl[2] & !3, pl[3]), addr64(pl[4], pl[5]), pl[6] & 0x07FF_FFFF);
-        // An 8-dword graphics RELEASE_MEM that interrupts after its write
+        // An 8-dword graphics release (native RELEASE_MEM or the private
+        // form sceAgcCbReleaseMem writes) that interrupts after its write
         // (selector 2) and names a flip sceVideoOutSubmitEopFlip reserved
         // (the token in its context id) performs that flip after it.
-        if !self.is_compute && super::opcode(p.header) == op::RELEASE_MEM && p.len() == 8 && int_sel == 2 {
+        if !self.is_compute && p.len() == 8 && int_sel == 2 {
             if let Some(id) = crate::agc::hook_claim_eop_flip(pl[6]) {
                 self.submit_eop_flip(id);
             }
@@ -1864,7 +1875,8 @@ impl Interpreter {
             self.copy_data_to_register(src_sel, src, bytes / 4, pl[3], pl[4]);
             return Ok(p.len() - 1);
         }
-        if matches!(src_sel, 9 | 18) {
+        // Raw selectors 9 (GPU clock) and 10 (system clock), either engine.
+        if matches!(src_sel, 9 | 18..=21) {
             if bytes == 8 {
                 self.write64(dst, reference_clock());
             } else {
@@ -1872,8 +1884,9 @@ impl Interpreter {
             }
             return Ok(p.len() - 1);
         }
-        if src_sel == 12 {
-            self.copy_atomic_return(dst, bytes, false);
+        // Raw selector 6: the atomic result latched by the engine named.
+        if matches!(src_sel, 12 | 13) {
+            self.copy_atomic_return(dst, bytes, src_sel == 13);
             return Ok(p.len() - 1);
         }
         if src_sel == 0 {
@@ -1891,9 +1904,11 @@ impl Interpreter {
             }
             return Ok(p.len() - 1);
         }
+        // Raw selector 1 (memory) and 2 (L2) are memory, 3 is GDS, 5
+        // immediate data; the low bit is the engine.
         let dma_src = match src_sel {
-            2 | 4 | 5 => 3,
-            3 | 6 | 7 => 1,
+            2..=5 => 3,
+            6 | 7 => 1,
             10 | 11 => 2,
             other => {
                 crate::agc::log_once(&format!("pm4.copy.src.{other}"), || log::warn!("[pm4] COPY_DATA source {other} unsupported"));
@@ -1901,8 +1916,8 @@ impl Interpreter {
             }
         };
         let dma_dst = match dst_sel {
-            2 | 4 | 5 => 3,
-            3 | 6 | 7 => 1,
+            2 | 4 => 3,
+            6 => 1,
             other => {
                 crate::agc::log_once(&format!("pm4.copy.dst.{other}"), || log::warn!("[pm4] COPY_DATA destination {other} unsupported"));
                 return Ok(p.len() - 1);
@@ -1921,7 +1936,8 @@ impl Interpreter {
     /// absolute dword offset `reg` on (`reg_hi` = 0).
     fn copy_data_to_register(&mut self, src_sel: u32, src: u64, count: u32, reg: u32, reg_hi: u32) {
         let target = Self::absolute_register(reg).filter(|_| reg_hi == 0);
-        let (Some((bank, offset)), true) = (target, matches!(src_sel, 2 | 4)) else {
+        // Memory or L2 (raw 1/2), read by either engine.
+        let (Some((bank, offset)), true) = (target, matches!(src_sel, 2..=5)) else {
             crate::agc::log_once(&format!("pm4.copy.toreg.{src_sel}.{reg:x}"), || {
                 log::warn!("[pm4] COPY_DATA from source {src_sel} to register {reg:#x} (high {reg_hi:#x}) unsupported")
             });

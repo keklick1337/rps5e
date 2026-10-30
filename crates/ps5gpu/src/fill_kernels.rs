@@ -265,6 +265,111 @@ pub fn detect_indexed_pattern_fill(program: &ps5shader::Program) -> Option<Index
     Some(IndexedPatternFill { group, count, pattern, resource: c.scalar_resource })
 }
 
+/// A constant-fill kernel: every thread stores one constant dword at its
+/// flat index through a V# from user data
+/// (`v_lshl_add_u32 v_i, s_group, 6, v0; v_mov_b32 v_d, <constant>;
+/// buffer_store_format_x v_d, v_i, s[resource:+3], 0 idxen; s_endpgm`).
+/// The SDK clears metadata (DCC keys, HTILE) with it. The stored dword can
+/// also be loaded first from a V# in user data
+/// (`s_buffer_load_dword s_v, s[loaded:+3], <offset>; s_waitcnt;
+/// v_mov_b32 v_d, s_v`): every thread loads the same dword, so the fill
+/// value is that dword of guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstantFill {
+    /// SGPR holding the work-group id X.
+    pub group: u32,
+    /// The dword every thread stores (0 when `loaded`).
+    pub value: u32,
+    /// User-data SGPRs of the destination V#.
+    pub resource: u32,
+    /// The value is loaded: user-data SGPRs of the source V# and the byte
+    /// offset of the dword in its buffer.
+    pub loaded: Option<(u32, u32)>,
+}
+
+/// Bytes a scalar buffer load (`s_buffer_load_*`) reaches through a V#
+/// with dword 1 `w1` and NUM_RECORDS `records`: with a non-zero stride the
+/// records count stride-sized units (constant buffers use stride 16),
+/// otherwise bytes. A dword at or past this many bytes reads 0.
+pub fn scalar_buffer_bytes(w1: u32, records: u32) -> u64 {
+    let stride = (w1 >> 16) & 0x3FFF;
+    if stride == 0 {
+        records as u64
+    } else {
+        records as u64 * stride as u64
+    }
+}
+
+/// SGPR_NULL as an encoded operand (reads 0).
+const ENCODED_NULL: u32 = 125;
+
+/// Recognise the constant-fill kernel ([`ConstantFill`]) in a decoded
+/// program; None for any other shape.
+pub fn detect_constant_fill(program: &ps5shader::Program) -> Option<ConstantFill> {
+    use ps5shader::opcode::Opcode::*;
+    use ps5shader::{Operand, OperandKind};
+    let scalar = |o: &Operand| matches!(o.kind, OperandKind::ScalarRegister).then_some(o.value);
+    let vector = |o: &Operand| matches!(o.kind, OperandKind::VectorRegister).then_some(o.value);
+    let encoded = |o: &Operand, v: u32| matches!(o.kind, OperandKind::EncodedConstant) && o.value == v;
+    let mut i: Vec<&ps5shader::Instruction> = program.instructions.iter().filter(|x| !matches!(x.opcode, STtraceData | SInstPrefetch)).collect();
+    // The loaded form: the scalar load and its wait between the index and
+    // the move (the move then reads the loaded SGPR).
+    let mut load = None;
+    if i.len() == 6 && i[1].opcode == SBufferLoadDword && i[2].opcode == SWaitcnt {
+        let ps5shader::Control::ScalarMemory(c) = i[1].control.as_ref()? else { return None };
+        if c.destination_count != 1 || c.dynamic_offset_register.is_some() || c.immediate_offset_bytes < 0 || c.immediate_offset_bytes % 4 != 0 {
+            return None;
+        }
+        let base = scalar(i[1].sources.first()?)?;
+        let dst = scalar(i[1].destinations.first()?)?;
+        // A second source is the scalar offset: only null (reads 0) or 0.
+        let no_offset = match i[1].sources.get(1) {
+            None => true,
+            Some(o) => encoded(o, ENCODED_NULL) || encoded(o, ENCODED_ZERO),
+        };
+        if i[1].sources.len() > 2 || !no_offset || base % 4 != 0 || (base..base + 4).contains(&dst) {
+            return None;
+        }
+        load = Some((base, c.immediate_offset_bytes as u32, dst));
+        i.drain(1..3);
+    }
+    if i.len() != 4 || i[0].opcode != VLshlAddU32 || i[1].opcode != VMovB32 || i[2].opcode != BufferStoreFormatX || i[3].opcode != SEndpgm {
+        return None;
+    }
+    // v_lshl_add_u32 v_index, s_group, 6, v0: the flat thread index.
+    let index = vector(i[0].destinations.first()?)?;
+    let group = scalar(&i[0].sources[0])?;
+    if i[0].sources.len() != 3 || !encoded(&i[0].sources[1], ENCODED_SHIFT_64) || i[0].sources[2] != Operand::vector(0) {
+        return None;
+    }
+    // v_mov_b32 v_data, constant (inline or literal).
+    let data = vector(i[1].destinations.first()?)?;
+    let src = *i[1].sources.first()?;
+    let value = match (src.kind, load) {
+        (OperandKind::LiteralConstant, None) => src.value,
+        (OperandKind::EncodedConstant, None) => ps5shader::inline_constants::decode(src.value)?,
+        (OperandKind::ScalarRegister, Some((_, _, dst))) if src.value == dst => 0,
+        _ => return None,
+    };
+    // The index's group SGPR is not the loaded one.
+    if load.is_some_and(|(_, _, dst)| dst == group) {
+        return None;
+    }
+    if i[1].sources.len() != 1 || data == index {
+        return None;
+    }
+    // buffer_store_format_x v_data, v_index, s[resource..4], 0: one dword
+    // per element, indexed, untyped, no offset.
+    let ps5shader::Control::BufferMemory(c) = i[2].control.as_ref()? else { return None };
+    if c.dword_count != 1 || c.offset_bytes != 0 || !c.index_enabled || c.offset_enabled || c.typed {
+        return None;
+    }
+    if i[2].sources.len() != 3 || !encoded(&i[2].sources[2], ENCODED_ZERO) || c.vector_address != index || c.vector_data != data {
+        return None;
+    }
+    Some(ConstantFill { group, value, resource: c.scalar_resource, loaded: load.map(|(b, o, _)| (b, o)) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +480,82 @@ mod tests {
                 assert_eq!(w, want, "count {count} groups {groups} dword {i}");
             }
         }
+    }
+
+    /// The UE5 key-fill kernel (SILENT HILL 2: DCC keys of transient
+    /// targets): v_lshl_add_u32 v0, s4, 6, v0; v_mov_b32 v1, 0;
+    /// buffer_store_format_x v1, v0, s[0:3], 0 idxen; s_endpgm.
+    #[test]
+    fn the_key_fill_kernel_is_a_constant_fill() {
+        let words = [0xd746_0000u32, 0x0401_0c04, 0x7e02_0280, 0xe010_2000, 0x8000_0100, 0xbf81_0000];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = ps5shader::program::decode_blob(&bytes, 0x14_800c_1900).unwrap();
+        let f = detect_constant_fill(&program).expect("a constant fill");
+        assert_eq!((f.group, f.value, f.resource, f.loaded), (4, 0, 0, None));
+    }
+
+    /// The same fill with its value loaded through a second V# (s[4:7]):
+    /// v_lshl_add_u32 v0, s8, 6, v0; s_buffer_load_dword vcc_lo, s[4:7], 0;
+    /// s_waitcnt; v_mov_b32 v1, vcc_lo; buffer_store_format_x v1, v0,
+    /// s[0:3], 0 idxen; s_endpgm. A move of another SGPR is no fill.
+    #[test]
+    fn the_loaded_key_fill_kernel_is_a_constant_fill() {
+        let words = [0xd746_0000u32, 0x0401_0c08, 0xf420_1a82, 0xfa00_0000, 0xbf8c_c07f, 0x7e02_026a, 0xe010_2000, 0x8000_0100, 0xbf81_0000];
+        let decode = |w: &[u32]| {
+            let bytes: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+            ps5shader::program::decode_blob(&bytes, 0x14_c00a_3a00).unwrap()
+        };
+        let f = detect_constant_fill(&decode(&words)).expect("a loaded constant fill");
+        assert_eq!((f.group, f.resource, f.loaded), (8, 0, Some((4, 0))));
+        let mut other = words;
+        other[5] = 0x7e02_0269; // v_mov_b32 v1, s105: not the loaded dword
+        assert_eq!(detect_constant_fill(&decode(&other)), None);
+    }
+
+    /// The loaded fill's source is a constant buffer V# with stride 16 and
+    /// NUM_RECORDS 1 (16 bytes; UE5 passes its DCC clear code 0x40404040,
+    /// "clear to 0,0,0,1", this way). The scalar load reads the dword: the
+    /// kernel run in the shader interpreter stores it, and the range the
+    /// fill emulation uses agrees. Counting the records as bytes made the
+    /// dword out of range: the fill wrote clear code 0 (0,0,0,0) instead.
+    #[test]
+    fn a_loaded_fill_reads_through_a_strided_constant_buffer() {
+        use ps5shader::interp::{Machine, Memory};
+        use ps5shader::ssa::{Stage, SystemValue};
+        use ps5shader::translate::{compile, InputValue, TranslateOptions};
+        const SOURCE: u64 = 0x40_0000;
+        let words = [0xd746_0000u32, 0x0401_0c08, 0xf420_1a82, 0xfa00_0000, 0xbf8c_c07f, 0x7e02_026a, 0xe010_2000, 0x8000_0100, 0xbf81_0000];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = ps5shader::program::decode_blob(&bytes, 0x14_c00a_7c00).unwrap();
+        let f = detect_constant_fill(&program).expect("a loaded constant fill");
+        let (_, offset) = f.loaded.unwrap();
+        let mut o = TranslateOptions::with_user_data(64, Stage::Compute, 8);
+        o.sgprs.push((8, InputValue::System(SystemValue::WorkgroupId(0))));
+        o.vgprs = vec![(0, InputValue::System(SystemValue::LocalInvocationId(0)))];
+        let func = compile(&program, &o, None).unwrap().function;
+        for (stride, records) in [(16u32, 1u32), (0, 4), (0, 3), (16, 0)] {
+            let mut user = [0u32; 8];
+            user[0] = OUTPUT as u32;
+            user[1] = 4 << 16;
+            user[2] = 64;
+            user[3] = 0x14204;
+            user[4] = SOURCE as u32;
+            user[5] = stride << 16;
+            user[6] = records;
+            user[7] = 0x4dfac;
+            let mut memory = Memory::default();
+            memory.write_words(SOURCE, &[0x4040_4040, 0, 0, 0]);
+            memory.write_words(OUTPUT, &[0xDEAD_BEEF; 64]);
+            let mut m = Machine::new(64, 64);
+            m.user_data = user.to_vec();
+            m.memory = memory;
+            m.system.insert(SystemValue::LocalInvocationId(0), (0..64).collect());
+            m.system.insert(SystemValue::WorkgroupId(0), vec![0; 64]);
+            m.run(&func).unwrap();
+            let emulated = if offset as u64 + 4 > scalar_buffer_bytes(user[5], user[6]) { 0 } else { 0x4040_4040 };
+            let out = m.memory.read_words(OUTPUT, 64);
+            assert!(out.iter().all(|&w| w == emulated), "stride {stride} records {records}: kernel stored {:#x}, fill emulation {emulated:#x}", out[0]);
+        }
+        assert_eq!(scalar_buffer_bytes(16 << 16, 1), 16, "a stride-16 constant buffer of one record holds 16 bytes");
     }
 }

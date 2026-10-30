@@ -95,6 +95,8 @@ struct Inner {
     deleted: bool,
     waiters: Vec<Waiter>,
     next_waiter: u64,
+    /// Diagnostics: when the semaphore was last signalled.
+    last_signal: Option<Instant>,
 }
 
 impl Inner {
@@ -171,7 +173,7 @@ fn create_with(name: String, fifo: bool, initial: i32, max: i32, targeted: bool)
         targeted,
         initial,
         max,
-        inner: Mutex::new(Inner { count: initial, deleted: false, waiters: Vec::new(), next_waiter: 1 }),
+        inner: Mutex::new(Inner { count: initial, deleted: false, waiters: Vec::new(), next_waiter: 1, last_signal: None }),
         cv: Condvar::new(),
     });
     {
@@ -180,6 +182,16 @@ fn create_with(name: String, fifo: bool, initial: i32, max: i32, targeted: bool)
         SEMAS_GENERATION.bump();
     }
     handle
+}
+
+/// Diagnostics (`RPS5E_HLE_STUCK`): name, count and waiters of a
+/// semaphore.
+pub fn describe(handle: u32) -> Option<String> {
+    let s = get(handle)?;
+    let g = lock_inner(&s);
+    let waiters: Vec<String> = g.waiters.iter().map(|w| format!("{}:{:?}", w.need, w.result)).collect();
+    let last = g.last_signal.map_or("never".to_string(), |t| format!("{:.1} s ago", t.elapsed().as_secs_f64()));
+    Some(format!("'{}' count {} max {} [{}] last signal {last}", s.name, g.count, s.max, waiters.join(" ")))
 }
 
 pub(crate) fn delete(handle: u32) -> bool {
@@ -282,6 +294,7 @@ pub(crate) fn signal(handle: u32, n: i32) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     g.count += n;
+    g.last_signal = Some(Instant::now());
     g.wake_waiters();
     drop(g);
     if !s.targeted {

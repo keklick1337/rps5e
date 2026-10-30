@@ -273,7 +273,7 @@ impl ReplayState {
         // The result is made in the reused scratch (its vectors keep their
         // capacity from draw to draw).
         let mut result = std::mem::take(&mut self.scratch);
-        let mut ran = program.run_into(user_data, inputs.shader_base, &ReplayReader::Resident(resident, has_clean), inputs.gpu_written, &mut self.run, &mut result);
+        let mut ran = program.run_into_with(user_data, inputs.shader_base, &ReplayReader::Resident(resident, has_clean), inputs.gpu_written, inputs.records_room, &mut self.run, &mut result);
         if ran == Err(ReplayAbort::Unreadable) {
             // GPU-written or unmapped words: read them through the
             // synchronising reader.
@@ -281,7 +281,10 @@ impl ReplayState {
                 self.scratch = result;
                 return None;
             };
-            ran = program.run_into(user_data, inputs.shader_base, &ReplayReader::Words(read, inputs.read_clean_memory), inputs.gpu_written, &mut self.run, &mut result);
+            ran = program.run_into_with(user_data, inputs.shader_base, &ReplayReader::Words(read, inputs.read_clean_memory), inputs.gpu_written, inputs.records_room, &mut self.run, &mut result);
+            if !result.blocked.is_empty() {
+                super::replay::note_blocked(program, inputs.shader_base, &result.blocked);
+            }
         }
         if ran.is_err() {
             self.scratch = result;
@@ -464,6 +467,7 @@ impl ResourceMaterializationCache {
             read_resident_memory: inputs.read_resident_memory.map(|_| &resident_record as ResidentReader<'_>),
             reads_clean: inputs.reads_clean,
             gpu_written: inputs.gpu_written,
+            records_room: None,
         };
         let (snapshot, specialization) = match materialize(plan, &recording) {
             Ok(r) => r,

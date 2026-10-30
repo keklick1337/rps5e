@@ -266,6 +266,29 @@ const LAYOUTS_PER_PLAN: usize = 32;
 /// `RPS5E_LAYOUT_INTERN=0`: a specialization handed out again (a new
 /// `Arc` of equal contents, after the materialisation cache dropped its
 /// template) gets a new binding layout (draw recipes and pipeline layouts
+
+/// The room a deferred NUM_RECORDS binding covers at most (bytes).
+const MAX_RECORDS_ROOM: u64 = 1 << 30;
+/// ... and at least, when the mirrors have it.
+const RECORDS_ROOM_MIN: u64 = 64 << 10;
+
+/// `RPS5E_DEFER_RECORDS`: a buffer whose V# NUM_RECORDS is a word GPU work
+/// is still writing, and which the program reads itself, is bound over
+/// the mirror holding its base instead of waiting for the GPU to read the
+/// word on the CPU (`1`: on; default off while measured; `check`: on,
+/// and the word is also read on the CPU to count records past the
+/// binding, `[gpu]` line).
+pub(crate) fn defer_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("RPS5E_DEFER_RECORDS").unwrap_or_default();
+        if v == "check" {
+            ps5shader::resources::RECORDS_CHECK.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        !crate::backend::ab::safe() && (v == "1" || v == "check")
+    })
+}
+
 /// keyed by it miss), and eight layouts are kept per plan.
 pub(crate) fn layout_intern_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1271,10 +1294,34 @@ impl ShaderFrontend {
             note(a, out.len() as u64);
             resident(a, out, clean)
         };
+        // The room of the mirrors from a buffer's base on: a NUM_RECORDS
+        // word GPU work still writes is left to the program, and the
+        // binding covers the mirrored memory from the base on.
+        let records_room = |base: u64, stride: u32, word: u64| -> Option<u64> {
+            let cell = record?;
+            let room = {
+                let g = cell.borrow();
+                g.1.cache().mirrored_end(base, MAX_RECORDS_ROOM)? - base
+            };
+            // The count the word held when it last reached guest memory
+            // (the previous frame's, as a rule): a buffer whose records
+            // then needed more than half the room keeps waiting for the
+            // word (its records may reach past the mirrors).
+            let mut w = [0u8; 4];
+            let stale = if memory.read_backing(word, &mut w) { u32::from_le_bytes(w) as u64 } else { return None };
+            let need = if stride == 0 { stale } else { stale * stride as u64 };
+            // The binding covers twice that (a larger written range costs
+            // write-throughs and CPU faults on every use).
+            let twice = need.saturating_mul(2);
+            (twice <= room).then(|| twice.max(RECORDS_ROOM_MIN).min(room))
+        };
         let mut inputs = ResourceRuntimeInputs::new(user, shader_base);
         // RPS5E_SAFE: such words are read back (synchronous download).
         if !crate::backend::ab::safe() {
             inputs.gpu_written = Some(&gpu_written_noted);
+            if defer_records() && crate::backend::ab::release_fast("RPS5E_DEFER_RECORDS") {
+                inputs.records_room = Some(&records_room);
+            }
         }
         inputs.read_memory = Some(&read_noted);
         inputs.read_clean_memory = Some(&read_clean_noted);

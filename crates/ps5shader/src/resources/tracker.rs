@@ -26,6 +26,13 @@ const SAMPLER_DWORD3_RESERVED_MASK: u32 = 0x3FFF_F000;
 const DENSE_INDIRECT_IMAGE_SHIFT: u32 = 5;
 const MAX_DENSE_INDIRECT_IMAGE_ENTRIES: u32 = 4096;
 
+/// `RPS5E_RUNTIME_BUFFER_RECORDS=0`: a buffer descriptor whose record count
+/// the program computes at run time fails the plan (the pass is skipped).
+fn runtime_records_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_RUNTIME_BUFFER_RECORDS").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
 pub(super) struct TrackResult {
     pub sources: Vec<DescriptorSource>,
     pub info: ShaderResourceInfo,
@@ -362,7 +369,18 @@ impl Tracker<'_> {
         // Image descriptors loaded straight from a scalar buffer at a
         // dynamically uniform offset are evaluated like buffer descriptors;
         // the validator is the single source of truth.
-        let check = if non_contiguous_image { Err((0usize, false)) } else { self.validate_source(&source) };
+        let mut check = if non_contiguous_image { Err((0usize, false)) } else { self.validate_source(&source) };
+        // A buffer whose record count the program computes itself (a counter it
+        // just incremented): the access checks bounds against its own value, so
+        // the host binding only needs the base, bound as unbounded.
+        if expected == ValueKind::BufferHandle && matches!(check, Err((2, _))) && runtime_records_enabled() {
+            let mut unbounded = source.clone();
+            unbounded.dwords[2] = self.plan.graph.constant(u32::MAX);
+            if self.validate_source(&unbounded).is_ok() {
+                source = unbounded;
+                check = Ok(());
+            }
+        }
         if let Err((bad, control_dependent)) = check {
             // A bindless image/sampler descriptor resolving through a
             // control-dependent phi (a hash-table material lookup) has no

@@ -2772,8 +2772,16 @@ fn cb_map_named_flexible_memory(ctx: &mut CpuContext) -> HleResult {
     map_flexible_cb(ctx, name)
 }
 
+/// sceKernelMunmap(addr, len): the munmap system call with the error as an
+/// SCE code, so the range rounds to whole pages like POSIX munmap (the
+/// start down, the end up); a zero length or an overflowing range is
+/// EINVAL.
 fn cb_munmap(ctx: &mut CpuContext) -> HleResult {
-    unmap(ctx.rdi(), ctx.rsi())
+    let (addr, len) = (ctx.rdi(), ctx.rsi());
+    match page_range(addr, len) {
+        Some((start, end)) if len != 0 && end > start => unmap(start, end - start),
+        _ => EINVAL,
+    }
 }
 
 /// sceKernelReleaseFlexibleMemory(addr, len)

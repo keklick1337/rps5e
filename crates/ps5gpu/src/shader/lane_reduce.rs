@@ -38,7 +38,7 @@ struct Reduction {
     spirv: S,
 }
 
-const REDUCTIONS: [Reduction; 7] = [
+const REDUCTIONS: [Reduction; 8] = [
     Reduction { op: Op::UMin, identity: 0xFFFF_FFFF, disjoint: false, spirv: S::GroupNonUniformUMin },
     Reduction { op: Op::UMax, identity: 0, disjoint: false, spirv: S::GroupNonUniformUMax },
     Reduction { op: Op::SMin, identity: 0x7FFF_FFFF, disjoint: false, spirv: S::GroupNonUniformSMin },
@@ -46,6 +46,7 @@ const REDUCTIONS: [Reduction; 7] = [
     Reduction { op: Op::IAdd, identity: 0, disjoint: true, spirv: S::GroupNonUniformIAdd },
     Reduction { op: Op::And, identity: 0xFFFF_FFFF, disjoint: false, spirv: S::GroupNonUniformBitwiseAnd },
     Reduction { op: Op::Or, identity: 0, disjoint: false, spirv: S::GroupNonUniformBitwiseOr },
+    Reduction { op: Op::Xor, identity: 0, disjoint: true, spirv: S::GroupNonUniformBitwiseXor },
 ];
 
 /// Lane-set evaluation of one candidate reduction.

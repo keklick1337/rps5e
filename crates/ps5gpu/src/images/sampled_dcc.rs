@@ -173,24 +173,38 @@ impl ImageCache {
             if !self.needs_upload(id) {
                 return SampledKeys::Stored;
             }
-            // The head first: most surfaces read here are not compressed.
-            let head = bytes.min(64);
-            if buffers.has_gpu_dirty(dcc.address, bytes) {
-                crate::log_once(&format!("ps5gpu: sampled DCC keys {:#x} written by the GPU: fetched", dcc.address));
-                if !buffers.download(sched, dcc.address, bytes) {
-                    return SampledKeys::Stored;
+            // Keys a GPU fill wrote last hold its value: no download.
+            let filled = buffers.has_gpu_dirty(dcc.address, bytes).then(|| buffers.known_fill(dcc.address, bytes));
+            match filled {
+                Some(Some(v)) => {
+                    let b = v as u8;
+                    if v != u32::from_ne_bytes([b; 4]) || !(b == SINGLE || matches!(b, 0x00 | 0x40 | 0x80 | 0xC0)) {
+                        return SampledKeys::Stored;
+                    }
+                    self.stats.known_fill_keys += 1;
+                    b
+                }
+                _ => {
+                    if filled.is_some() {
+                        crate::log_once(&format!("ps5gpu: sampled DCC keys {:#x} written by the GPU: fetched", dcc.address));
+                        if !buffers.download(sched, dcc.address, bytes) {
+                            return SampledKeys::Stored;
+                        }
+                    }
+                    // The head first: most surfaces read here are not compressed.
+                    let head = bytes.min(64);
+                    let mut first = vec![0u8; head as usize];
+                    if !self.memory.read_backing(dcc.address, &mut first) {
+                        return SampledKeys::Stored;
+                    }
+                    let Some(code) = uniform_key(&first).filter(|&c| c == SINGLE || matches!(c, 0x00 | 0x40 | 0x80 | 0xC0)) else { return SampledKeys::Stored };
+                    let mut all = vec![0u8; bytes as usize];
+                    if !self.memory.read_backing(dcc.address, &mut all) || uniform_key(&all) != Some(code) {
+                        return SampledKeys::Stored;
+                    }
+                    code
                 }
             }
-            let mut first = vec![0u8; head as usize];
-            if !self.memory.read_backing(dcc.address, &mut first) {
-                return SampledKeys::Stored;
-            }
-            let Some(code) = uniform_key(&first).filter(|&c| c == SINGLE || matches!(c, 0x00 | 0x40 | 0x80 | 0xC0)) else { return SampledKeys::Stored };
-            let mut all = vec![0u8; bytes as usize];
-            if !self.memory.read_backing(dcc.address, &mut all) || uniform_key(&all) != Some(code) {
-                return SampledKeys::Stored;
-            }
-            code
         };
         let done = match code {
             SINGLE => {

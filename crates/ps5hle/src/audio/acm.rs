@@ -5,9 +5,9 @@
 //! libSceAcm (audio coprocessor DSP batches: FFT, panner, convolution reverb).
 //!
 //! No DSP job is executed. Job builders advance the batch buffer cursor by
-//! the job size (a convolution reverb also clears its outputs, so no stale
-//! samples are played), batch submissions complete immediately with a
-//! cleared error block and a fresh batch id, and waits succeed.
+//! the job size and write nothing else, batch submissions complete
+//! immediately with a cleared error block and a fresh batch id, and waits
+//! succeed.
 
 use super::Export;
 use crate::context::CpuContext;
@@ -117,38 +117,14 @@ fn cb_conv_reverb(ctx: &mut CpuContext) -> HleResult {
     advance_batch_info(ctx, 1024)
 }
 
-/// Output descriptor of a reverb job: samples u32 @0, channels u32 @4,
-/// float* buffers[channels] @0x10.
-const REVERB_OUTPUT_DESCRIPTOR_SIZE: usize = 24;
-const REVERB_MAX_OUTPUTS: u64 = 64;
-const REVERB_MAX_CHANNELS: u32 = 64;
-const REVERB_MAX_SAMPLES: u32 = 65536;
-
-/// sceAcm_ConvReverb_SharedInput(batch, ..., outputCount (rcx), ...,
-/// outputs (first stack argument)): the convolution is not run, so its
-/// output channels are cleared rather than left holding stale samples.
+/// sceAcm_ConvReverb_SharedInput(batch, blockCount, input, count, ir[],
+/// gain, out[] (first stack argument)): the job is only added to the
+/// batch. Its outputs are left as they are: the layout `out[]` points at
+/// is not known, and clearing through a guessed descriptor (sample and
+/// channel counts and a channel table read from the first words) wrote
+/// zeros wherever the audio data in those buffers happened to point —
+/// Wwise heap blocks in SILENT HILL 2, whose allocator then crashed.
 fn cb_conv_reverb_shared_input(ctx: &mut CpuContext) -> HleResult {
-    let count = ctx.rcx() as u32 as u64;
-    let rsp = ctx.get(crate::context::CpuRegister::Rsp);
-    let outputs = ctx.read_u64(rsp + 8).unwrap_or(0);
-    if outputs != 0 {
-        for i in 0..count.min(REVERB_MAX_OUTPUTS) {
-            let Some(d) = ctx.read_u64(outputs + i * 8).filter(|&d| d != 0) else { continue };
-            let Some(desc) = ctx.read_bytes(d, REVERB_OUTPUT_DESCRIPTOR_SIZE) else { continue };
-            let samples = u32::from_le_bytes(desc[0..4].try_into().unwrap());
-            let channels = u32::from_le_bytes(desc[4..8].try_into().unwrap());
-            let buffers = u64::from_le_bytes(desc[16..24].try_into().unwrap());
-            if samples == 0 || samples > REVERB_MAX_SAMPLES || channels == 0 || channels > REVERB_MAX_CHANNELS || buffers == 0 {
-                continue;
-            }
-            let silence = vec![0u8; samples as usize * 4];
-            for c in 0..channels as u64 {
-                if let Some(b) = ctx.read_u64(buffers + c * 8).filter(|&b| b != 0) {
-                    ctx.write_bytes(b, &silence);
-                }
-            }
-        }
-    }
     advance_batch_info(ctx, 1024)
 }
 fn cb_fft(ctx: &mut CpuContext) -> HleResult {
@@ -226,34 +202,34 @@ mod tests {
         assert_eq!(cb_context_destroy(&mut ctx), ERR_BAD_CONTEXT);
     }
 
-    /// A shared-input reverb job clears the channels of its outputs (the
-    /// convolution itself is not run) and advances the batch cursor.
+    /// A shared-input reverb job only advances the batch cursor: buffers
+    /// its output list points at keep their bytes even when their first
+    /// words look like a descriptor (sample count, channel count, channel
+    /// table) that points at other memory.
     #[test]
-    fn conv_reverb_clears_outputs() {
+    fn conv_reverb_writes_no_output() {
         const BASE: u64 = 0x5CE0_7100_0000;
         let base = BASE;
         let vm = crate::sync::test_util::vm_arena(base);
         let mut ctx = CpuContext::new(vm);
-        let (info, stack, list, desc, chans, out0, out1) =
-            (base, base + 0x100, base + 0x200, base + 0x300, base + 0x400, base + 0x500, base + 0x600);
+        let (info, stack, list, out, chans, victim) = (base, base + 0x100, base + 0x200, base + 0x300, base + 0x400, base + 0x500);
         ctx.write_u64(info, base + 0x1000);
         ctx.write_u64(info + 8, 0);
         ctx.write_u64(info + 16, 4096);
         ctx.write_u64(stack + 8, list);
-        ctx.write_u64(list, desc);
-        ctx.write_u32(desc, 4); // samples
-        ctx.write_u32(desc + 4, 2); // channels
-        ctx.write_u64(desc + 16, chans);
-        ctx.write_u64(chans, out0);
-        ctx.write_u64(chans + 8, out1);
-        ctx.write_bytes(out0, &[0x7F; 32]);
-        ctx.write_bytes(out1, &[0x7F; 32]);
+        ctx.write_u64(list, out);
+        ctx.write_u32(out, 4);
+        ctx.write_u32(out + 4, 1);
+        ctx.write_u64(out + 16, chans);
+        ctx.write_u64(chans, victim);
+        ctx.write_bytes(victim, &[0x7F; 32]);
+        let before = ctx.read_bytes(out, 24).unwrap();
         ctx.set(CpuRegister::Rdi, info);
         ctx.set(CpuRegister::Rcx, 1);
         ctx.set(CpuRegister::Rsp, stack);
         assert_eq!(cb_conv_reverb_shared_input(&mut ctx), 0);
-        assert_eq!(ctx.read_bytes(out0, 32).unwrap(), [vec![0; 16], vec![0x7F; 16]].concat(), "4 float samples");
-        assert_eq!(ctx.read_bytes(out1, 16).unwrap(), vec![0; 16]);
+        assert_eq!(ctx.read_bytes(victim, 32).unwrap(), vec![0x7F; 32], "memory the output words point at");
+        assert_eq!(ctx.read_bytes(out, 24).unwrap(), before);
         assert_eq!(ctx.read_u64(info + 8), Some(1024));
     }
 }

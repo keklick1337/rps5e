@@ -90,7 +90,7 @@ pub use info::*;
 pub use materialize::*;
 pub use memory::*;
 pub use pixel_inputs::resolve_pixel_input_locations;
-pub use replay::{ReplayAbort, ReplayProgram, ReplayReader, ReplayResult, ReplayScratch};
+pub use replay::{note_blocked, RecordsRoom, ReplayAbort, ReplayProgram, ReplayReader, ReplayResult, ReplayScratch, BLOCKED_READS, RECORDS_CHECK, RECORDS_STATS, WHY_BLOCKED};
 pub use plan::{IndirectImageAccess, PlanOptions, ShaderResourcePlan, WRITTEN_RANGE_DWORD_COUNT};
 pub use request::*;
 pub use selector::{IndirectSelectorDiagnostic, IndirectSelectorValues};

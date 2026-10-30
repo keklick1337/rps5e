@@ -1168,7 +1168,7 @@ fn all_zero_position_clips_its_primitive() {
 /// 32-lane host never has) are not read.
 #[test]
 fn pixel_wave_reduction_reads_become_subgroup_reductions() {
-    for (vector, scalar, identity, op) in [(0x2600_0000u32, 0x8380_0000u32, 0xffff_ffffu32, Op::GroupNonUniformUMin), (0x4a00_0000, 0x8000_0000, 0, Op::GroupNonUniformIAdd)] {
+    for (vector, scalar, identity, op) in [(0x2600_0000u32, 0x8380_0000u32, 0xffff_ffffu32, Op::GroupNonUniformUMin), (0x4a00_0000, 0x8000_0000, 0, Op::GroupNonUniformIAdd), (0x3a00_0000, 0x8900_0000, 0, Op::GroupNonUniformBitwiseXor)] {
         let dpp = vector | 0x001a_1afa;
         let code = vec![
             0x7e040f00, 0x7e060f01, 0xd5430006, 0x0409ff03, 0x000000c0, 0x7e120506, 0xd569000b, 0x0001ff06, 0x9e3779b1, 0x2c161696, 0xbe98047e, 0x879a187e,

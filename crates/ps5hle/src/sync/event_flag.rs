@@ -45,6 +45,8 @@ struct Inner {
     /// with clear modes the first waiter wins.
     waiters: Vec<Waiter>,
     next_waiter: u64,
+    /// Diagnostics: when bits were last set, and which.
+    last_set: Option<(Instant, u64)>,
 }
 
 struct Waiter {
@@ -135,11 +137,20 @@ pub(crate) fn create(name: String, attr: u32, init: u64) -> u64 {
     let f = Arc::new(EventFlag {
         name,
         attr,
-        inner: Mutex::new(Inner { bits: init, waiting: 0, cancel_epoch: 0, deleted: false, waiters: Vec::new(), next_waiter: 0 }),
+        inner: Mutex::new(Inner { bits: init, waiting: 0, cancel_epoch: 0, deleted: false, waiters: Vec::new(), next_waiter: 0, last_set: None }),
         cv: Condvar::new(),
     });
     table(|t| t.insert(handle, f));
     handle
+}
+
+/// Diagnostics (`RPS5E_HLE_STUCK`): name, bits and waiters of a flag.
+pub fn describe(handle: u64) -> Option<String> {
+    let f = get(handle)?;
+    let g = f.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let waiters: Vec<String> = g.waiters.iter().map(|w| format!("{:#x}/{:#x}{}", w.pattern, w.mode, if w.result.is_some() { "*" } else { "" })).collect();
+    let last = g.last_set.map_or("never".to_string(), |(t, p)| format!("{p:#x} {:.1} s ago", t.elapsed().as_secs_f64()));
+    Some(format!("'{}' attr {:#x} bits {:#x} waiting {} [{}] last set {last}", f.name, f.attr, g.bits, g.waiting, waiters.join(" ")))
 }
 
 pub(crate) fn delete(handle: u64) -> bool {
@@ -154,6 +165,7 @@ pub(crate) fn set(handle: u64, pattern: u64) -> HleResult {
     let Some(f) = get(handle) else { return ERR_NOT_FOUND };
     let mut g = f.inner.lock().unwrap();
     g.bits |= pattern;
+    g.last_set = Some((Instant::now(), pattern));
     let mut bits = g.bits;
     let mut woke = false;
     for w in g.waiters.iter_mut() {

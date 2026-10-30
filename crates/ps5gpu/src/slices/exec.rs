@@ -439,10 +439,10 @@ impl RenderExecutor for SliceExecutor {
         // draws and transfers before it were recorded.
         let pending = self.pending.clone();
         let serial = pending.add(addr, data.len() as u64, Some(EventData::Bytes(data.to_vec())));
+        let bytes = data.to_vec();
         self.event(
             Entry::Call(Box::new(move || {
-                crate::backend::publish_point();
-                write();
+                crate::backend::ordered_cp_write(addr, &bytes, write);
                 pending.remove(serial);
             })),
             None,

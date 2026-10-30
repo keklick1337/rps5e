@@ -440,11 +440,21 @@ pub fn stencil_op(op: u32, write_mask: u32, op_value: u32) -> vk::StencilOp {
                 S::REPLACE
             }
         }
-        5 => S::INCREMENT_AND_CLAMP,
-        6 => S::DECREMENT_AND_CLAMP,
+        // ADD / SUB (clamp or wrap) add or subtract the operation value:
+        // 0 keeps the value, 1 is the host's increment / decrement.
+        5 | 6 | 8 | 9 if op_value == 0 && stencil_add_opval_enabled() => S::KEEP,
+        5 | 6 | 8 | 9 => {
+            if op_value != 1 && stencil_add_opval_enabled() {
+                unsupported_stencil("add/subtract of an operation value other than 0 or 1 (drawn as 1)");
+            }
+            match op & 0xF {
+                5 => S::INCREMENT_AND_CLAMP,
+                6 => S::DECREMENT_AND_CLAMP,
+                8 => S::INCREMENT_AND_WRAP,
+                _ => S::DECREMENT_AND_WRAP,
+            }
+        }
         7 => S::INVERT,
-        8 => S::INCREMENT_AND_WRAP,
-        9 => S::DECREMENT_AND_WRAP,
         12 => {
             if write_mask & op_value == 0 {
                 S::KEEP
@@ -463,6 +473,13 @@ pub fn stencil_op(op: u32, write_mask: u32, op_value: u32) -> vk::StencilOp {
             S::KEEP
         }
     }
+}
+
+/// `RPS5E_STENCIL_ADD_OPVAL=0`: the stencil ADD / SUB operations always
+/// step by one, whatever DB_STENCILREFMASK.STENCILOPVAL holds.
+fn stencil_add_opval_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_STENCIL_ADD_OPVAL").is_ok_and(|v| v == "0"))
 }
 
 /// `RPS5E_STENCIL_LOGIC=0`: the stencil logic operations AND, OR and XNOR
@@ -1221,6 +1238,14 @@ mod tests {
     fn stencil_and_blend_tables() {
         assert_eq!(stencil_op(3, 0xFF, 0), vk::StencilOp::REPLACE);
         assert_eq!(stencil_op(5, 0, 0), vk::StencilOp::KEEP);
+        // ADD / SUB step by STENCILOPVAL: 0 changes nothing, 1 is the
+        // host increment / decrement.
+        assert_eq!(stencil_op(5, 0xFF, 0), vk::StencilOp::KEEP);
+        assert_eq!(stencil_op(9, 0xFF, 0), vk::StencilOp::KEEP);
+        assert_eq!(stencil_op(5, 0xFF, 1), vk::StencilOp::INCREMENT_AND_CLAMP);
+        assert_eq!(stencil_op(6, 0xFF, 1), vk::StencilOp::DECREMENT_AND_CLAMP);
+        assert_eq!(stencil_op(8, 0xFF, 1), vk::StencilOp::INCREMENT_AND_WRAP);
+        assert_eq!(stencil_op(9, 0xFF, 1), vk::StencilOp::DECREMENT_AND_WRAP);
         assert_eq!(blend_factor(5), vk::BlendFactor::ONE_MINUS_SRC_ALPHA);
         assert_eq!(blend_op(4), vk::BlendOp::REVERSE_SUBTRACT);
         assert_eq!(compare_op(3), vk::CompareOp::LESS_OR_EQUAL);

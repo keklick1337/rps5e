@@ -184,7 +184,15 @@ pub mod rewrites {
     /// otherwise, as the lazy arm of a select
     /// ([`crate::ssa::Function::lazy_selects`]).
     pub const HALF_FMA_FAST: u32 = 1 << 4;
-    pub const ALL: u32 = LEAN_FLUSH | LANE_ACTIVE_EXEC | FLUSH_ELISION | FLOAT_CLASS_COMPARE | HALF_FMA_FAST;
+    /// Not an optimisation: s_cbranch_execz/execnz look only at the lanes
+    /// the host runs (present at entry). The guest may enable every lane
+    /// of its wave (`s_mov_b64 exec, -1`); on the hardware those lanes
+    /// exist and clear their bits again, here a lane the host lacks (a
+    /// partial wave, wave64 on a 32-lane host) never does, and a waterfall
+    /// loop waiting for EXEC to empty would never end. The EXEC words keep
+    /// the guest's bits (the hardware reads them back as written).
+    pub const PRESENT_EXEC: u32 = 1 << 5;
+    pub const ALL: u32 = LEAN_FLUSH | LANE_ACTIVE_EXEC | FLUSH_ELISION | FLOAT_CLASS_COMPARE | HALF_FMA_FAST | PRESENT_EXEC;
 }
 
 /// Bits of [`TranslateOptions::float_rules`].
@@ -486,6 +494,7 @@ pub fn translate_structured(program: &Program, structured: &Structured, options:
         float_mode: options.float_mode,
         round: rounding::RoundState { value: options.float_mode.mode & rounding::ROUND_BITS, unknown: 0 },
         entry_rounding,
+        present: None,
     };
     t.prologue();
     let open = t.emit_node(&structured.tree)?;
@@ -536,6 +545,9 @@ pub(crate) struct Translator<'a> {
     pub round: rounding::RoundState,
     /// The round fields at the entry of each CFG block.
     entry_rounding: Vec<rounding::RoundState>,
+    /// The ballot words of the lanes present at entry, which EXEC branches
+    /// test ([`rewrites::PRESENT_EXEC`]).
+    present: Option<(Value, Value)>,
 }
 
 impl<'a> Translator<'a> {
@@ -588,7 +600,18 @@ impl<'a> Translator<'a> {
         let hi = if self.wave64() { hi } else { self.b().u32(0) };
         self.b().set_reg(Reg::Sgpr(Reg::EXEC), lo);
         self.b().set_reg(Reg::Sgpr(Reg::EXEC + 1), hi);
+        if opts.rewrites & rewrites::PRESENT_EXEC != 0 {
+            self.present = Some(match opts.initial_exec {
+                InitialExec::All => (lo, hi),
+                InitialExec::NotSystem(_) => {
+                    let all = self.b().bool(true);
+                    self.b().ballot(all)
+                }
+            });
+        }
     }
+
+
 
     fn input_value(&mut self, input: InputValue) -> Value {
         match input {
@@ -729,7 +752,7 @@ impl<'a> Translator<'a> {
             }
             BranchCond::Vccz | BranchCond::Vccnz | BranchCond::Execz | BranchCond::Execnz => {
                 let base = if matches!(cond, BranchCond::Vccz | BranchCond::Vccnz) { Reg::VCC } else { Reg::EXEC };
-                let zero = self.mask_is_zero(base);
+                let zero = self.mask_words_zero(base, base == Reg::EXEC);
                 if matches!(cond, BranchCond::Vccz | BranchCond::Execz) {
                     zero
                 } else {
@@ -747,9 +770,22 @@ impl<'a> Translator<'a> {
 
     /// Whether the lane mask starting at SGPR `base` is zero (wave-wide).
     pub fn mask_is_zero(&mut self, base: u8) -> Value {
-        let lo = self.b().get_reg(Reg::Sgpr(base));
+        self.mask_words_zero(base, false)
+    }
+
+    /// [`Self::mask_is_zero`]; with `present_only` (an EXEC branch) only the
+    /// bits of the lanes present at entry count ([`rewrites::PRESENT_EXEC`]).
+    fn mask_words_zero(&mut self, base: u8, present_only: bool) -> Value {
+        let present = if present_only { self.present } else { None };
+        let mut lo = self.b().get_reg(Reg::Sgpr(base));
+        if let Some((p, _)) = present {
+            lo = self.b().and(lo, p);
+        }
         let word = if self.wave64() {
-            let hi = self.b().get_reg(Reg::Sgpr(base + 1));
+            let mut hi = self.b().get_reg(Reg::Sgpr(base + 1));
+            if let Some((_, p)) = present {
+                hi = self.b().and(hi, p);
+            }
             self.b().or(lo, hi)
         } else {
             lo

@@ -240,6 +240,35 @@ pub fn thin_surface(mode: u32, bytes_per_element: usize, width: u32, height: u32
     Some((pitch, height.div_ceil(bh) as usize * (pitch / bw) as usize * bb))
 }
 
+/// Bytes of one slice of a thin `width` x `height` surface of `mode` with
+/// `samples` samples per pixel. A block keeps its size and holds the
+/// samples of fewer pixels: per doubling of the sample count the block
+/// halves in width first, then in height (GFX10 thin block dimensions;
+/// every block size here has an even log2). `samples` 1 is
+/// [`thin_surface`]; linear surfaces and unknown modes take `samples`
+/// copies of the one-sample slice.
+pub fn thin_surface_bytes(mode: u32, bytes_per_element: usize, width: u32, height: u32, samples: u32) -> Option<usize> {
+    let one = thin_surface(mode, bytes_per_element, width, height)?.1;
+    let samples = samples.max(1);
+    if samples == 1 {
+        return Some(one);
+    }
+    let Some((bw, bh, bb)) = thin_block_extent(mode, bytes_per_element).filter(|_| samples.is_power_of_two() && msaa_blocks_enabled()) else {
+        return Some(one * samples as usize);
+    };
+    let log2 = samples.trailing_zeros();
+    let (q, r) = (log2 >> 1, log2 & 1);
+    let (bw, bh) = ((bw >> (q + r)).max(1), (bh >> q).max(1));
+    Some(width.div_ceil(bw) as usize * height.div_ceil(bh) as usize * bb)
+}
+
+/// `RPS5E_MSAA_BLOCKS=0`: multisampled surfaces span `samples` one-sample
+/// surfaces (padded to the one-sample block) instead of their own blocks.
+fn msaa_blocks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_MSAA_BLOCKS").is_ok_and(|v| v == "0"))
+}
+
 /// Resolved addressing for one (mode, element size, pitch) combination.
 #[derive(Clone, Debug)]
 pub struct DetileParams {
@@ -522,6 +551,18 @@ pub fn tile(p: &DetileParams, linear: &[u8], tiled: &mut [u8], width: u32, heigh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Multisampled thin blocks: 64 KiB of 4-byte elements is 128x128 at
+    /// one sample, 64x128 at two, 64x64 at four, 32x64 at eight.
+    #[test]
+    fn multisampled_blocks_shrink_width_first() {
+        assert_eq!(thin_surface_bytes(SWIZZLE_64KB_S, 4, 1920, 1080, 1), Some(1920 * 1152 * 4));
+        assert_eq!(thin_surface_bytes(SWIZZLE_64KB_S, 4, 1920, 1080, 4), Some(1920 * 1088 * 16));
+        assert_eq!(thin_surface_bytes(SWIZZLE_64KB_S, 4, 100, 100, 2), Some(2 * 65536));
+        assert_eq!(thin_surface_bytes(SWIZZLE_64KB_S, 4, 40, 70, 8), Some(2 * 2 * 65536));
+        // Linear: samples copies.
+        assert_eq!(thin_surface_bytes(SWIZZLE_LINEAR, 4, 64, 2, 2), Some(64 * 2 * 4 * 2));
+    }
 
     fn synth(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8).collect()

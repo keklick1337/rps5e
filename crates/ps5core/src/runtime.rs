@@ -173,6 +173,14 @@ pub fn start_stats_reporter() {
                 log::info!("[hle] imports={} rate={rate:.0}/s emulated instructions: {}", now.1, emulated.join(" "));
             }
             last = now;
+            for line in crate::dispatcher::stuck::report(std::time::Duration::from_secs(5)) {
+                log::info!("[hle] stuck: {line}");
+            }
+            if crate::dispatcher::stuck::enabled() {
+                for line in crate::dispatcher::stuck::busy_report() {
+                    log::info!("[hle] busy: {line}");
+                }
+            }
         }
     });
 }

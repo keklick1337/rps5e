@@ -242,6 +242,10 @@ pub struct BufferCache {
     /// The exact ranges GPU work wrote and the write-throughs landing them
     /// (descriptor reads next to newer writes, see [`Self::download_window`]).
     written_words: written_words::WrittenWords,
+    /// Ranges whose mirror bytes the last GPU write of them set to one
+    /// 32-bit value: a fill ([`Self::fill`]) no other GPU write overlapped
+    /// since (start -> (end, value), see [`Self::known_fill`]).
+    known_fills: BTreeMap<u64, (u64, u32)>,
     /// Tick of the last write-through recorded.
     last_through_tick: u64,
     /// GPU-written ranges to write through at the next submit (or CPU
@@ -535,6 +539,13 @@ fn readback_any_size_enabled() -> bool {
     crate::backend::ab::new_fast() && *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_READBACK_ANY_SIZE"))
 }
 
+/// `RPS5E_UNMAP_WHOLE_BUFFERS=0`: an unmap downloads the GPU-dirty pages of
+/// the unmapped range only, not of the whole buffers it drops.
+fn unmap_whole_buffers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_UNMAP_WHOLE_BUFFERS").is_ok_and(|v| v == "0"))
+}
+
 /// Bytes of the aligned window whose GPU-written pages a CPU read of a
 /// GPU-written descriptor word downloads (`RPS5E_DESC_WINDOW_KIB`, default
 /// 1024; 0: the word's page only).
@@ -542,6 +553,15 @@ fn descriptor_window() -> u64 {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let w = *V.get_or_init(|| parse_descriptor_window(std::env::var("RPS5E_DESC_WINDOW_KIB").ok().as_deref()));
     if crate::backend::ab::new_fast() { w } else { 0 }
+}
+
+/// `RPS5E_KNOWN_FILLS=0`: the value of a GPU fill is not remembered, so a
+/// CPU decision on the filled bytes (sampled DCC keys) downloads them. On
+/// by default; A/B in one run with `RPS5E_AB_SCOPE=release
+/// RPS5E_AB_ONLY=known-fills`.
+fn known_fills_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_KNOWN_FILLS")) && crate::backend::ab::release_fast("known-fills")
 }
 
 /// `RPS5E_WRITTEN_WORDS=0`: a descriptor read waits for the newest
@@ -673,6 +693,7 @@ impl BufferCache {
             zero_copy: zero_copy_enabled(),
             written_through: through::ThroughSpans::default(),
             written_words: Default::default(),
+            known_fills: BTreeMap::new(),
             last_through_tick: 0,
             pending_through: Vec::new(),
             unpublished_through: Vec::new(),
@@ -737,6 +758,23 @@ impl BufferCache {
         // `addr` names the only candidate.
         let k = *self.page_index.find(addr >> CACHING_PAGE_BITS)?;
         (k != 0 && self.buffers.get(&k).is_some_and(|b| b.contains(addr, size))).then_some(k)
+    }
+
+    /// The end of the run of buffers that mirror guest memory from `addr`
+    /// on without a gap (the buffer holding `addr`, then each buffer that
+    /// starts where the previous one ends), at most `limit` bytes past
+    /// `addr`. None when no buffer holds `addr`.
+    pub fn mirrored_end(&self, addr: u64, limit: u64) -> Option<u64> {
+        let b = self.get(self.find_containing(addr, 4)?)?;
+        let cap = addr.saturating_add(limit);
+        let mut end = b.addr + b.size;
+        while end < cap {
+            match self.buffers.range(end..).next() {
+                Some((_, n)) if n.addr == end => end = n.addr + n.size,
+                _ => break,
+            }
+        }
+        Some(end.min(cap))
     }
 
     /// Point the caching pages of `[addr, addr+size)` at buffer `key`
@@ -1090,6 +1128,7 @@ impl BufferCache {
             // GPU work may change these pages after any write-through.
             self.forget_written_through(addr, size);
             self.written_words.written(addr, size);
+            self.forget_fills(addr, size);
         }
         // Written ranges the CPU may poll are written through to guest
         // memory after the work: small ranges whole, of a large range only
@@ -1303,7 +1342,39 @@ impl BufferCache {
         sched.full_barrier();
         self.write_through(sched, dst, size);
         self.stats.gpu_fills += 1;
+        if known_fills_enabled() {
+            if self.known_fills.len() >= 4096 {
+                self.known_fills.clear();
+            }
+            self.known_fills.insert(dst, (dst + size, value));
+        }
         Ok(true)
+    }
+
+    /// The 32-bit value every dword of `[addr, addr+size)` holds in the
+    /// mirror when the last GPU write over the range was one fill covering
+    /// all of it (`RPS5E_KNOWN_FILLS`): a CPU decision on those bytes (DCC
+    /// keys of a sampled image) needs no download then. None when unknown.
+    pub fn known_fill(&self, addr: u64, size: u64) -> Option<u32> {
+        if !known_fills_enabled() {
+            return None;
+        }
+        let (_, &(end, value)) = self.known_fills.range(..=addr).next_back()?;
+        (end >= addr + size).then_some(value)
+    }
+
+    /// GPU work writes `[addr, addr+size)`: fills over it are no longer
+    /// what the mirror holds.
+    fn forget_fills(&mut self, addr: u64, size: u64) {
+        if self.known_fills.is_empty() {
+            return;
+        }
+        let end = addr + size;
+        let first = self.known_fills.range(..addr).next_back().filter(|(_, &(e, _))| e > addr).map(|(&k, _)| k);
+        let keys: Vec<u64> = first.into_iter().chain(self.known_fills.range(addr..end).map(|(&k, _)| k)).collect();
+        for k in keys {
+            self.known_fills.remove(&k);
+        }
     }
 
     /// A command-processor write of `data` to guest memory executed on the
@@ -2007,8 +2078,6 @@ impl BufferCache {
         ok
     }
 
-    /// Download every GPU-dirty page and forget the buffers overlapping
-    /// `[addr, addr+size)` (the guest unmapped the range).
     /// Before a frame capture: every buffer's GPU
     /// results reach guest memory and the buffer goes. Returns the
     /// buffers dropped.
@@ -2020,10 +2089,22 @@ impl BufferCache {
         ranges.len()
     }
 
+    /// Download every GPU-dirty page of the buffers overlapping
+    /// `[addr, addr+size)` and forget them (the guest unmapped the range).
     pub fn unmap(&mut self, sched: &mut Scheduler, addr: u64, size: u64) {
-        self.download(sched, addr, size);
+        // The buffers overlapping the range go whole (they are 16 KiB
+        // aligned and merged across neighbouring allocations), so the GPU
+        // data they hold outside the range is downloaded too: the mirror is
+        // its only copy (`RPS5E_UNMAP_WHOLE_BUFFERS=0`: the range only).
+        let (lo, hi) = if unmap_whole_buffers_enabled() {
+            self.overlapping(addr, addr + size).iter().filter_map(|k| self.buffers.get(k)).fold((addr, addr + size), |(lo, hi), b| (lo.min(b.addr), hi.max(b.addr + b.size)))
+        } else {
+            (addr, addr + size)
+        };
+        self.download(sched, lo, hi - lo);
         self.forget_written_through(addr, size);
         self.written_words.forget(addr, size);
+        self.forget_fills(addr, size);
         self.settling.retain(|&(s, e, _)| e <= addr || s >= addr + size);
         self.pending_through.retain(|&(a, n)| a + n <= addr || a >= addr + size);
         self.readback.remove(addr, size);

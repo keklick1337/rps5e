@@ -421,6 +421,13 @@ pub fn decode_clear_color(format: vk::Format, words: [u32; 2]) -> Option<vk::Cle
             (packed & 0x3FF) as f32 / 1023.0,
             ((packed >> 30) & 3) as f32 / 3.0,
         ],
+        // Packed 16-bit formats: the fields of the host format, which
+        // stores the guest's bits unchanged.
+        F::B5G6R5_UNORM_PACK16 => [(packed & 0x1F) as f32 / 31.0, ((packed >> 5) & 0x3F) as f32 / 63.0, ((packed >> 11) & 0x1F) as f32 / 31.0, 1.0],
+        F::R5G6B5_UNORM_PACK16 => [((packed >> 11) & 0x1F) as f32 / 31.0, ((packed >> 5) & 0x3F) as f32 / 63.0, (packed & 0x1F) as f32 / 31.0, 1.0],
+        F::R5G5B5A1_UNORM_PACK16 => [((packed >> 11) & 0x1F) as f32 / 31.0, ((packed >> 6) & 0x1F) as f32 / 31.0, ((packed >> 1) & 0x1F) as f32 / 31.0, (packed & 1) as f32],
+        F::A1R5G5B5_UNORM_PACK16 => [((packed >> 10) & 0x1F) as f32 / 31.0, ((packed >> 5) & 0x1F) as f32 / 31.0, (packed & 0x1F) as f32 / 31.0, ((packed >> 15) & 1) as f32],
+        F::R4G4B4A4_UNORM_PACK16 => [((packed >> 12) & 0xF) as f32 / 15.0, ((packed >> 8) & 0xF) as f32 / 15.0, ((packed >> 4) & 0xF) as f32 / 15.0, (packed & 0xF) as f32 / 15.0],
         F::A2B10G10R10_UINT_PACK32 => return uint([packed & 0x3FF, (packed >> 10) & 0x3FF, (packed >> 20) & 0x3FF, packed >> 30]),
         F::B10G11R11_UFLOAT_PACK32 => [small_ufloat(packed, 6), small_ufloat(packed >> 11, 6), small_ufloat(packed >> 22, 5), 1.0],
         F::R16G16B16A16_SFLOAT => halves(&half),
@@ -453,7 +460,9 @@ pub fn supports_dcc_fixed_clear(format: vk::Format) -> bool {
             | F::A2B10G10R10_UNORM_PACK32
             | F::A2R10G10B10_UNORM_PACK32
             | F::R5G6B5_UNORM_PACK16
+            | F::B5G6R5_UNORM_PACK16
             | F::A1R5G5B5_UNORM_PACK16
+            | F::R5G5B5A1_UNORM_PACK16
             | F::R4G4B4A4_UNORM_PACK16
             | F::R16_UNORM
             | F::R16G16_UNORM
@@ -503,7 +512,7 @@ fn fixed_clear_components(format: vk::Format) -> usize {
     match format {
         F::R8_UNORM | F::R16_UNORM | F::R16_SFLOAT | F::R32_SFLOAT => 1,
         F::R8G8_UNORM | F::R16G16_UNORM | F::R16G16_SFLOAT | F::R32G32_SFLOAT => 2,
-        F::R5G6B5_UNORM_PACK16 | F::B10G11R11_UFLOAT_PACK32 => 3,
+        F::R5G6B5_UNORM_PACK16 | F::B5G6R5_UNORM_PACK16 | F::B10G11R11_UFLOAT_PACK32 => 3,
         _ => 4,
     }
 }
@@ -535,7 +544,8 @@ pub fn decode_dcc_clear(code: u8, format: vk::Format, register: Option<vk::Clear
     }
     match format {
         F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB | F::A2R10G10B10_UNORM_PACK32 | F::A1R5G5B5_UNORM_PACK16 | F::R5G6B5_UNORM_PACK16 => c.swap(0, 2),
-        F::R4G4B4A4_UNORM_PACK16 => c.reverse(),
+        // Alpha in the low bits, red in the high bits.
+        F::R4G4B4A4_UNORM_PACK16 | F::R5G5B5A1_UNORM_PACK16 => c.reverse(),
         _ => {}
     }
     Some(vk::ClearColorValue { float32: c })
@@ -634,6 +644,24 @@ mod tests {
         let f = render_target_format(5, number_type::FLOAT, order::REVERSED).unwrap();
         assert_eq!(f.export_mapping, ComponentMap::GR);
         assert!(render_target_format(0, 0, 0).is_none());
+    }
+
+    /// Register and DCC fixed clears of packed 16-bit targets (5_6_5 is
+    /// stored as B5G6R5, 1_5_5_5 as R5G5B5A1).
+    #[test]
+    fn packed16_clear_values_decode() {
+        let f = |c: vk::ClearColorValue| unsafe { c.float32 };
+        // Red only: X (R) in the low five bits.
+        assert_eq!(f(decode_clear_color(vk::Format::B5G6R5_UNORM_PACK16, [0x001F, 0]).unwrap()), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(f(decode_clear_color(vk::Format::B5G6R5_UNORM_PACK16, [0xF800, 0]).unwrap()), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(f(decode_clear_color(vk::Format::R5G5B5A1_UNORM_PACK16, [0x0001, 0]).unwrap()), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(f(decode_clear_color(vk::Format::R5G5B5A1_UNORM_PACK16, [0xF800, 0]).unwrap()), [1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(f(decode_clear_color(vk::Format::A1R5G5B5_UNORM_PACK16, [0x8000, 0]).unwrap()), [0.0, 0.0, 0.0, 1.0]);
+        // DCC fixed clears: opaque white, and transparent black with the
+        // alpha flag in the first memory component (1_5_5_5).
+        assert_eq!(f(decode_dcc_clear(0xC0, vk::Format::B5G6R5_UNORM_PACK16, None, true).unwrap())[..3], [1.0; 3]);
+        assert_eq!(f(decode_dcc_clear(0x40, vk::Format::R5G5B5A1_UNORM_PACK16, None, false).unwrap()), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(f(decode_dcc_clear(0x80, vk::Format::R5G5B5A1_UNORM_PACK16, None, false).unwrap()), [1.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]

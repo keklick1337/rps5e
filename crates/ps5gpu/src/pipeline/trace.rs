@@ -197,8 +197,14 @@ fn decoder(format: vk::Format) -> Option<(u32, fn(&[u8]) -> [f32; 4])> {
 
 /// The leading dwords of a guest range as ` [hex...]` (empty when the
 /// range is not readable). Debug aid: shows constants and vertex records.
+/// `RPS5E_FRAME_TRACE_WORDS=<bytes>`: how much of each buffer is shown
+/// (default 0x60).
 pub fn guest_words(addr: u64, size: u64) -> String {
-    let n = (size / 4) as usize;
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("RPS5E_FRAME_TRACE_WORDS").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), if v.starts_with("0x") { 16 } else { 10 }).ok()).unwrap_or(0x60)
+    });
+    let n = (size.min(limit) / 4) as usize;
     let mut words = vec![0u8; n * 4];
     if n == 0 || !crate::memory::global().read_backing(addr, &mut words) {
         return String::new();
@@ -268,6 +274,14 @@ pub fn dump_last_only() -> bool {
 fn raw_dumps() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("RPS5E_FRAME_TRACE_RAW").is_ok_and(|v| v == "1"))
+}
+
+/// `RPS5E_FRAME_TRACE_BITS=1`: also write the texel bytes of layer 0 as
+/// `<seq>_<kind>_<addr>_<w>x<h>_<bytes per texel>.bin` (the bits a view
+/// of another format reads, which the decoded dump does not keep).
+fn raw_bits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_FRAME_TRACE_BITS").is_ok_and(|v| v == "1"))
 }
 
 fn is_8bit(f: vk::Format) -> bool {
@@ -344,6 +358,11 @@ pub fn dump_image(dev: &Arc<GpuDevice>, sched: &mut Scheduler, images: &mut Imag
         log(&format!("  {what} {:#x} slice means: {}", key.addr(), means.join(" ")));
     }
     let bytes = &all[..size as usize];
+    if raw_bits() {
+        if let Some(dir) = &c.dir {
+            let _ = std::fs::write(dir.join(format!("{seq:04}_{what}_{:x}_{w}x{h}_{}.bin", key.addr(), bpp)), bytes);
+        }
+    }
     let step = w.div_ceil(dump_width()).max(1);
     let (ow, oh) = (w.div_ceil(step), h.div_ceil(step));
     let mut lo = [f32::INFINITY; 4];

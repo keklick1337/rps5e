@@ -338,6 +338,26 @@ impl BufferStore for MapLog {
     }
 }
 
+/// A mapping onto the bytes a range already shows changes nothing for the
+/// caches: only the parts that were not mapped there (or showed other
+/// bytes) are reported as mapped.
+#[test]
+fn remap_onto_the_same_bytes_is_not_new_contents() {
+    use crate::testutil::{map_guest, remap_guest, unmap_guest};
+    let mem = test_memory();
+    let (view, _) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let log = Arc::new(MapLog(std::sync::Mutex::new(Vec::new())));
+    mem.attach(log.clone(), Arc::new(NoImages), Arc::new(NoUnmap));
+    unmap_guest(mem, view + 2 * PAGE_BYTES, PAGE_BYTES);
+    log.0.lock().unwrap().clear();
+    map_guest(mem, view, 4 * PAGE_BYTES);
+    assert_eq!(*log.0.lock().unwrap(), vec![(view + 2 * PAGE_BYTES, PAGE_BYTES)]);
+    // Other bytes in place: reported.
+    log.0.lock().unwrap().clear();
+    remap_guest(mem, view, PAGE_BYTES, 8 * PAGE_BYTES);
+    assert_eq!(*log.0.lock().unwrap(), vec![(view, PAGE_BYTES)]);
+}
+
 /// A finite buffer over a partially resident range keeps the committed
 /// pages past an uncommitted hole (they read through the binding, the hole
 /// as zeros); a range ending in the hole, an oversized descriptor and an

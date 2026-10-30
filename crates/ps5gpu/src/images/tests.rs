@@ -783,7 +783,9 @@ fn alias_refills_from_a_newer_image_with_cpu_written_pages() {
     unsafe { std::ptr::write_volatile((addr + off) as *mut u32, 0x0102_0304) };
     assert!(images.needs_refresh(texture));
     assert!(images.prepare(&mut sched, &mut buffers, texture, false));
-    assert_eq!(images.stats().merges, 1, "the target took the written page first");
+    // The written page was taken from memory: merged into the target
+    // first, or laid over its bytes in the refill.
+    assert_eq!(images.stats().merges + images.stats().alias_overlays, 1, "the written page was taken");
     let back = read_image(&dev, &mut sched, &mut images, texture, 4);
     let mut guest = vec![0u8; size];
     assert!(mem.read_backing(addr, &mut guest));
@@ -796,6 +798,106 @@ fn alias_refills_from_a_newer_image_with_cpu_written_pages() {
             assert_eq!(at(xx, yy), want, "texel ({xx}, {yy}): the target's rendering everywhere else");
         }
     }
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// Preparing an image refreshes first only the newer aliases whose
+/// CPU-written pages lie over it (only those bytes are read from them),
+/// and none when the image is discarded (UE5 transient targets: a large
+/// target reusing memory with many small surfaces).
+#[test]
+#[ignore]
+fn alias_pages_written_outside_the_image_are_not_merged_first() {
+    let mem = test_memory();
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    // The target: four dense 64 KiB blocks; the texture: its second block.
+    let target = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R8G8B8A8_UNORM, 4, sw, 256, 256, addr)).unwrap();
+    let block = 64u64 << 10;
+    let texture = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R32_UINT, 4, sw, 128, 128, addr + block)).unwrap();
+    let other = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R32_UINT, 4, sw, 128, 128, addr + 2 * block)).unwrap();
+    for id in [target, texture, other] {
+        assert!(images.prepare(&mut sched, &mut buffers, id, false));
+    }
+    images.clear_color(&mut sched, target, vk::ClearColorValue { float32: [1.0, 0.0, 0.0, 1.0] }, None);
+
+    // The CPU writes into the target's last block, outside the texture.
+    // SAFETY: faulting write resolved by the image watch table.
+    unsafe { std::ptr::write_volatile((addr + 3 * block + 0x100) as *mut u32, 0x0102_0304) };
+    assert!(images.prepare(&mut sched, &mut buffers, texture, false));
+    assert_eq!(images.stats().merges, 0, "the written page is not over the texture");
+    let back = read_image(&dev, &mut sched, &mut images, texture, 4);
+    assert!(back.chunks(4).all(|c| c == [255, 0, 0, 255]), "the texture holds the target's rendering");
+
+    // The CPU writes into the third block, then that image is overwritten
+    // whole: nothing is taken from the target first.
+    // SAFETY: as above.
+    unsafe { std::ptr::write_volatile((addr + 2 * block + 0x100) as *mut u32, 0x0506_0708) };
+    assert!(images.prepare(&mut sched, &mut buffers, other, true));
+    assert_eq!(images.stats().merges, 0, "a discarded image takes nothing from its aliases");
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// An image refilled from a newer alias that has a page written into it
+/// over the image takes that page from memory on top of the alias's bytes
+/// (`RPS5E_ALIAS_PAGE_OVERLAY`): the alias itself is not merged or refilled
+/// first, and keeps the page for its own next use. With the switch at `0`
+/// the alias is merged first (the assertion on `merges` fails).
+#[test]
+#[ignore]
+fn alias_pages_are_laid_over_the_refill_without_preparing_the_alias() {
+    let mem = test_memory();
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let block = 64u64 << 10;
+    assert!(mem.write_backing(addr, &vec![0x5Au8; (4 * block) as usize]));
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    // The texture: the target's second and third blocks, loaded first.
+    let texture = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R32_UINT, 4, sw, 256, 128, addr + block)).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, texture, false));
+    // The target: four dense blocks, rendered after (newer).
+    let target = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R8G8B8A8_UNORM, 4, sw, 256, 256, addr)).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, target, false));
+    images.clear_color(&mut sched, target, vk::ClearColorValue { float32: [1.0, 0.0, 0.0, 1.0] }, None);
+
+    // The CPU writes into the second block (the texture's first).
+    // SAFETY: faulting write resolved by the image watch table.
+    unsafe { std::ptr::write_volatile((addr + block + 0x100) as *mut u32, 0x0102_0304) };
+    assert!(images.prepare(&mut sched, &mut buffers, texture, false));
+    assert_eq!(images.stats().merges, 0, "the target is not merged for the texture's refill");
+    assert_eq!(images.stats().alias_overlays, 1);
+    let back = read_image(&dev, &mut sched, &mut images, texture, 4);
+    let count = |v: &[u8], t: [u8; 4]| v.chunks(4).filter(|c| *c == t).count();
+    let page = (PAGE_BYTES / 4) as usize;
+    assert_eq!(count(&back, [255, 0, 0, 255]), 2 * 128 * 128 - page, "outside the written page the texture holds the target's rendering");
+    assert_eq!(count(&back, [4, 3, 2, 1]), 1, "the written dword");
+    assert_eq!(count(&back, [0x5A; 4]), page - 1, "the rest of the written page is memory's");
+
+    // The target takes its page at its own next use.
+    assert!(images.prepare(&mut sched, &mut buffers, target, false));
+    assert_eq!(images.stats().merges, 1);
+    let back = read_image(&dev, &mut sched, &mut images, target, 4);
+    assert_eq!(count(&back, [4, 3, 2, 1]), 1);
+    assert_eq!(count(&back, [255, 0, 0, 255]), 4 * 128 * 128 - page);
     sched.flush_and_wait();
     dev.wait_idle();
     drop(images);
@@ -934,6 +1036,102 @@ fn depth_stencil_refill_through_memory_keeps_its_own_depth() {
         }
     }
     assert!(inside > 0 && outside > 0);
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// A depth/stencil image refilled through guest memory does not first
+/// prepare a newer alias that has a page written over it: that alias keeps
+/// the CPU's claim on its memory and is not written back either way
+/// (`RPS5E_ALIAS_PAGE_OVERLAY`; with `=0` the alias is merged first and the
+/// assertion on `merges` fails).
+#[test]
+#[ignore]
+fn depth_stencil_refill_through_memory_leaves_written_aliases_alone() {
+    use vk::Format as F;
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let (w, h) = (256u32, 256u32);
+    let zp = DetileParams::new(tiling::SWIZZLE_64KB_Z_X, 4, w).unwrap();
+    let size = zp.surface_size(h);
+    assert!(mem.write_backing(addr, &vec![0x55u8; size]));
+    let mut ykey = ImageKey {
+        format: F::D32_SFLOAT_S8_UINT,
+        width: w,
+        height: h,
+        depth: 1,
+        layers: 1,
+        levels: 1,
+        samples: 1,
+        dim: ImageDim::D2,
+        main: Plane { addr: 0, bytes_per_element: 0, swizzle: 0, pitch: 0, slice_size: 0, bytes: 0, aspect: vk::ImageAspectFlags::COLOR },
+        stencil: None,
+        transform: Default::default(),
+    };
+    ykey.main = plane(&ykey, addr, 4, tiling::SWIZZLE_64KB_Z_X, vk::ImageAspectFlags::DEPTH);
+    ykey.stencil = Some(plane(&ykey, addr + (2 << 20), 1, tiling::SWIZZLE_64KB_Z_X, vk::ImageAspectFlags::STENCIL));
+    let y = images.find_or_create(&mut sched, &mut buffers, &ykey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, y, true));
+    images.clear_depth_stencil(&mut sched, y, Some(0.25), Some(7), None, None);
+    // X: a newer colour surface over the first two 64 KiB blocks.
+    let xkey = key2d(F::R32_UINT, 4, tiling::SWIZZLE_64KB_R_X, 256, 128, addr);
+    let x = images.find_or_create(&mut sched, &mut buffers, &xkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, x, true));
+    images.clear_color(&mut sched, x, vk::ClearColorValue { uint32: [0x3f00_0000, 0, 0, 0] }, None);
+    // The CPU writes into X's second block.
+    // SAFETY: faulting write resolved by the image watch table.
+    unsafe { std::ptr::write_volatile((addr + (64 << 10) + 0x40) as *mut u32, 0x3e80_0000) };
+    assert!(images.needs_refresh(y));
+    assert!(images.prepare(&mut sched, &mut buffers, y, false));
+    assert_eq!(images.stats().merges, 0, "X is not merged for Y's refill");
+    // X takes its page at its own next use.
+    assert!(images.prepare(&mut sched, &mut buffers, x, false));
+    assert_eq!(images.stats().merges, 1);
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+/// The DCC keys of a sampled image that a GPU fill wrote last are decided
+/// from the fill's value (`RPS5E_KNOWN_FILLS`): the image is cleared to the
+/// code's colour without downloading the keys. With `=0` the keys are
+/// downloaded first (the assertion on `known_fill_keys` fails).
+#[test]
+#[ignore]
+fn sampled_keys_written_by_a_gpu_fill_need_no_download() {
+    let mem = test_memory();
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let keys = view + (4 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    let id = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R8G8B8A8_UNORM, 4, sw, 256, 256, addr)).unwrap();
+    // The CPU wrote the texels: the image must be loaded before its read.
+    assert!(mem.write_backing(addr, &vec![0x33u8; 256 << 10]));
+    images.invalidate_range(addr, 256 << 10);
+    // The keys: cleared to code 0x00 (black, alpha 0) by a GPU fill.
+    assert!(buffers.fill(&mut sched, keys, 64 << 10, 0).unwrap());
+    let r = images.sampled_dcc(&mut sched, &mut buffers, id, super::sampled_dcc::DescriptorDcc { address: keys, alpha_on_msb: false });
+    assert_eq!(images.stats().known_fill_keys, 1, "decided from the fill, not from downloaded keys");
+    assert_eq!(r, super::sampled_dcc::SampledKeys::Cleared(0));
+    let back = read_image(&dev, &mut sched, &mut images, id, 4);
+    assert!(back.chunks(4).all(|c| c == [0, 0, 0, 0]), "cleared to the code's colour");
     sched.flush_and_wait();
     dev.wait_idle();
     drop(images);
@@ -1481,6 +1679,79 @@ fn compressed_image_refills_from_its_block_view_by_one_copy() {
     drop(buffers);
 }
 
+/// Array key of `layers` layers at `addr`.
+fn key_layers(format: vk::Format, bpe: u32, swizzle: u32, width: u32, height: u32, layers: u32, addr: u64) -> ImageKey {
+    let mut key = key2d(format, bpe, swizzle, width, height, addr);
+    key.layers = layers;
+    key.main = plane(&key, addr, bpe, swizzle, vk::ImageAspectFlags::COLOR);
+    key
+}
+
+#[test]
+fn layer_shift_matches_views_of_one_array() {
+    use vk::Format as F;
+    let sw = tiling::SWIZZLE_64KB_S;
+    let a = key_layers(F::R32_UINT, 4, sw, 256, 128, 4, 0x1000_0000);
+    let s = a.main.slice_size;
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_UINT, 4, sw, 256, 128, 1, 0x1000_0000 + 3 * s)), Some(3));
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_UINT, 4, sw, 256, 128, 3, 0x1000_0000 + s)), Some(1));
+    assert_eq!(super::layer_shift(&key_layers(F::R32_UINT, 4, sw, 256, 128, 1, 0x1000_0000 + 3 * s), &a), Some(-3));
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_UINT, 4, sw, 256, 128, 1, 0x1000_0000 + 4 * s)), None, "past the last layer");
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_UINT, 4, sw, 256, 128, 1, 0x1000_0000 + s / 2)), None, "not a layer boundary");
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_SFLOAT, 4, sw, 256, 128, 1, 0x1000_0000 + s)), None, "another format");
+    assert_eq!(super::layer_shift(&a, &key_layers(F::R32_UINT, 4, sw, 256, 64, 1, 0x1000_0000 + s)), None, "another extent");
+}
+
+/// A 4-layer array is rendered into; single-layer and 3-layer views of
+/// the same memory starting at layers 3 and 1 take their layers from it
+/// with image copies: the right layers, nothing through guest memory.
+#[test]
+#[ignore]
+fn layer_views_refill_from_their_array_by_layer_copies() {
+    use vk::Format as F;
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let sw = tiling::SWIZZLE_64KB_S;
+    let akey = key_layers(F::R32_UINT, 4, sw, 256, 128, 4, addr);
+    let s = akey.main.slice_size;
+    let stale: Vec<u8> = (0..akey.size() as usize).map(|i| (i * 13 % 241) as u8).collect();
+    assert!(mem.write_backing(addr, &stale));
+
+    let a = images.find_or_create(&mut sched, &mut buffers, &akey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, a, true));
+    images.clear_color(&mut sched, a, vk::ClearColorValue { uint32: [0x1111_1111; 4] }, None);
+    images.clear_color_layers(&mut sched, a, vk::ClearColorValue { uint32: [0x3333_3333; 4] }, 3, 1);
+    images.mark_gpu_written(a, sched.current_tick());
+
+    let y = images.find_or_create(&mut sched, &mut buffers, &key_layers(F::R32_UINT, 4, sw, 256, 128, 1, addr + 3 * s)).unwrap();
+    assert!(images.needs_refresh(y));
+    assert!(images.prepare(&mut sched, &mut buffers, y, false));
+    let z = images.find_or_create(&mut sched, &mut buffers, &key_layers(F::R32_UINT, 4, sw, 256, 128, 3, addr + s)).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, z, false));
+    let st = images.stats();
+    let on = super::layer_copy_enabled();
+    assert_eq!((st.retiles, st.direct_copies, st.writebacks), (2, 2 * on as u64, 0));
+    let ylin = read_image(&dev, &mut sched, &mut images, y, 4);
+    assert!(ylin.chunks(4).all(|c| c == [0x33; 4]), "layer 0 of the view is layer 3 of the array");
+    let zlin = read_image(&dev, &mut sched, &mut images, z, 4);
+    assert!(zlin.chunks(4).all(|c| c == [0x11; 4]), "layer 0 of the view is layer 1 of the array");
+    assert!(!images.needs_refresh(y) && !images.needs_refresh(z));
+    let mut now = vec![0u8; stale.len()];
+    assert!(mem.read_backing(addr, &mut now));
+    assert!(now == stale, "no GPU data went through guest memory");
+    sched.flush_and_wait();
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
 #[test]
 fn direct_copies_pair_only_size_compatible_aspects() {
     use vk::{Format as F, ImageAspectFlags as A};
@@ -1504,4 +1775,132 @@ fn block_views_need_the_same_element_grid_and_layout() {
     assert!(!super::block_view_of(&key2d(F::R32G32B32A32_UINT, 16, sw, 1950, 1950, at + 0x1_0000), &y), "other memory");
     assert!(!super::block_view_of(&key2d(F::R32G32B32A32_UINT, 16, tiling::SWIZZLE_64KB_R_X, 1950, 1950, at), &y), "other swizzle");
     assert!(!super::block_view_of(&key2d(F::R32G32_UINT, 8, sw, 1950, 1950, at), &key2d(F::BC1_RGBA_UNORM_BLOCK, 8, sw, 7801, 7800, at)), "a partial block column");
+}
+
+/// Benchmark (`RPS5E_RETILE_BENCH=1`): GPU time of refilling a 2848x1600
+/// RGBA16 target from a newer B10G11R11 image over the same memory (the
+/// UE5 transient-target shape), per refill and per guest byte.
+#[test]
+#[ignore]
+fn retile_bench() {
+    if std::env::var("RPS5E_RETILE_BENCH").is_err() {
+        return;
+    }
+    let mem = test_memory();
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let (view, _) = guest_mapping(mem, 64 << 20);
+    let addr = view + (1 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    let a = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::R16G16B16A16_SFLOAT, 8, sw, 2848, 1600, addr)).unwrap();
+    let b = images.find_or_create(&mut sched, &mut buffers, &key2d(vk::Format::B10G11R11_UFLOAT_PACK32, 4, sw, 2848, 1600, addr)).unwrap();
+    let bytes = images.get(a).unwrap().key.size();
+    assert!(images.prepare(&mut sched, &mut buffers, a, true));
+    assert!(images.prepare(&mut sched, &mut buffers, b, true));
+    sched.flush_and_wait();
+    let n = 40;
+    let t = std::time::Instant::now();
+    for i in 0..n {
+        let (dst, src) = if i % 2 == 0 { (a, b) } else { (b, a) };
+        images.clear_color(&mut sched, src, vk::ClearColorValue { float32: [i as f32, 0.0, 0.0, 1.0] }, None);
+        assert!(images.prepare(&mut sched, &mut buffers, dst, false));
+        sched.flush();
+    }
+    sched.flush_and_wait();
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let s = images.stats();
+    eprintln!("retile bench: {n} refills of {:.1} MiB: {ms:.1} ms wall, {:.2} ms each, {:.1} GB/s of target bytes (retiles {}, direct {})", bytes as f64 / 1048576.0, ms / n as f64, bytes as f64 * n as f64 / ms / 1e6, s.retiles, s.direct_copies);
+    dev.wait_idle();
+    drop(images);
+    drop(buffers);
+}
+
+fn key2d_levels(levels: u32, addr: u64) -> ImageKey {
+    let sw = tiling::SWIZZLE_64KB_R_X;
+    let mut key = key2d(vk::Format::R8G8B8A8_UNORM, 4, sw, 256, 256, addr);
+    key.levels = levels;
+    key.main = plane(&key, addr, 4, sw, vk::ImageAspectFlags::COLOR);
+    key
+}
+
+/// GFX10 stores the levels of a layer from the smallest to the largest:
+/// level 0 of a one-level surface is not where level 0 of an eight-level
+/// surface at the same address lies.
+#[test]
+fn shorter_mip_chains_place_level_zero_elsewhere() {
+    let long = key2d_levels(8, 0x10_0000_0000);
+    let short = key2d_levels(1, 0x10_0000_0000);
+    let l = long.layout(&long.main).unwrap();
+    let s = short.layout(&short.main).unwrap();
+    assert_ne!(l.mips[0].offset, s.mips[0].offset);
+    assert!(!same_level_placement(&long, &short, 1), "a one-level texture does not read the long chain's level 0");
+    assert!(same_level_placement(&long, &long, 8));
+}
+
+#[test]
+#[ignore]
+fn alias_lookup_skips_images_with_another_mip_chain() {
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let addr = view + (1 << 20);
+    let long = key2d_levels(8, addr);
+    let id = images.find_or_create(&mut sched, &mut buffers, &long).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, id, true));
+    assert_eq!(images.find_alias(&long, 3), Some(id), "the same chain is found");
+    assert_eq!(images.find_alias(&key2d_levels(1, addr), 1), None, "a one-level texture at the address is another surface");
+}
+
+/// Small colour targets the GPU wrote reach guest memory for the CPU: a
+/// linear one at the next collection, a tiny tiled one on the CPU access
+/// to its pages.
+#[test]
+#[ignore]
+fn small_gpu_written_targets_reach_guest_memory() {
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker.clone()).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    images.readback_linear = LinearReadback::Eager;
+    let (view, _) = guest_mapping(mem, 8 << 20);
+
+    // A 128x128 linear RGBA8 target, cleared on the GPU.
+    let lin = view + (1 << 20);
+    assert!(mem.write_backing(lin, &vec![0x55u8; 128 * 128 * 4]));
+    let lkey = key2d(vk::Format::R8G8B8A8_UNORM, 4, tiling::SWIZZLE_LINEAR, 128, 128, lin);
+    let l = images.find_or_create(&mut sched, &mut buffers, &lkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, l, true));
+    images.clear_color(&mut sched, l, vk::ClearColorValue { float32: [1.0, 0.0, 1.0, 1.0] }, None);
+    images.mark_gpu_written(l, 1);
+    images.process_downloads(&mut sched, &mut buffers);
+    buffers.download(&mut sched, lin, 128 * 128 * 4);
+    let mut out = vec![0u8; 16];
+    assert!(mem.read_backing(lin + 128 * 4 * 77, &mut out));
+    assert_eq!(&out[..4], &[255, 0, 255, 255], "linear target written back");
+
+    // A 1x1 tiled RG32F target: read-watched until the CPU touches it.
+    let tiny = view + (4 << 20);
+    assert!(mem.write_backing(tiny, &[0x55u8; 8]));
+    let tkey = key2d(vk::Format::R32G32_SFLOAT, 8, tiling::SWIZZLE_64KB_R_X, 1, 1, tiny);
+    let t = images.find_or_create(&mut sched, &mut buffers, &tkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, t, true));
+    images.clear_color(&mut sched, t, vk::ClearColorValue { float32: [2.0, -3.0, 0.0, 0.0] }, None);
+    images.mark_gpu_written(t, 2);
+    let hits = images.table.take_read_backs(tiny).expect("the tiny target is read-watched");
+    images.resolve_read_backs(&mut sched, &mut buffers, &tracker, &hits, false);
+    let mut out = [0u8; 8];
+    assert!(mem.read_backing(tiny, &mut out));
+    assert_eq!(out, [2.0f32.to_le_bytes(), (-3.0f32).to_le_bytes()].concat().as_slice(), "tiled target written back");
 }

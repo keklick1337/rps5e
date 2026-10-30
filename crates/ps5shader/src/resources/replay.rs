@@ -93,8 +93,16 @@ pub struct ReplayProgram {
     ranges: Vec<Option<(u32, u32)>>,
     pub user_data_len: usize,
     /// Per op: the table slots it is the whole value of when nothing else
-    /// uses it (a plain read that may be deferred to the GPU), else empty.
+    /// uses it (a plain read that may be deferred to the GPU), or, for a
+    /// read in [`Self::records_buffer`], the table slots it fills besides
+    /// that NUM_RECORDS; else empty.
     deferrable: Vec<Vec<u32>>,
+    /// Per op: the plan buffer whose V# NUM_RECORDS (word 2) is the op's
+    /// only use besides table slots ([`NONE`]: none). While GPU work still
+    /// writes such a word, the program reads it itself from its table
+    /// slots; the host binds the room it has from the buffer's base
+    /// ([`RecordsRoom`]) and the word is left to the GPU.
+    records_buffer: Vec<u32>,
     /// Per op: it fails on every run (a failing op or an operand that
     /// does), whatever the inputs.
     always_fails: Vec<bool>,
@@ -118,7 +126,45 @@ pub struct ReplayScratch {
     active: Vec<bool>,
     visited: Vec<bool>,
     pending: Vec<usize>,
+    /// Reads of NUM_RECORDS words left to the GPU in this run.
+    records: Vec<u32>,
 }
+
+/// The bytes from a buffer's base (48-bit guest address) that its host
+/// binding covers when its NUM_RECORDS (the dword at the third argument,
+/// still being written by GPU work) is left to the program, given the V#
+/// stride (second argument). None: the host has no such room; the word is
+/// read on the CPU.
+pub type RecordsRoom<'a> = &'a dyn Fn(u64, u32, u64) -> Option<u64>;
+
+/// `RPS5E_DEFER_RECORDS=check` (set by the host): a NUM_RECORDS word left
+/// to the GPU is read on the CPU as well, compared with the room the host
+/// would bind ([`RECORDS_STATS`]) and bound as read.
+pub static RECORDS_CHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// NUM_RECORDS words left to the GPU, and in the check mode: words
+/// compared, words whose records reach past the room bound, and the last
+/// such (base, records bytes, room).
+pub struct RecordsStats {
+    pub deferred: std::sync::atomic::AtomicU64,
+    pub checked: std::sync::atomic::AtomicU64,
+    pub over: std::sync::atomic::AtomicU64,
+    pub last_over: std::sync::Mutex<Option<(u64, u64, u64)>>,
+    /// The largest (records bytes, room) pair seen by the check, by
+    /// records bytes.
+    pub largest: std::sync::Mutex<Option<(u64, u64, u64)>>,
+    /// Per program address: words checked, words past the room.
+    pub programs: std::sync::Mutex<Vec<(u64, u64, u64)>>,
+}
+
+pub static RECORDS_STATS: RecordsStats = RecordsStats {
+    deferred: std::sync::atomic::AtomicU64::new(0),
+    checked: std::sync::atomic::AtomicU64::new(0),
+    over: std::sync::atomic::AtomicU64::new(0),
+    last_over: std::sync::Mutex::new(None),
+    largest: std::sync::Mutex::new(None),
+    programs: std::sync::Mutex::new(Vec::new()),
+};
 
 /// One run's results.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -129,6 +175,31 @@ pub struct ReplayResult {
     pub range_bases: Vec<Option<u64>>,
     /// Table slots left zero for the GPU to fill: (slot, guest address).
     pub deferred: Vec<(u32, u64)>,
+    /// Diagnostics ([`WHY_BLOCKED`]): the read ops of a synchronising run
+    /// whose word GPU work is still writing and which could not be
+    /// deferred: (op, guest address).
+    pub blocked: Vec<(u32, u64)>,
+}
+
+/// Diagnostics: synchronising runs note in [`ReplayResult::blocked`] the
+/// GPU-written reads they wait for (`RPS5E_DESC_WAIT_WHY`, set by the host).
+pub static WHY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Diagnostics: per (program address, op) the blocked reads seen, with
+/// the description of the op's uses and the last address.
+pub static BLOCKED_READS: std::sync::Mutex<Vec<((u64, u32), String, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Count the blocked reads of one synchronising run of `program`.
+pub fn note_blocked(program: &ReplayProgram, shader_base: u64, blocked: &[(u32, u64)]) {
+    let mut v = BLOCKED_READS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(op, address) in blocked {
+        if let Some(e) = v.iter_mut().find(|e| e.0 == (shader_base, op)) {
+            e.2 += 1;
+            e.3 = address;
+        } else if v.len() < 256 {
+            v.push(((shader_base, op), program.describe_uses(op), 1, address));
+        }
+    }
 }
 
 struct Compiler<'p> {
@@ -430,10 +501,58 @@ impl ReplayProgram {
                 deferrable[r as usize].push(slot as u32);
             }
         }
+        // Reads whose only use besides table slots is one plan buffer's
+        // NUM_RECORDS: uses other than descriptor words, then the
+        // descriptor words.
+        let mut records_buffer = vec![NONE; c.ops.len()];
+        {
+            let mut other = vec![false; c.ops.len()];
+            for op in &c.ops {
+                match *op {
+                    Op::Select(a, b, d) => [a, b, d].iter().for_each(|&r| other[r as usize] = true),
+                    Op::Operation { operands, count, .. } => operands[..count as usize].iter().for_each(|&r| other[r as usize] = true),
+                    Op::Read { low, high, offset, records, format, .. } => {
+                        [low, high, offset, records, format].iter().filter(|&&r| r != NONE).for_each(|&r| other[r as usize] = true)
+                    }
+                    _ => {}
+                }
+            }
+            for &(low, high) in ranges.iter().flatten() {
+                other[low as usize] = true;
+                other[high as usize] = true;
+            }
+            for (condition, _, _) in &branches {
+                if let Some(r) = condition {
+                    other[*r as usize] = true;
+                }
+            }
+            let mut uses = vec![0u32; c.ops.len()];
+            let mut word2 = vec![NONE; c.ops.len()];
+            let buffers = plan.info.buffers.len().min(descriptor_spans.len());
+            for (k, &(start, end)) in descriptor_spans.iter().enumerate() {
+                for w in start..end {
+                    let r = outputs[w as usize] as usize;
+                    uses[r] += 1;
+                    if k < buffers && end - start == 4 && w == start + 2 {
+                        word2[r] = k as u32;
+                    }
+                }
+            }
+            let mut slots = vec![Vec::new(); c.ops.len()];
+            for (slot, &r) in outputs[descriptor_words..].iter().enumerate() {
+                slots[r as usize].push(slot as u32);
+            }
+            for r in 0..c.ops.len() {
+                if word2[r] != NONE && uses[r] == 1 && !other[r] && !slots[r].is_empty() && matches!(c.ops[r], Op::Read { clean: false, .. }) {
+                    records_buffer[r] = word2[r];
+                    deferrable[r] = std::mem::take(&mut slots[r]);
+                }
+            }
+        }
         let mut ops = c.ops;
-        for (op, slots) in ops.iter_mut().zip(&deferrable) {
+        for ((op, slots), &records) in ops.iter_mut().zip(&deferrable).zip(&records_buffer) {
             if let Op::Read { deferrable, .. } = op {
-                *deferrable = !slots.is_empty();
+                *deferrable = !slots.is_empty() && records == NONE;
             }
         }
         // Reads of consecutive dwords through the same operands are
@@ -473,6 +592,7 @@ impl ReplayProgram {
             })
             .collect();
         let deferrable: Vec<Vec<u32>> = order.iter().map(|&old| std::mem::take(&mut deferrable[old as usize])).collect();
+        let records_buffer: Vec<u32> = order.iter().map(|&old| records_buffer[old as usize]).collect();
         outputs.iter_mut().for_each(|r| *r = rename(*r));
         let ranges = ranges.into_iter().map(|r| r.map(|(low, high)| (rename(low), rename(high)))).collect();
         let branches = branches.into_iter().map(|(condition, successors, sources)| (condition.map(rename), successors, sources)).collect();
@@ -512,6 +632,7 @@ impl ReplayProgram {
             ranges,
             user_data_len: plan.graph.user_data_count as usize,
             deferrable,
+            records_buffer,
         })
     }
 
@@ -521,6 +642,94 @@ impl ReplayProgram {
 
     /// Each descriptor's words in a result (start, end), in materialisation
     /// order: buffers, images, samplers.
+    /// The NUM_RECORDS register of read `i` left to the GPU: the records
+    /// the host's room from the buffer's base holds (the check mode reads
+    /// the word as well and compares), or the word read through `reader`
+    /// when the host has no room for it.
+    #[allow(clippy::too_many_arguments)]
+    fn records_value(&self, i: usize, shader_base: u64, registers: &[u64], failed: &[bool], reader: &ReplayReader<'_>, room: Option<RecordsRoom<'_>>) -> Result<Option<u64>, ReplayAbort> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let read = || -> Result<Option<u64>, ReplayAbort> {
+            let Op::Read { kind, low, high, offset, records, immediate, clean, .. } = self.ops[i] else { return Ok(None) };
+            let records = if records != NONE { registers[records as usize] } else { 0 };
+            read_raw(kind, registers[low as usize], registers[high as usize], registers[offset as usize] as u32, records, immediate, reader, clean)
+        };
+        let (start, _) = self.descriptor_spans[self.records_buffer[i] as usize];
+        let (lo, hi) = (self.outputs[start as usize] as usize, self.outputs[start as usize + 1] as usize);
+        if failed[lo] || failed[hi] {
+            return read();
+        }
+        let (w0, w1) = (registers[lo] as u32, registers[hi] as u32);
+        let base = w0 as u64 | ((w1 & 0xFFFF) as u64) << 32;
+        let stride = (w1 >> 16) & 0x3FFF;
+        let word = match self.ops[i] {
+            Op::Read { kind, low, high, offset, records, immediate, .. } => {
+                let records = if records != NONE { registers[records as usize] } else { 0 };
+                raw_address(kind, registers[low as usize], registers[high as usize], registers[offset as usize] as u32, records, immediate)
+            }
+            _ => None,
+        };
+        let Some(word) = word else { return read() };
+        let Some(bytes) = room.and_then(|f| f(base, stride, word)) else { return read() };
+        let records = if stride == 0 { bytes } else { bytes / stride as u64 }.min(u32::MAX as u64);
+        RECORDS_STATS.deferred.fetch_add(1, Relaxed);
+        if RECORDS_CHECK.load(Relaxed) {
+            if let Some(actual) = read()? {
+                let need = if stride == 0 { actual as u32 as u64 } else { actual as u32 as u64 * stride as u64 };
+                let room_bytes = if stride == 0 { records } else { records * stride as u64 };
+                RECORDS_STATS.checked.fetch_add(1, Relaxed);
+                {
+                    let mut p = RECORDS_STATS.programs.lock().unwrap_or_else(|e| e.into_inner());
+                    let over = (need > room_bytes) as u64;
+                    if let Some(e) = p.iter_mut().find(|e| e.0 == shader_base) {
+                        e.1 += 1;
+                        e.2 += over;
+                    } else if p.len() < 64 {
+                        p.push((shader_base, 1, over));
+                    }
+                }
+                if need > room_bytes {
+                    RECORDS_STATS.over.fetch_add(1, Relaxed);
+                    *RECORDS_STATS.last_over.lock().unwrap_or_else(|e| e.into_inner()) = Some((base, need, room_bytes));
+                }
+                let mut largest = RECORDS_STATS.largest.lock().unwrap_or_else(|e| e.into_inner());
+                if largest.is_none_or(|l| need > l.1) {
+                    *largest = Some((base, need, room_bytes));
+                }
+                // The check binds what the program will read.
+                return Ok(Some(actual));
+            }
+        }
+        Ok(Some(records))
+    }
+
+    /// Diagnostics: what uses the value of op `op` (descriptor words as
+    /// `source.word`, table slots, other ops, range bases, branch
+    /// predicates).
+    pub fn describe_uses(&self, op: u32) -> String {
+        let mut words = Vec::new();
+        for (i, &r) in self.outputs[..self.descriptor_words].iter().enumerate() {
+            if r == op {
+                let (k, &(start, _)) = self.descriptor_spans.iter().enumerate().find(|(_, s)| s.0 as usize <= i && (i as u32) < s.1).unwrap_or((usize::MAX, &(0, 0)));
+                words.push(format!("{k}.{}", i as u32 - start));
+            }
+        }
+        let slots = self.outputs[self.descriptor_words..].iter().filter(|&&r| r == op).count();
+        let mut ops = 0;
+        for o in &self.ops {
+            let refs: &[u32] = match o {
+                Op::Select(a, b, d) => &[*a, *b, *d],
+                Op::Operation { operands, count, .. } => &operands[..*count as usize],
+                Op::Read { low, high, offset, records, format, .. } => &[*low, *high, *offset, *records, *format],
+                _ => &[],
+            };
+            ops += refs.iter().filter(|&&r| r == op).count();
+        }
+        let ranges = self.ranges.iter().flatten().filter(|r| r.0 == op || r.1 == op).count();
+        let branches = self.branches.iter().filter(|b| b.0 == Some(op)).count();
+        format!("descriptor words [{}] (buffers first) table slots {slots} ops {ops} ranges {ranges} branches {branches}", words.join(" "))
+    }
+
     pub fn descriptor_spans(&self) -> &[(u32, u32)] {
         &self.descriptor_spans
     }
@@ -549,7 +758,27 @@ impl ReplayProgram {
         scratch: &mut ReplayScratch,
         out: &mut ReplayResult,
     ) -> Result<(), ReplayAbort> {
+        self.run_into_with(user_data, shader_base, reader, gpu_written, None, scratch, out)
+    }
+
+    /// [`Self::run_into`]; with `records_room`, a NUM_RECORDS word GPU
+    /// work is still writing ([`Self::records_buffer`]) is left to the GPU:
+    /// its table slots are deferred and the descriptor gets the records the
+    /// room holds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_into_with(
+        &self,
+        user_data: &[u32],
+        shader_base: u64,
+        reader: &ReplayReader<'_>,
+        gpu_written: Option<GpuWrittenProbe<'_>>,
+        records_room: Option<RecordsRoom<'_>>,
+        scratch: &mut ReplayScratch,
+        out: &mut ReplayResult,
+    ) -> Result<(), ReplayAbort> {
         out.deferred.clear();
+        out.blocked.clear();
+        let why = matches!(reader, ReplayReader::Words(..)) && WHY_BLOCKED.load(std::sync::atomic::Ordering::Relaxed);
         let n = self.ops.len();
         // The register file keeps its values across runs: a register is
         // read only through an operand whose `failed` bit is clear, and a
@@ -563,6 +792,8 @@ impl ReplayProgram {
         let failed = &mut scratch.failed;
         failed.clear();
         failed.resize(n, false);
+        let pending_records = &mut scratch.records;
+        pending_records.clear();
         // No register failed but those that fail on every run (which no
         // output word is, when `outputs_can_hold`): the outputs need no
         // failure checks.
@@ -612,7 +843,9 @@ impl ReplayProgram {
                     }
                 }
                 Op::Read { kind, low, high, offset, records, format, immediate, clean, block, deferrable } => {
-                    if block > 1 && self.read_block(i, block as usize, reader, gpu_written, registers, failed) {
+                    let to_records = records_room.is_some() && self.records_buffer[i] != NONE;
+                    let deferrable = deferrable || to_records;
+                    if block > 1 && self.read_block(i, block as usize, reader, gpu_written, records_room.is_some(), registers, failed) {
                         i += block as usize;
                         continue;
                     }
@@ -628,9 +861,21 @@ impl ReplayProgram {
                         }) {
                             Some(address) => {
                                 out.deferred.extend(self.deferrable[i].iter().map(|&slot| (slot, address)));
+                                if to_records {
+                                    pending_records.push(i as u32);
+                                }
                                 Some(0)
                             }
-                            None => read_raw(kind, low, high, offset, records, immediate, reader, clean)?,
+                            None => {
+                                if why && !deferrable {
+                                    if let (Some(probe), Some(address)) = (gpu_written, raw_address(kind, low, high, offset, records, immediate)) {
+                                        if probe(address) {
+                                            out.blocked.push((i as u32, address));
+                                        }
+                                    }
+                                }
+                                read_raw(kind, low, high, offset, records, immediate, reader, clean)?
+                            }
                         }
                     }
                 }
@@ -644,7 +889,18 @@ impl ReplayProgram {
             }
             i += 1;
         }
-        let ReplayScratch { registers, failed, active, visited, pending } = scratch;
+        for k in 0..pending_records.len() {
+            let i = pending_records[k] as usize;
+            match self.records_value(i, shader_base, registers, failed, reader, records_room) {
+                Ok(Some(v)) => registers[i] = v,
+                Ok(None) => {
+                    failed[i] = true;
+                    any_failed = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let ReplayScratch { registers, failed, active, visited, pending, .. } = scratch;
         let any_inactive = self.active_sources(reader, registers, failed, active, visited, pending);
         let words = &mut out.words;
         words.clear();
@@ -692,7 +948,8 @@ impl ReplayProgram {
     /// address), the dwords are not consecutive, a deferrable dword is
     /// still being written by the GPU, the reader is the word reader, or
     /// the range read refused (any of its words: unmapped, GPU-owned).
-    fn read_block(&self, first: usize, count: usize, reader: &ReplayReader<'_>, gpu_written: Option<GpuWrittenProbe<'_>>, registers: &mut [u64], failed: &[bool]) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn read_block(&self, first: usize, count: usize, reader: &ReplayReader<'_>, gpu_written: Option<GpuWrittenProbe<'_>>, to_records: bool, registers: &mut [u64], failed: &[bool]) -> bool {
         let ReplayReader::Resident(read, has_clean) = *reader else { return false };
         let Op::Read { kind, low, high, offset, records, format, clean, .. } = self.ops[first] else { return false };
         if clean && !has_clean {
@@ -707,6 +964,7 @@ impl ReplayProgram {
         let mut start = 0;
         for k in 0..count {
             let Op::Read { immediate, deferrable, .. } = self.ops[first + k] else { return false };
+            let deferrable = deferrable || (to_records && self.records_buffer[first + k] != NONE);
             let RawAddress::Read(a) = resolve_raw_address(kind, base, high, records, immediate, offset) else { return false };
             if k == 0 {
                 start = a;

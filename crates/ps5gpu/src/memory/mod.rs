@@ -151,6 +151,14 @@ thread_local! {
     static SPAN_CACHE: std::cell::Cell<[SpanCache; SPAN_CACHE_ENTRIES]> = const { std::cell::Cell::new([NO_SPAN; SPAN_CACHE_ENTRIES]) };
 }
 
+/// `RPS5E_SAME_BACKING_REMAP=0`: a mapping onto the bytes a range already
+/// shows is reported to the buffer and image caches as new contents (they
+/// drop GPU results there and load the range again), as before.
+fn same_backing_remap_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_SAME_BACKING_REMAP").is_ok_and(|v| v == "0"))
+}
+
 /// `RPS5E_FAULT_LANDING=0`: a CPU access to GPU-dirty pages always goes
 /// through the back-end (it takes the back-end lock and waits for a copy
 /// recorded behind all queued work). On (default), copies into guest
@@ -504,6 +512,10 @@ impl GuestGpuMemory {
         // describe the old view here, so downloads land in the old bytes,
         // where the GPU wrote them on the console.
         let replaced = self.replaced_parts(addr, size, backing);
+        // Parts mapped again onto the bytes they already showed keep their
+        // contents: the caches keep what they hold there (GPU results not
+        // yet downloaded included).
+        let same = if same_backing_remap_enabled() { self.same_backing_parts(addr, size, backing) } else { smallvec::SmallVec::new() };
         if !replaced.is_empty() {
             let n = REPLACED_VIEWS.fetch_add(1, Ordering::Relaxed);
             if n < 8 || n.is_power_of_two() {
@@ -541,12 +553,40 @@ impl GuestGpuMemory {
         // partially resident resource was committed, or memory was mapped
         // over another mapping. Pages watched while uncommitted were
         // protected by `register` from their watch counts already.
-        if let Some(b) = self.buffers.get() {
-            b.mapped(addr, size);
+        let mut cur = addr;
+        for (a, n) in same.into_iter().chain(std::iter::once((addr + size, 0))) {
+            if a > cur {
+                if let Some(b) = self.buffers.get() {
+                    b.mapped(cur, a - cur);
+                }
+                if let Some(i) = self.images.get() {
+                    i.mapped(cur, a - cur);
+                }
+            }
+            cur = cur.max(a + n);
         }
-        if let Some(i) = self.images.get() {
-            i.mapped(addr, size);
+    }
+
+    /// The parts of `[addr, addr+size)` a new mapping at `backing` maps onto
+    /// the memfd bytes the current views there already show (in address
+    /// order, merged).
+    fn same_backing_parts(&self, addr: u64, size: u64, backing: Option<u64>) -> smallvec::SmallVec<[(u64, u64); 4]> {
+        let mut out: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
+        let Some(new) = backing else { return out };
+        let end = addr + size;
+        let m = self.spans();
+        let first = m.range(..=addr).next_back().map_or(addr, |(&s, _)| s);
+        for (&s, sp) in m.range(first..end) {
+            let (a, e) = (s.max(addr), sp.end.min(end));
+            if a >= e || sp.backing.map(|old| old + (a - s)) != Some(new + (a - addr)) {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 == a => last.1 += e - a,
+                _ => out.push((a, e - a)),
+            }
         }
+        out
     }
 
     /// The parts of `[addr, addr+size)` that views of memfd bytes other
