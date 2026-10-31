@@ -1218,7 +1218,8 @@ pub fn texture_view(ctx: &mut DrawContext, dummies: Option<&mut DummyResources>,
         return Err(format!("image {:?} bound as {:?}", fmt.host, req.numeric));
     }
     let key = crate::backend::profile::time(17, || texture_key(&t, &fmt))?;
-    let window = sampled_array_window(&t, &key, req, crate::images::sampled_dcc::descriptor_dcc(words).is_some(), ty);
+    let dcc = crate::images::sampled_dcc::sampled_descriptor_dcc(words, fmt.block_compressed);
+    let window = sampled_array_window(&t, &key, req, dcc.is_some(), ty);
     let key = window.unwrap_or(key);
     let msaa = key.samples > 1;
     if msaa != matches!(req.dimension, ImageDimension::Dim2DMsaa | ImageDimension::Dim2DMsaaArray) {
@@ -1244,7 +1245,7 @@ pub fn texture_view(ctx: &mut DrawContext, dummies: Option<&mut DummyResources>,
         id = ctx.images.find_or_create(ctx.sched, &mut ctx.buffers, &key).map_err(|e| creation_error(&key, e))?;
     }
     // The DCC keys of a compressed surface decide what it reads.
-    if let Some(dcc) = crate::images::sampled_dcc::descriptor_dcc(words).filter(|_| stencil_owner.is_none() && crate::images::sampled_dcc::enabled()) {
+    if let Some(dcc) = dcc.filter(|_| stencil_owner.is_none() && crate::images::sampled_dcc::enabled()) {
         match (ctx.images.exact(), ctx.buffers.exact()) {
             (Some(images), Some(buffers)) => {
                 images.sampled_dcc(ctx.sched, buffers, id, dcc);

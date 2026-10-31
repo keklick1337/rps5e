@@ -90,6 +90,51 @@ struct Held {
     range: Option<SubRange>,
 }
 
+/// What a slot holds: a view of an image (by image id: a view handle
+/// alone is reused by the driver once its view is destroyed), its class
+/// and the layout its descriptor names.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct SlotKey {
+    image: u64,
+    view: vk::ImageView,
+    mode: u32,
+    layout: vk::ImageLayout,
+}
+
+/// The slots holding a view, shared by every table element reading it
+/// (the tables of one texture heap: several entry offsets, kinds or copies
+/// of it would otherwise each take a slot per view), with their reference
+/// counts.
+#[derive(Default)]
+struct SharedSlots {
+    map: HashMap<SlotKey, (u32, u32)>,
+}
+
+impl SharedSlots {
+    /// The slot already holding `key`'s view, with one more reference.
+    fn share(&mut self, key: SlotKey) -> Option<u32> {
+        let (slot, refs) = self.map.get_mut(&key)?;
+        *refs += 1;
+        Some(*slot)
+    }
+
+    /// `slot` now holds `key`'s view (one reference).
+    fn insert(&mut self, key: SlotKey, slot: u32) {
+        self.map.insert(key, (slot, 1));
+    }
+
+    /// One reference less; the slot when it was the last.
+    fn release(&mut self, key: SlotKey) -> Option<u32> {
+        let (slot, refs) = self.map.get_mut(&key)?;
+        *refs -= 1;
+        let slot = *slot;
+        (*refs == 0).then(|| {
+            self.map.remove(&key);
+            slot
+        })
+    }
+}
+
 /// One distinct T# of a table.
 struct Distinct {
     words: [u32; 8],
@@ -98,8 +143,8 @@ struct Distinct {
     /// Its slot (a null slot when it has no view) and the view's class.
     slot: u32,
     mode: u32,
-    /// The slot is its own (else a null slot).
-    owned: bool,
+    /// The shared slot it holds a reference on (else a null slot).
+    owned: Option<SlotKey>,
     image: Option<Held>,
     view: vk::ImageView,
     /// Listed in the table's `failed` / `uncovered` lists.
@@ -163,6 +208,9 @@ pub struct BindlessSet {
     next_slot: u32,
     free_slots: Vec<u32>,
     retired_slots: Vec<(u64, u32)>,
+    /// The slots holding a view, shared by every table element reading it,
+    /// with their reference counts.
+    shared: SharedSlots,
     /// The null view's slot per view type.
     /// The null view's slot per view type and storage class.
     null_slots: HashMap<(i32, bool), u32>,
@@ -344,6 +392,7 @@ impl BindlessSet {
             capacity,
             next_slot: 0,
             free_slots: Vec::new(),
+            shared: SharedSlots::default(),
             retired_slots: Vec::new(),
             null_slots: HashMap::default(),
             tables: HashMap::default(),
@@ -423,6 +472,26 @@ impl BindlessSet {
         Err(format!("bindless set full ({} slots)", self.capacity))
     }
 
+    /// A slot holding `key`'s view (see [`SharedSlots`]); a new one gets
+    /// its descriptor written.
+    fn acquire_slot(&mut self, sched: &crate::scheduler::Scheduler, key: SlotKey) -> Result<u32, String> {
+        if let Some(slot) = self.shared.share(key) {
+            return Ok(slot);
+        }
+        let slot = self.alloc_slot(sched)?;
+        self.writes.push((slot, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: key.view, image_layout: key.layout }));
+        self.shared.insert(key, slot);
+        Ok(slot)
+    }
+
+    /// Drop a reference on `key`'s slot; the last one retires the slot
+    /// (reused once `tick` completed).
+    fn release_slot(&mut self, key: SlotKey, tick: u64) {
+        if let Some(slot) = self.shared.release(key) {
+            self.retired_slots.push((tick, slot));
+        }
+    }
+
     /// The slot of the null view of `kind`'s view type (an atomic kind's
     /// null view is the storage R32ui one).
     fn null_slot(&mut self, ctx: &mut DrawContext, dummies: &mut DummyResources, kind: DescriptorBindingKind) -> Result<u32, String> {
@@ -444,9 +513,8 @@ impl BindlessSet {
     /// `tick` completed, its image unpinned.
     fn drop_view(&mut self, images: &mut crate::images::ImageCache, t: &mut Table, d: u32, tick: u64) {
         let x = &mut t.distinct[d as usize];
-        if x.owned {
-            self.retired_slots.push((tick, x.slot));
-            x.owned = false;
+        if let Some(key) = x.owned.take() {
+            self.release_slot(key, tick);
         }
         x.slot = t.null_slot;
         x.mode = bindless::MODE_FLOAT;
@@ -775,7 +843,7 @@ impl BindlessSet {
                     refs: 0,
                     slot: t.null_slot,
                     mode: bindless::MODE_FLOAT,
-                    owned: false,
+                    owned: None,
                     image: None,
                     view: vk::ImageView::null(),
                     failed: false,
@@ -836,19 +904,21 @@ impl BindlessSet {
                 let range = ctx.images.view_subresources(view);
                 let covered = ctx.images.upload_covered(id);
                 ctx.images.transition(id, usage, range, &mut self.barriers);
-                let x = &t.distinct[d as usize];
-                if x.view != view || !x.owned || x.mode != mode {
-                    // A new view: a new slot (the old one may still be read).
-                    let slot = self.alloc_slot(ctx.sched)?;
+                let key = SlotKey { image: id, view, mode, layout: usage.0 };
+                if t.distinct[d as usize].owned != Some(key) {
+                    // A new view: another slot (the old one may still be read).
+                    let slot = self.acquire_slot(ctx.sched, key)?;
                     if let Some(images) = ctx.images.exact() {
-                    self.drop_view(images, t, d, now);
-                }
+                        self.drop_view(images, t, d, now);
+                    }
+                    if let Some(old) = t.distinct[d as usize].owned.take() {
+                        self.release_slot(old, now);
+                    }
                     let x = &mut t.distinct[d as usize];
                     x.slot = slot;
-                    x.owned = true;
+                    x.owned = Some(key);
                     x.mode = mode;
                     x.view = view;
-                    self.writes.push((slot, vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: usage.0 }));
                     t.map_stale = true;
                 }
                 let x = &mut t.distinct[d as usize];
@@ -893,6 +963,38 @@ impl BindlessSet {
 #[cfg(test)]
 mod no_view_tests {
     use super::*;
+
+    fn key(image: u64, view: u64) -> SlotKey {
+        use ash::vk::Handle;
+        SlotKey { image, view: vk::ImageView::from_raw(view), mode: bindless::MODE_FLOAT, layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }
+    }
+
+    /// Tables reading the same view share its slot until the last lets go.
+    #[test]
+    fn tables_share_the_slot_of_a_view() {
+        let mut s = SharedSlots::default();
+        let k = key(0x52d7, 0x7ff3_296e_f560);
+        assert_eq!(s.share(k), None);
+        s.insert(k, 7);
+        assert_eq!(s.share(k), Some(7), "a second table reads the same view");
+        assert_eq!(s.release(k), None, "still held");
+        assert_eq!(s.release(k), Some(7), "the last reference frees the slot");
+        assert_eq!(s.share(k), None);
+    }
+
+    /// A view handle that comes back for another image (the driver reused
+    /// the handle of a destroyed view) is another slot: the old slot's
+    /// descriptor describes the destroyed view.
+    #[test]
+    fn reused_view_handle_of_another_image_gets_a_new_slot() {
+        let mut s = SharedSlots::default();
+        s.insert(key(0x52d7, 0x7ff3_296e_f560), 7);
+        assert_eq!(s.share(key(0x5a7c, 0x7ff3_296e_f560)), None);
+        let mut other_layout = key(0x52d7, 0x7ff3_296e_f560);
+        other_layout.layout = vk::ImageLayout::GENERAL;
+        assert_eq!(s.share(other_layout), None);
+    }
+
 
     /// The lazily formatted reasons read as the strings formatted before.
     #[test]

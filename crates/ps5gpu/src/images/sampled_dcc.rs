@@ -60,6 +60,32 @@ pub fn descriptor_dcc(words: &[u32]) -> Option<DescriptorDcc> {
     (address != 0).then_some(DescriptorDcc { address, alpha_on_msb: (w6 >> 22) & 1 != 0 })
 }
 
+/// The DCC metadata a sampled surface of the T# `words` is read through.
+/// Block-compressed formats have no DCC (no colour target can write them
+/// and the hardware has no DCC mode for them): their COMPRESSION_EN bit
+/// and metadata address mean nothing, and the address is often not a guest
+/// address at all.
+/// `RPS5E_BC_WITHOUT_DCC=0` reads them through the keys like other formats
+/// (A/B scope `release`, `RPS5E_AB_ONLY=bc-without-dcc`).
+pub fn sampled_descriptor_dcc(words: &[u32], block_compressed: bool) -> Option<DescriptorDcc> {
+    let dcc = descriptor_dcc(words)?;
+    if block_compressed {
+        static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!("ps5gpu: block-compressed texture with COMPRESSION_EN (metadata {:#x}): read without DCC", dcc.address);
+        }
+        if bc_without_dcc() {
+            return None;
+        }
+    }
+    Some(dcc)
+}
+
+fn bc_without_dcc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_value(false, std::env::var("RPS5E_BC_WITHOUT_DCC").ok().as_deref())) && crate::backend::ab::release_fast("bc-without-dcc")
+}
+
 /// Bytes of keys of a surface of `bytes` (one per 256 surface bytes; the
 /// 64 KiB render-target layout keeps whole 4 KiB metadata blocks per
 /// layer, `slice` bytes each).
@@ -268,6 +294,8 @@ mod tests {
         w[6] = 1 << 21 | 1 << 22 | 0x34 << 24;
         w[7] = 0x12;
         assert_eq!(descriptor_dcc(&w), Some(DescriptorDcc { address: 0x1234 << 8, alpha_on_msb: true }));
+        assert_eq!(sampled_descriptor_dcc(&w, false), descriptor_dcc(&w));
+        assert_eq!(sampled_descriptor_dcc(&w, true), None, "block-compressed");
         w[6] &= !(1 << 21);
         assert_eq!(descriptor_dcc(&w), None, "COMPRESSION_EN off");
     }

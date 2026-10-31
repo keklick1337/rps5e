@@ -161,22 +161,15 @@ fn cb_get_app_info(ctx: &mut CpuContext) -> HleResult {
 /// The console's firmware version is not modelled.
 const SYSTEM_SW_VERSION: u32 = 0x0100_0000;
 const SYSTEM_SW_VERSION_STRING: &[u8] = b"01.000.000";
-/// `{u64 size; char versionString[0x1C]; u32 version}`.
-const SYSTEM_SW_VERSION_SIZE: u64 = 0x28;
-
-/// sceKernelGetSystemSwVersion / sceKernelGetProsperoSystemSwVersion(info):
-/// the caller sets `size` to 0x28; another size is EINVAL and nothing is
-/// written, NULL is EFAULT. The string is zero-padded; size stays.
+/// sceKernelGetSystemSwVersion / sceKernelGetProsperoSystemSwVersion(info),
+/// info = `{u64 size; char versionString[0x1C]; u32 version}`: the console
+/// neither checks nor changes `size` (any value is accepted) and writes only
+/// the zero-padded string at +8 and the version at +0x24, never past 0x28.
+/// NULL returns 0 and writes nothing.
 fn get_system_sw_version(ctx: &CpuContext, info: u64) -> HleResult {
     const KERNEL_EFAULT: HleResult = 0x8002_000Eu32 as i32 as i64;
-    const KERNEL_EINVAL: HleResult = 0x8002_0016u32 as i32 as i64;
     if info == 0 {
-        return KERNEL_EFAULT;
-    }
-    match ctx.read_u64(info) {
-        Some(SYSTEM_SW_VERSION_SIZE) => {}
-        Some(_) => return KERNEL_EINVAL,
-        None => return KERNEL_EFAULT,
+        return 0;
     }
     let mut text = [0u8; 0x1C];
     text[..SYSTEM_SW_VERSION_STRING.len()].copy_from_slice(SYSTEM_SW_VERSION_STRING);
@@ -558,11 +551,12 @@ mod tests {
         .unwrap();
     }
 
-    /// The system software version block: 0x28 bytes with the size at 0,
-    /// the string at 8 and the version at 0x24; other sizes are EINVAL
-    /// without writing, NULL is EFAULT, errno is untouched (reference
-    /// GuestSystemConfiguration / GuestSoftwareVersion cases); the allowed
-    /// SDK version is the system version with the patch bits set.
+    /// The system software version block: the string at 8 and the version
+    /// at 0x24 are written whatever the size field at 0 holds (the console
+    /// accepted 0, 1, 24, 39, 40, 41, 48, 64, 0x1000 and 2^64-1 and left
+    /// the field as it was), nothing past 0x28; NULL returns 0; errno is
+    /// untouched. The allowed SDK version is the system version with the
+    /// patch bits set.
     #[test]
     fn system_sw_version_blocks() {
         std::thread::spawn(|| {
@@ -574,23 +568,19 @@ mod tests {
             ctx.write_u32(errno, 13);
             for cb in [cb_get_system_sw_version as crate::registry::HleCallback, cb_get_system_sw_version] {
                 ctx.set(CpuRegister::Rdi, 0);
-                assert_eq!(cb(&mut ctx), 0x8002_000Eu32 as i32 as i64);
-                for size in [0u64, 0x18, 0x27, 0x29, 0x30] {
+                assert_eq!(cb(&mut ctx), 0);
+                for size in [0u64, 1, 0x18, 0x27, 0x28, 0x29, 0x30, 0x40, 0x1000, u64::MAX] {
                     ctx.write_bytes(BASE, &[0xAA; 0x30]);
                     ctx.write_u64(BASE, size);
                     ctx.set(CpuRegister::Rdi, BASE);
-                    assert_eq!(cb(&mut ctx), 0x8002_0016u32 as i32 as i64, "size {size:#x}");
-                    assert_eq!((ctx.read_u64(BASE), ctx.read_u32(BASE + 0x24), ctx.read_bytes(BASE + 8, 1).unwrap()[0]), (Some(size), Some(0xAAAA_AAAA), 0xAA));
+                    assert_eq!(cb(&mut ctx), 0, "size {size:#x}");
+                    assert_eq!(ctx.read_u64(BASE), Some(size));
+                    let text = ctx.read_bytes(BASE + 8, 0x1C).unwrap();
+                    assert_eq!(&text[..11], b"01.000.000\0");
+                    assert!(text[11..].iter().all(|&b| b == 0));
+                    assert_eq!(ctx.read_u32(BASE + 0x24), Some(0x0100_0000));
+                    assert_eq!(ctx.read_bytes(BASE + 0x28, 8).unwrap(), vec![0xAA; 8], "past the block");
                 }
-                ctx.write_bytes(BASE, &[0xAA; 0x30]);
-                ctx.write_u64(BASE, 0x28);
-                assert_eq!(cb(&mut ctx), 0);
-                assert_eq!(ctx.read_u64(BASE), Some(0x28));
-                let text = ctx.read_bytes(BASE + 8, 0x1C).unwrap();
-                assert_eq!(&text[..11], b"01.000.000\0");
-                assert!(text[11..].iter().all(|&b| b == 0));
-                assert_eq!(ctx.read_u32(BASE + 0x24), Some(0x0100_0000));
-                assert_eq!(ctx.read_bytes(BASE + 0x28, 8).unwrap(), vec![0xAA; 8], "past the block");
             }
             ctx.set(CpuRegister::Rdi, 0);
             assert_eq!(cb_get_allowed_sdk_version_on_system(&mut ctx), 0x8002_0016u32 as i32 as i64);

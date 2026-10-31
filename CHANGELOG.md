@@ -13,9 +13,17 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ### Fixed
 
+- PlayGo reads the chunk count from `playgo-chunks.xml` in the game folder, so games whose dump has no other PlayGo data no longer get "PlayGo not supported" from `scePlayGoOpen` (DOOM: The Dark Ages crashed right after start).
+- DOOM: The Dark Ages no longer loses the GPU ("Vulkan device lost", exit code 3) on the title screen. A slot of the bindless texture set kept its descriptor when a texture's new view got the same handle as its old one, but the driver hands out the handle of a destroyed view again, so the slot still described the destroyed view and sampling it hung the GPU. A slot now belongs to one view of one image.
+- Textures selected through large bindless tables share one slot per view between the tables that read them. DOOM: The Dark Ages reads one texture heap through six tables and filled the 131 072-slot set ("bindless set full"); its draws then failed and the title screen stayed black.
 - Pipelines of the saved shader list that use the bindless texture set are built at the start too; they failed with no pipeline layout and were built during play in every run (GTA V: 39 of 2302 pipelines, the ray-tracing ones, 2-4 s each) (`RPS5E_PREWARM_BINDLESS`).
 - Shaders and pipelines added to the saved shader list are kept within a second (a journal next to the list, `RPS5E_PREWARM_JOURNAL`), so a run that crashes or is killed no longer loses the last 30 s of them.
 - Pipelines of shaders that read their own code address and turned out not relocatable are saved under the shader's own key, so the next run finds them in the list.
+- `sceKernelCreateSema` accepts the attribute bit 0x100 (values 0x100-0x102), as the console does; it returned EINVAL.
+- `sceKernelGetSystemSwVersion` and `sceKernelGetProsperoSystemSwVersion` accept any value in the block's size field and leave it as it is, and return 0 for a null pointer, as the console does; they returned EINVAL and EFAULT.
+- `scePthreadCondSignalto` returns ESRCH for a handle that names no thread and EPERM for a thread that does not wait on the condition variable, as the console does; it returned success.
+- `sceKernelHasTrinityMode` is implemented and reports a base PS5 (0); it was missing, and its unimplemented-call error read as "PS5 Pro mode available".
+- Block-compressed textures whose descriptor has the compression bit set are no longer read through colour-compression metadata at the descriptor's (meaningless) metadata address.
 
 ## [0.1.3-alpha] - 2026-10-31
 

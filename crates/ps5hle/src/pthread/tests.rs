@@ -242,6 +242,13 @@ fn cond_broadcast_and_signalto() {
     assert_eq!(t.join().unwrap(), OK);
     wait_for(&ctx, 1);
     assert_eq!(call(&mut ctx, cb_cond_signalto, &[c, 0]), EINVAL);
+    // No such thread: ESRCH; a thread that does not wait there: EPERM. The
+    // remaining waiter keeps waiting.
+    assert_eq!(call(&mut ctx, cb_cond_signalto, &[c, 0x7_FFFF_FF00]), ESRCH);
+    let (idle, _) = fake_thread("idle", 0);
+    assert_eq!(call(&mut ctx, cb_cond_signalto, &[c, idle]), EPERM);
+    forget_fake_thread(idle);
+    wait_for(&ctx, 1);
     assert_eq!(call(&mut ctx, cb_cond_broadcast, &[c]), OK);
     for (_, t) in ts {
         assert_eq!(t.join().unwrap(), OK);

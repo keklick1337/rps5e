@@ -23,7 +23,7 @@
 //! unlock hands the mutex to the longest sleeper (FIFO) instead.
 
 use super::{alloc_object, attr_object, current_handle, free_object, OBJECT_REGION, OBJECT_REGION_SIZE, OBJECT_SIZE};
-use super::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, EPERM, ETIMEDOUT, OK};
+use super::{EAGAIN, EBUSY, EDEADLK, EINVAL, ENOMEM, EPERM, ESRCH, ETIMEDOUT, OK};
 use crate::context::CpuContext;
 use crate::registry::HleResult;
 use std::cell::RefCell;
@@ -1266,13 +1266,41 @@ pub(super) fn cb_cond_signal(ctx: &mut CpuContext) -> HleResult {
     cond_wake(ctx, Some(None))
 }
 
-/// scePthreadCondSignalto(cond*, thread)
+/// scePthreadCondSignalto(cond*, thread): wakes `thread` if it waits on the
+/// condition variable. A null thread is EINVAL, a handle that names no
+/// thread ESRCH, a thread that does not wait there EPERM (the console's
+/// order of checks).
 pub(super) fn cb_cond_signalto(ctx: &mut CpuContext) -> HleResult {
     let thread = ctx.rsi();
     if thread == 0 {
         return EINVAL;
     }
-    cond_wake(ctx, Some(Some(thread)))
+    let c = match resolve_cond(ctx, ctx.rdi()) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let mut s = lock(&c.state);
+    if s.waiters.iter().any(|w| w.handle.load(Ordering::Relaxed) == thread) {
+        wake_waiter(&mut s, Some(thread));
+        return OK;
+    }
+    drop(s);
+    if !signalto_errors() {
+        return OK;
+    }
+    let r = if super::thread_exists(thread) { EPERM } else { ESRCH };
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+        log::info!("[pthread] scePthreadCondSignalto({:#x}, thread {thread:#x}): {}", ctx.rdi(), if r == EPERM { "not waiting (EPERM)" } else { "no such thread (ESRCH)" });
+    }
+    r
+}
+
+/// `RPS5E_SIGNALTO_ERRORS=0`: scePthreadCondSignalto returns success when
+/// the thread does not wait on the condition variable (the old behaviour).
+fn signalto_errors() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_SIGNALTO_ERRORS").map_or(true, |v| v != "0"))
 }
 
 pub(super) fn cb_cond_broadcast(ctx: &mut CpuContext) -> HleResult {

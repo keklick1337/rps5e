@@ -8,6 +8,8 @@
 //! (see [`set_app_root`]), tried in this order:
 //! - `sce_sys/playgo-chunk.dat`: magic "plgo" (PS4 layout) or "plgx" (PS5
 //!   packages), u16 chunk count at offset 10 (a zero count is no metadata);
+//! - `playgo-chunks.xml` (the PS5 package project): `<chunk_info chunk_count>`,
+//!   else highest `<chunk id>` + 1;
 //! - `playgo-chunkdefs.xml`: highest `<chunks default_chunk>` / `<chunk id>` + 1;
 //! - `Data/chunkmanifest`: highest `\x08id\0` + u32 record + 1, ids dense from 0.
 //! Chunk ids `0..count` are valid and installed (LOCAL_FAST). A package with
@@ -150,8 +152,9 @@ pub const fn convert_language(system_language: i32) -> u64 {
 
 /// Chunk count from the package metadata below `root`.
 pub fn load_chunks_num(root: &Path) -> Option<u32> {
-    let sources: [(PathBuf, fn(&[u8]) -> Option<u32>); 3] = [
+    let sources: [(PathBuf, fn(&[u8]) -> Option<u32>); 4] = [
         (root.join("sce_sys").join("playgo-chunk.dat"), parse_playgo_dat),
+        (root.join("playgo-chunks.xml"), parse_chunks_project),
         (root.join("playgo-chunkdefs.xml"), parse_chunkdefs),
         (root.join("Data").join("chunkmanifest"), parse_chunk_manifest),
     ];
@@ -244,6 +247,20 @@ fn parse_chunkdefs(data: &[u8]) -> Option<u32> {
         pos = tag_end + 1;
     }
     (found && max_id < MAX_CHUNKS).then_some(max_id + 1)
+}
+
+/// `playgo-chunks.xml`: `<chunk_info chunk_count="N">`, or the highest
+/// `<chunk id="N">` plus one when the count is missing.
+fn parse_chunks_project(data: &[u8]) -> Option<u32> {
+    let xml = String::from_utf8_lossy(data);
+    if let Some(p) = xml.find("<chunk_info") {
+        if let Some(end) = xml[p..].find('>') {
+            if let Some(n) = parse_xml_uint_attr(&xml[p..p + end], "chunk_count") {
+                return (n != 0 && n <= MAX_CHUNKS).then_some(n);
+            }
+        }
+    }
+    parse_chunkdefs(data)
 }
 
 /// `Data/chunkmanifest`: binary records `\x08 'i' 'd' \0` followed by a u32
@@ -851,11 +868,16 @@ mod tests {
         assert_eq!(load_chunks_num(&dir), Some(1));
         std::fs::write(dir.join("playgo-chunkdefs.xml"), br#"<chunks default_chunk="0"><chunk id="3"/>"#).unwrap();
         assert_eq!(load_chunks_num(&dir), Some(4));
+        std::fs::write(dir.join("playgo-chunks.xml"), br#"<volume><chunk_info chunk_count="16" scenario_count="1"><chunks><chunk id="0"/>"#).unwrap();
+        assert_eq!(load_chunks_num(&dir), Some(16));
         std::fs::write(dir.join("sce_sys").join("playgo-chunk.dat"), b"plgo\0\0\0\0\0\0\x09\0").unwrap();
         assert_eq!(load_chunks_num(&dir), Some(9));
         // A corrupt first source falls through to the next one.
         std::fs::write(dir.join("sce_sys").join("playgo-chunk.dat"), b"junk").unwrap();
-        assert_eq!(load_chunks_num(&dir), Some(4));
+        assert_eq!(load_chunks_num(&dir), Some(16));
+        // Without chunk_count the project falls back to the chunk ids.
+        std::fs::write(dir.join("playgo-chunks.xml"), br#"<chunks><chunk id="0"/><chunk id="5"/>"#).unwrap();
+        assert_eq!(load_chunks_num(&dir), Some(6));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

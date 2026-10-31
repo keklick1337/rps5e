@@ -53,7 +53,9 @@ const GUEST_CPU_COUNT: i32 = 13;
 // System mode / GPO
 // ---------------------------------------------------------------------------
 
-/// sceKernelIsTrinityMode(): the emulated console is a base PS5.
+/// sceKernelIsTrinityMode() / sceKernelHasTrinityMode(): the emulated
+/// console is a base PS5, which neither runs in nor offers the PS5 Pro
+/// (Trinity) mode.
 fn cb_is_trinity_mode(_ctx: &mut CpuContext) -> HleResult {
     0
 }
@@ -1209,6 +1211,7 @@ const EXPORTS: &[(&str, &str, &str, HleCallback)] = &[
     ("DpDnfM6StzA", "sceKernelMapTraceMemory", LIB_KERNEL, cb_fw_enosys),
     ("eESTogkCMPE", "sceKernelTraceMemoryTypeProtect", LIB_KERNEL, cb_fw_enosys),
     ("tU5e3f9gSiU", "sceKernelIsTrinityMode", LIB_KERNEL, cb_is_trinity_mode),
+    ("yu17wG8L5FI", "sceKernelHasTrinityMode", LIB_KERNEL, cb_is_trinity_mode),
     ("ca7v6Cxulzs", "sceKernelSetGPO", LIB_KERNEL, cb_set_gpo),
     ("4oXYe9Xmk0Q", "sceKernelGetGPI", LIB_KERNEL, cb_get_gpi),
     ("DLORcroUqbc", "sceKernelGetOpenPsId", LIB_KERNEL, cb_get_open_ps_id),

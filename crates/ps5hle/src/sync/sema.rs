@@ -327,6 +327,19 @@ fn value(handle: u32) -> Option<i32> {
     get(handle).map(|s| lock_inner(&s).count)
 }
 
+/// Attribute bits `sceKernelCreateSema` accepts: the queueing order in bits
+/// 0-1 (1 FIFO, 2 priority, 3 invalid) and bit 0x100, which the console
+/// accepts with no visible effect on the semaphore.
+const SEMA_ATTR_BITS: u32 = 0x103;
+
+/// Whether `attr` is a valid semaphore attribute.
+/// `RPS5E_SEMA_ATTR_0X100=0` rejects bit 0x100 (EINVAL, the old behaviour).
+fn valid_sema_attr(attr: u32) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let bits = if *ON.get_or_init(|| std::env::var("RPS5E_SEMA_ATTR_0X100").map_or(true, |v| v != "0")) { SEMA_ATTR_BITS } else { 3 };
+    attr & !bits == 0 && attr & 3 != 3
+}
+
 /// sceKernelCreateSema(SceKernelSema* sem, const char* name, u32 attr, int init, int max, opt*)
 fn cb_create_sema(ctx: &mut CpuContext) -> HleResult {
     let out = ctx.rdi();
@@ -335,12 +348,16 @@ fn cb_create_sema(ctx: &mut CpuContext) -> HleResult {
     let init = ctx.rcx() as i32;
     let max = ctx.r8() as i32;
     let opt = ctx.r9();
-    if out == 0 || name_ptr == 0 || attr > 2 || init < 0 || max <= 0 || init > max || opt != 0 {
+    if out == 0 || name_ptr == 0 || !valid_sema_attr(attr) || init < 0 || max <= 0 || init > max || opt != 0 {
         return ERR_INVALID_ARGUMENT;
     }
     let Some(name) = read_name(ctx, name_ptr, MAX_NAME_LEN) else { return ERR_MEMORY_FAULT };
-    log::debug!("[sema] create name='{name}' attr={attr:#x} init={init} max={max}");
-    let handle = create(name, attr == 1, init, max);
+    if attr & 0x100 != 0 {
+        log::info!("[sema] create name='{name}' attr={attr:#x} init={init} max={max}");
+    } else {
+        log::debug!("[sema] create name='{name}' attr={attr:#x} init={init} max={max}");
+    }
+    let handle = create(name, attr & 3 == 1, init, max);
     if !ctx.write_u64(out, handle as u64) {
         delete(handle);
         return ERR_MEMORY_FAULT;
@@ -752,6 +769,35 @@ mod tests {
         assert_eq!(poll(h, 1), ERR_BUSY);
         assert!(delete(h));
         assert_eq!(poll(h, 1), ERR_NOT_FOUND);
+    }
+
+    /// The attribute values the console accepts and rejects (measured on a
+    /// PS5): bit 0x100 is allowed next to the queueing order.
+    #[test]
+    fn create_accepts_the_console_attribute_bits() {
+        for attr in [0, 1, 2, 0x100, 0x101, 0x102] {
+            assert!(valid_sema_attr(attr), "{attr:#x}");
+        }
+        for attr in [3, 0x103, 0x200, 0x1000, 0x10000, 0x8000_0000, u32::MAX] {
+            assert!(!valid_sema_attr(attr), "{attr:#x}");
+        }
+        const BASE: u64 = 0x5CF4_0000_0000;
+        let vm = vm_arena(BASE);
+        let mut ctx = CpuContext::new(vm);
+        assert!(ctx.write_bytes(BASE + 0x100, b"s\0"));
+        let create = |ctx: &mut CpuContext, attr: u64| {
+            for (r, v) in [(CpuRegister::Rdi, BASE), (CpuRegister::Rsi, BASE + 0x100), (CpuRegister::Rdx, attr), (CpuRegister::Rcx, 0), (CpuRegister::R8, 1), (CpuRegister::R9, 0)] {
+                ctx.set(r, v);
+            }
+            cb_create_sema(ctx)
+        };
+        assert_eq!(create(&mut ctx, 0x101), OK);
+        let h = ctx.read_u64(BASE).unwrap() as u32;
+        assert_eq!(signal(h, 1), OK);
+        assert_eq!(poll(h, 1), OK);
+        assert!(delete(h));
+        assert_eq!(create(&mut ctx, 0x103), ERR_INVALID_ARGUMENT);
+        assert_eq!(create(&mut ctx, 0x200), ERR_INVALID_ARGUMENT);
     }
 
     #[test]
