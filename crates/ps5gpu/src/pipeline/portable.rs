@@ -65,8 +65,10 @@ impl std::fmt::Display for ImportSummary {
 
 /// The portable file of the list at `list_path` for `title`.
 pub fn export(list_path: &Path, title: &str) -> Result<Vec<u8>, String> {
-    let file = std::fs::read(list_path).map_err(|e| format!("{}: {e}", list_path.display()))?;
-    let (_, modules, graphics, compute) = prewarm::decode(&file).ok_or_else(|| format!("{}: not a shader prewarm list of this format", list_path.display()))?;
+    if !list_path.exists() && prewarm::journal_files(list_path).is_empty() {
+        return Err(format!("{}: no such file", list_path.display()));
+    }
+    let (_, modules, graphics, compute) = prewarm::read_merged(list_path).ok_or_else(|| format!("{}: not a shader prewarm list of this format", list_path.display()))?;
     Ok(encode(title, modules, graphics, compute))
 }
 

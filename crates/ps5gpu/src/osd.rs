@@ -120,11 +120,33 @@ pub enum CompileOverlay {
     /// The game waits for its shaders: the full panel.
     Full(CompileProgress),
     /// Compiles in the background while the game runs: the jobs done and
-    /// in all since they started piling up (the bar under the count).
-    Background { done: u64, total: u64 },
+    /// in all since they started piling up (the bar under the count);
+    /// `cache`: the title's shader cache list is being built (counts of
+    /// its jobs) rather than shaders the game asked for.
+    Background { done: u64, total: u64, cache: bool },
 }
 
 static PROGRESS: Mutex<Option<CompileProgress>> = Mutex::new(None);
+
+/// The title's shader cache list built in the background while the game
+/// runs: (done, total) jobs.
+static PREWARM: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// Show (Some) or hide (None) the background build of the title's shader
+/// cache list in the corner indicator.
+pub fn set_prewarm_progress(p: Option<(u64, u64)>) {
+    let mut g = PREWARM.lock().unwrap_or_else(|e| e.into_inner());
+    if *g != p {
+        *g = p;
+        drop(g);
+        crate::input::wake();
+    }
+}
+
+/// The background build of the shader cache list, if one runs.
+pub fn prewarm_progress() -> Option<(u64, u64)> {
+    *PREWARM.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Show (Some) or hide (None) the full compile progress panel.
 pub fn set_compile_progress(p: Option<CompileProgress>) {
@@ -180,9 +202,12 @@ pub fn compile_overlay() -> Option<CompileOverlay> {
     if !indicator_enabled() {
         return None;
     }
+    if let Some((done, total)) = prewarm_progress() {
+        return Some(CompileOverlay::Background { done, total, cache: true });
+    }
     let pending = crate::pipeline::pool::foreground_pending();
     let finished = crate::pipeline::pool::foreground_done();
-    INDICATOR.lock().unwrap_or_else(|e| e.into_inner()).update(pending, finished, Instant::now()).map(|(done, total)| CompileOverlay::Background { done, total })
+    INDICATOR.lock().unwrap_or_else(|e| e.into_inner()).update(pending, finished, Instant::now()).map(|(done, total)| CompileOverlay::Background { done, total, cache: false })
 }
 
 /// Time until the current hint expires (the window redraws then).

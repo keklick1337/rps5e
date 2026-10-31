@@ -2,6 +2,21 @@
 
 All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Play mode no longer waits for shaders at all: a draw whose pipeline is still compiling is skipped from the first frame and drawn from the frame its pipeline is ready (the per-frame wait of 3 ms is now 0, `--compile-wait`); a pipeline the pipeline cache already holds is made on the spot instead of being skipped (`RPS5E_INLINE_PROBE`). Draws that write memory, draws without render targets and compute dispatches still wait, since the game and later GPU work read what they write.
+- The saved shader list of a game is built in the background while the game runs (on all compile workers, with "Building the shader cache: done / total" in the corner) instead of before the game starts; `--prewarm-wait` (`RPS5E_PREWARM_WAIT=1`) keeps the old behaviour. Tests and input replays still build it first.
+- Compiles are ordered by need: the shaders a draw or dispatch needs now, then the saved list, then the compile lookahead's guesses; an eighth of the compile workers is kept free for the shaders needed now.
+- The compile lookahead also reads the command buffers already queued after the current one, on every GPU queue, and reads past flips and conditional commands (`RPS5E_LOOKAHEAD_QUEUED`, `RPS5E_LOOKAHEAD_GUESS`); the GPU command thread starts it whenever it meets a new compute program (`RPS5E_LOOKAHEAD_EAGER`), so it also works while draws are recorded on their own thread, where it found nothing before.
+
+### Fixed
+
+- Pipelines of the saved shader list that use the bindless texture set are built at the start too; they failed with no pipeline layout and were built during play in every run (GTA V: 39 of 2302 pipelines, the ray-tracing ones, 2-4 s each) (`RPS5E_PREWARM_BINDLESS`).
+- Shaders and pipelines added to the saved shader list are kept within a second (a journal next to the list, `RPS5E_PREWARM_JOURNAL`), so a run that crashes or is killed no longer loses the last 30 s of them.
+- Pipelines of shaders that read their own code address and turned out not relocatable are saved under the shader's own key, so the next run finds them in the list.
+
 ## [0.1.3-alpha] - 2026-10-31
 
 ### Fixed
@@ -142,6 +157,7 @@ First public alpha.
 - The project is named RustPS5Emu (RPS5E): binaries `rps5e` and `rps5e-cli`, environment variables `RPS5E_*`, data, settings and caches under `rps5e` folders.
 - Release packages: `scripts/package.sh` (Linux tarball, Windows zip) with a `dist` build profile without debug info.
 
+[Unreleased]: https://github.com/keklick1337/rps5e/compare/v0.1.3-alpha...HEAD
 [0.1.3-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.3-alpha
 [0.1.2-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.2-alpha
 [0.1.1-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.1-alpha

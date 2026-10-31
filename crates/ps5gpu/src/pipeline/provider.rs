@@ -169,6 +169,19 @@ pub struct ProviderStats {
     pub hastened_compiles: u64,
     /// Compiles finished within the per-frame wait budget (draws not skipped).
     pub compile_budget_waits: u64,
+    /// Blocking compile waits by what waited ([`WaitClass`]): count and ns
+    /// (under the back-end lock; the unlocked waits are in
+    /// [`super::unlocked_wait::WAITED_BY`]).
+    pub wait_counts: [u64; WAIT_CLASSES],
+    pub wait_ns: [u64; WAIT_CLASSES],
+    /// Graphics pipelines a skipping draw found in the pipeline cache on
+    /// the command thread ([`inline_probe_enabled`]): hits, misses, ns.
+    pub inline_probe_hits: u64,
+    pub inline_probe_misses: u64,
+    pub inline_probe_ns: u64,
+    /// Draws whose only memory writes are storage images
+    /// ([`DrawWrites::skippable`]) tried while a compile was pending.
+    pub image_writer_compiles: u64,
     /// Streamed ranges reused from an earlier copy of the tick.
     pub stream_memo_hits: u64,
     /// Draws and dispatches during which a submit moved the open tick
@@ -429,6 +442,12 @@ fn compile_wait_budget() -> std::time::Duration {
     *BUDGET.get_or_init(|| parse_compile_wait(std::env::var("RPS5E_COMPILE_WAIT_MS").ok().as_deref()))
 }
 
+/// Interactive play: draws do not wait for compiles without limit
+/// (`RPS5E_COMPILE_WAIT_MS` set to a number of milliseconds).
+pub fn play_mode() -> bool {
+    compile_wait_budget() != std::time::Duration::MAX
+}
+
 /// The budget a `RPS5E_COMPILE_WAIT_MS` value names (None: unset).
 pub fn parse_compile_wait(v: Option<&str>) -> std::time::Duration {
     match v.map(str::trim) {
@@ -436,6 +455,137 @@ pub fn parse_compile_wait(v: Option<&str>) -> std::time::Duration {
         Some(v) if ["exact", "wait", "inf"].iter().any(|w| v.eq_ignore_ascii_case(w)) => std::time::Duration::MAX,
         Some(v) => v.parse().map_or(std::time::Duration::MAX, std::time::Duration::from_millis),
     }
+}
+
+/// ` waits=[cs 3/120+4000ms ...] probe=2/5/1ms`: blocking compile waits
+/// per [`WaitClass`] (count / ms under the lock + ms unlocked) and the
+/// inline pipeline-cache probes of skipping draws.
+fn wait_classes_text(s: &ProviderStats, misses: &[u64; 4], outcomes: &[u64; 8]) -> String {
+    let parts: Vec<String> = (0..WAIT_CLASSES)
+        .map(|c| {
+            let unlocked = super::unlocked_wait::WAITED_BY[c].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000;
+            format!("{} {}/{}+{}ms", WAIT_CLASS_NAMES[c], s.wait_counts[c], s.wait_ns[c] / 1_000_000, unlocked)
+        })
+        .collect();
+    format!(
+        " waits=[{}] image-writers={} probe={}/{}/{}ms{} ahead-misses=[unseen {} module {} other-pipeline {} other-module {}] ahead-tries=[{}]",
+        parts.join(" "),
+        s.image_writer_compiles,
+        s.inline_probe_hits,
+        s.inline_probe_misses,
+        s.inline_probe_ns / 1_000_000,
+        super::lookahead::stats_text(),
+        misses[0],
+        misses[1],
+        misses[2],
+        misses[3],
+        AHEAD_OUTCOMES.iter().zip(outcomes).map(|(n, c)| format!("{n} {c}")).collect::<Vec<_>>().join(" ")
+    )
+}
+
+/// The memory a draw's stages write besides its attachments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DrawWrites {
+    /// Storage buffers written or updated atomically.
+    buffers: u16,
+    atomics: u16,
+    /// Storage images written, and those updated atomically.
+    images: u16,
+    image_atomics: u16,
+    /// Device-address ranges written.
+    device: u16,
+    gds: bool,
+}
+
+impl DrawWrites {
+    fn of(p: &PreparedStage) -> DrawWrites {
+        let info = &p.resources.info;
+        DrawWrites {
+            buffers: info.buffers.iter().filter(|b| b.written || b.atomic).count() as u16,
+            atomics: info.buffers.iter().filter(|b| b.atomic).count() as u16,
+            images: info.images.iter().filter(|i| i.written || i.atomic).count() as u16,
+            image_atomics: info.images.iter().filter(|i| i.atomic).count() as u16,
+            device: p.snapshot.device_address_ranges.iter().filter(|r| r.written).count() as u16,
+            gds: p.layout.find(DescriptorBindingKind::GlobalDataShare).is_some(),
+        }
+    }
+
+    fn with(self, o: DrawWrites) -> DrawWrites {
+        DrawWrites {
+            buffers: self.buffers + o.buffers,
+            atomics: self.atomics + o.atomics,
+            images: self.images + o.images,
+            image_atomics: self.image_atomics + o.image_atomics,
+            device: self.device + o.device,
+            gds: self.gds || o.gds,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.buffers + self.images + self.device != 0 || self.gds
+    }
+
+    /// The draw writes storage images only, without atomics: a skipped
+    /// one leaves those images without the frame's results like a skipped
+    /// attachment. Buffers (GPU-driven lists, counters, results the CPU or
+    /// later frames read), atomics, device-address stores and GDS are not
+    /// skipped: their consumers cannot tell a missing write from an empty
+    /// result, and some state carries over frames.
+    fn skippable(&self) -> bool {
+        self.images != 0 && self.image_atomics == 0 && self.buffers == 0 && self.device == 0 && !self.gds
+    }
+}
+
+impl std::fmt::Display for DrawWrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "writes {} buffers ({} atomic), {} images ({} atomic), {} device ranges{}", self.buffers, self.atomics, self.images, self.image_atomics, self.device, if self.gds { ", GDS" } else { "" })
+    }
+}
+
+/// `RPS5E_SKIP_IMAGE_WRITERS=1`: in play mode a draw whose only memory
+/// writes are storage images (no atomics; [`DrawWrites::skippable`]) is
+/// skipped while its pipeline compiles, like a draw writing only its
+/// attachments, instead of waiting.
+fn skip_image_writers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_SKIP_IMAGE_WRITERS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on")))
+}
+
+/// What a compile wait held up (the `waits=` counters of the pipeline
+/// line): a dispatch, a draw that writes memory, a draw without
+/// attachments (both always wait: later work reads what they write), or a
+/// draw that writes only its attachments (waits within the frame's
+/// budget, then is skipped).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum WaitClass {
+    Dispatch = 0,
+    DrawMemory = 1,
+    DrawNoTargets = 2,
+    #[default]
+    Draw = 3,
+}
+
+pub const WAIT_CLASSES: usize = 4;
+
+/// Names of the [`WaitClass`] counters.
+pub const WAIT_CLASS_NAMES: [&str; WAIT_CLASSES] = ["cs", "mem", "notgt", "draw"];
+
+/// `RPS5E_PREWARM_BINDLESS=0`: the prewarm list's pipelines over the
+/// bindless set are left to the draws and dispatches that use them (the
+/// set is then made at the first bindless bind, too late for the list).
+fn bindless_prewarm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_PREWARM_BINDLESS").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
+/// `RPS5E_INLINE_PROBE=0`: a draw that would be skipped for a missing
+/// graphics pipeline does not first ask the pipeline cache for it on the
+/// command thread (`FAIL_ON_PIPELINE_COMPILE_REQUIRED`: a cached pipeline
+/// is made in well under a millisecond, an uncached one is refused at
+/// once and built on a compile worker).
+fn inline_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_INLINE_PROBE").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
 }
 
 /// `RPS5E_RELOCATABLE_CODE=0`: a program that reads its own address
@@ -496,10 +646,16 @@ fn compile_threads_env() -> Option<usize> {
     std::env::var("RPS5E_COMPILE_THREADS").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0)
 }
 
-/// (workers, prewarm share) of the game's pool on `cores` logical CPUs.
+/// (workers, prewarm share) of the game's pool on `cores` logical CPUs:
+/// the prewarm list and the compile lookahead leave an eighth of the
+/// workers (at least two, from four workers up) to the compiles draws and
+/// dispatches wait for. A job cannot be taken from the worker running it,
+/// so a pipeline a dispatch needs now would otherwise wait for a worker
+/// to finish a guess or a list build of up to seconds.
 fn pool_size(cores: usize, threads: Option<usize>) -> (usize, usize) {
     let threads = threads.unwrap_or_else(|| cores.saturating_sub(2).max(2)).max(1);
-    (threads, threads)
+    let reserve = if threads >= 4 { (threads / 8).max(2) } else { 0 };
+    (threads, threads - reserve)
 }
 
 /// The compile lookahead state of a provider (see `compile_ahead`).
@@ -510,6 +666,53 @@ struct Ahead {
     position: u64,
     handled: crate::fxhash::HashSet<u64>,
     queue_only: bool,
+    /// Upcoming dispatches whose module was still compiling when they were
+    /// seen: their pipelines are queued once a lookahead module finishes
+    /// ([`ShaderPipelines::retry_deferred_ahead`]), not only when another
+    /// wait scans again.
+    deferred: Vec<Deferred>,
+    deferred_ids: crate::fxhash::HashSet<u64>,
+    /// Modules the lookahead queued that are not finished yet.
+    modules: crate::fxhash::HashSet<u64>,
+    /// A module of [`Self::modules`] finished since the deferred ones
+    /// were tried.
+    retry: bool,
+    /// Compute pipelines the lookahead queued, by module, and the program
+    /// of each module it queued: a dispatch that then misses is counted
+    /// as a mismatch (the lookahead guessed another key), a module-only
+    /// miss, or unseen ([`Self::misses`]).
+    pipelines_of: crate::fxhash::HashMap<u64, smallvec::SmallVec<[ComputeKey; 2]>>,
+    /// Dispatches of eager scans already handled.
+    offered: crate::fxhash::HashSet<u64>,
+    programs: crate::fxhash::HashMap<u64, u64>,
+    /// Compute misses: [unseen program, module queued but no pipeline,
+    /// pipeline of another key, module of another key].
+    misses: [u64; 4],
+    /// What became of the upcoming dispatches tried ([`AHEAD_OUTCOMES`]).
+    outcomes: [u64; 8],
+    /// The module the last lookahead module request is still compiling
+    /// (a deferred dispatch is tried again only once it is not pending).
+    last_module: u64,
+}
+
+/// Outcomes of [`ShaderPipelines::compile_dispatch_ahead`].
+const AHEAD_OUTCOMES: [&str; 8] = ["unbound", "thread-dims", "no-program", "unprepared", "module-compiling", "module-failed", "no-layout", "queued"];
+
+/// Upcoming dispatches kept for [`Ahead::deferred`] at most.
+const AHEAD_DEFERRED: usize = 4096;
+
+/// Tries of a deferred dispatch that is not waiting for its module (its
+/// resources read words GPU work still writes) before it is dropped: the
+/// dispatch itself compiles what it needs when it runs.
+const AHEAD_UNPREPARED_TRIES: u8 = 4;
+
+/// An upcoming dispatch the lookahead could not queue yet.
+struct Deferred {
+    id: u64,
+    /// The module it waits for (0: none; its stage could not be prepared).
+    module: u64,
+    tries: u8,
+    dispatch: ResolvedDispatch,
 }
 
 /// The compute stage's module permutation of a dispatch: the stage
@@ -571,6 +774,16 @@ struct PrewarmCounts {
     /// Modules of the list translated again / that failed to.
     translated: usize,
     failed: usize,
+    /// Jobs of the list built in the background while the game runs
+    /// ([`ShaderPipelines::start_prewarm`]): the most left at once (the
+    /// indicator's total), 0 when none runs.
+    background_total: usize,
+    /// Pipeline records of the list not queued, by why: [a module missing
+    /// or failed, the layout failed, rect-list stages failed, the same
+    /// pipeline queued or made already].
+    skipped: [usize; 4],
+    /// Pipelines made during play that the list did not hold (logged).
+    unlisted: usize,
 }
 
 /// Progress of [`ShaderPipelines::prewarm_now`].
@@ -1607,6 +1820,14 @@ pub struct ShaderPipelines {
     /// The last item was given up for a pending compile
     /// ([`Failure::Pending`]; taken by the back-end).
     compile_pending: bool,
+    /// What the item being recorded is, for the compile-wait counters.
+    wait_class: WaitClass,
+    /// The memory writes of the last draw that writes memory (named in the
+    /// log of long waits).
+    draw_writes: DrawWrites,
+    /// What the item being recorded waits for (set when a blocking wait
+    /// starts; named in the log of long unlocked waits).
+    waiting_for: String,
     presented_frames: u64,
     /// Ranges of the current draw bound from copies of their guest bytes.
     /// The ranges the open draw's bindings stream (GPU_PLAN §52: the
@@ -1696,6 +1917,10 @@ pub(crate) struct PipelineTables {
     /// dependent (this run).
     relocating: Shared<HashMap<u64, u64>>,
     not_relocatable: Shared<crate::fxhash::HashSet<u64>>,
+    /// The plain key of each relocatable key whose translation was address
+    /// dependent: pipelines over it are listed with the plain key (the
+    /// module the list holds and the next run looks up).
+    relocated_plain: Shared<crate::fxhash::HashMap<u64, u64>>,
     pending_graphics: Shared<crate::fxhash::HashSet<GraphicsKey>>,
     /// Graphics pipeline libraries made, queued, and failed
     /// ([`super::library`]).
@@ -1729,6 +1954,9 @@ pub(crate) struct PipelineTables {
     prewarm_translating: Shared<crate::fxhash::HashSet<u64>>,
     prewarm_deferred: Shared<Vec<PrewarmPipeline>>,
     prewarm_counts: Shared<PrewarmCounts>,
+    /// Module keys and program addresses of the list as loaded.
+    prewarm_listed: Shared<crate::fxhash::HashSet<u64>>,
+    prewarm_listed_programs: Shared<crate::fxhash::HashSet<u64>>,
     cache_path: Shared<Option<std::path::PathBuf>>,
     /// Set-layout bindings and push stages of each pipeline layout made.
     layout_descs: Shared<HashMap<vk::PipelineLayout, (Vec<super::descriptors::BindingDesc>, u32)>>,
@@ -2343,6 +2571,7 @@ impl ShaderPipelines {
             pending_modules: Shared::new(Default::default()),
             relocating: Shared::new(Default::default()),
             not_relocatable: Shared::new(Default::default()),
+            relocated_plain: Shared::new(Default::default()),
             pending_graphics: Shared::new(Default::default()),
             libraries: Shared::new(Default::default()),
             pending_libraries: Shared::new(Default::default()),
@@ -2361,6 +2590,8 @@ impl ShaderPipelines {
             prewarm_translating: Shared::new(Default::default()),
             prewarm_deferred: Shared::new(Vec::new()),
             prewarm_counts: Shared::new(Default::default()),
+            prewarm_listed: Shared::new(Default::default()),
+            prewarm_listed_programs: Shared::new(Default::default()),
             cache_path: Shared::new(cache_path),
             layout_descs: Shared::new(HashMap::default()),
         });
@@ -2447,6 +2678,9 @@ impl ShaderPipelines {
             compile_wait_left: compile_wait_budget(),
             compile_wait: compile_wait_budget(),
             compile_pending: false,
+            wait_class: WaitClass::Draw,
+            draw_writes: DrawWrites::default(),
+            waiting_for: String::new(),
             presented_frames: 0,
             layout_memo: HashMap::default(),
             streams: Vec::new(),
@@ -2643,9 +2877,13 @@ impl ShaderPipelines {
                 let key = hash_of(&(p.plan.hash, p.code_hash, address, prepared.resource_key, options, mesh, float_mode));
                 // A program that reads its own address shares one module
                 // wherever it is loaded once a relocatable translation of it
-                // proved independent of the address.
+                // proved independent of the address. The module of the
+                // program at its own address, when there is one (made
+                // earlier, or loaded from the prewarm list after its
+                // relocatable translation failed the proof), is the exact
+                // translation: it serves without a relocatable try.
                 let key = match relocation_key(p, prepared, options, mesh, float_mode) {
-                    Some(rkey) if self.relocation_serves(rkey, p.address) => rkey,
+                    Some(rkey) if !self.t.modules.contains_key(&key) && self.relocation_serves(rkey, p.address) => rkey,
                     _ => key,
                 };
                 self.stats.module_key_misses += 1;
@@ -2742,15 +2980,29 @@ impl ShaderPipelines {
             return self.module_ready(key);
         };
         if self.t.pending_modules.w().insert(key) {
-            if stage == ShaderStage::Compute && !self.ahead.queue_only {
-                self.stats.ahead_misses += 1;
+            if self.ahead.queue_only {
+                self.ahead.modules.insert(key);
+                if self.ahead.programs.len() < 1 << 16 {
+                    self.ahead.programs.insert(p.address, key);
+                }
+                pool.submit_lookahead(job, key);
+            } else {
+                if stage == ShaderStage::Compute {
+                    self.stats.ahead_misses += 1;
+                    let class = if self.ahead.programs.contains_key(&p.address) { 3 } else { 0 };
+                    self.ahead.misses[class] += 1;
+                    if class == 3 && self.ahead.misses[3] <= 16 {
+                        log::info!("ps5gpu: compile lookahead: cs {:#x} needed module {key:016x}, the lookahead queued {:016x}", p.address, self.ahead.programs[&p.address]);
+                    }
+                }
+                pool.submit_urgent(job, key);
             }
-            pool.submit_urgent(job, key);
-        } else {
-            // Queued by the prewarm list: needed now.
+        } else if !self.ahead.queue_only {
+            // Queued by the prewarm list or the lookahead: needed now.
             pool.hurry(key);
         }
         if self.ahead.queue_only {
+            self.ahead.last_module = key;
             return Err(Failure::Compiling);
         }
         if !wait {
@@ -2763,6 +3015,7 @@ impl ShaderPipelines {
         }
         self.stats.compile_waits += 1;
         let t = std::time::Instant::now();
+        self.note_waiting_for(|| format!("{stage:?} program {:#x} (module {key:016x})", p.address));
         self.run_queued(key);
         while !self.t.modules.contains_key(&key) {
             self.wait_compile_step(t)?;
@@ -2807,6 +3060,12 @@ impl ShaderPipelines {
         if done(self) {
             return Ok(true);
         }
+        if self.compile_wait_left.is_zero() {
+            // No wait: only what finished meanwhile (a cheap check when
+            // nothing did).
+            self.harvest();
+            return Ok(done(self));
+        }
         let start = std::time::Instant::now();
         let mut ok = false;
         while !self.compile_wait_left.is_zero() {
@@ -2826,7 +3085,11 @@ impl ShaderPipelines {
             }
         }
         if !self.compile_wait.is_zero() {
-            self.t.compile_times.w().waits.add(start.elapsed().as_nanos() as u64);
+            let ns = start.elapsed().as_nanos() as u64;
+            self.t.compile_times.w().waits.add(ns);
+            let c = self.wait_class as usize;
+            self.stats.wait_counts[c] += 1;
+            self.stats.wait_ns[c] += ns;
         }
         Ok(ok)
     }
@@ -2844,7 +3107,13 @@ impl ShaderPipelines {
     fn give_up_pending(&mut self) -> Failure {
         self.compile_ahead();
         self.compile_pending = true;
+        super::unlocked_wait::note_item(self.wait_class as usize, &self.waiting_for);
         Failure::Pending
+    }
+
+    /// Name what the item now blocks on (for the log of long waits).
+    fn note_waiting_for(&mut self, what: impl FnOnce() -> String) {
+        self.waiting_for = what();
     }
 
     /// One step of a wait, begun at `started`, for a compile the item
@@ -2905,10 +3174,38 @@ impl ShaderPipelines {
     fn note_blocking_wait(&mut self, t: std::time::Instant, what: impl FnOnce() -> String) {
         let ns = t.elapsed().as_nanos() as u64;
         self.t.compile_times.w().waits.add(ns);
+        let c = self.wait_class as usize;
+        self.stats.wait_counts[c] += 1;
+        self.stats.wait_ns[c] += ns;
         if ns >= super::timing::SLOW_MS * 1_000_000 {
             let queued = self.t.pool.as_ref().map_or(0, |p| p.in_flight());
             log::info!("ps5gpu: the command thread waited {} ms for {} ({queued} compile jobs in flight)", ns / 1_000_000, what());
         }
+    }
+
+    /// A pipeline made during play that the prewarm list loaded at the
+    /// start did not hold (its first module `module`): the first ones are
+    /// logged with whether the list held the module (else: whether it held
+    /// another module of the same program), to find why a list misses
+    /// pipelines a later run needs.
+    fn note_unlisted(&mut self, module: u64, kind: &str) {
+        if self.t.prewarm_listed.is_empty() {
+            return;
+        }
+        let n = self.t.prewarm_counts.unlisted;
+        self.t.prewarm_counts.w().unlisted += 1;
+        if n >= 32 {
+            return;
+        }
+        let address = self.t.modules.get(&module).and_then(|m| m.as_ref().ok()).map_or(0, |m| m.address);
+        let why = if self.t.prewarm_listed.contains(&module) {
+            "its module was listed"
+        } else if self.t.prewarm_listed_programs.contains(&address) {
+            "the list held another module of the program"
+        } else {
+            "the list did not hold the program"
+        };
+        log::info!("ps5gpu: shader prewarm: {kind} pipeline of program {address:#x} (module {module:016x}) made during play was not in the list: {why}");
     }
 
     /// Collect the finished compile jobs.
@@ -2917,6 +3214,68 @@ impl ShaderPipelines {
         for c in pool.take() {
             self.finish(c);
         }
+        if self.ahead.queue_only || self.speculative {
+            return;
+        }
+        if self.ahead.retry {
+            self.retry_deferred_ahead();
+        }
+        let offered = super::lookahead::take_offered();
+        if !offered.is_empty() {
+            self.compile_offered(offered);
+        }
+    }
+
+    /// Queue the compiles of dispatches the command processor's eager
+    /// scans found ([`super::lookahead::scan_unseen`]); those whose module
+    /// is still compiling are deferred like the waits' lookahead.
+    fn compile_offered(&mut self, offered: Vec<ResolvedDispatch>) {
+        self.ahead.queue_only = true;
+        for d in offered {
+            let id = super::lookahead::identity(&d);
+            if self.ahead.offered.len() > 1 << 16 {
+                self.ahead.offered.clear();
+            }
+            if !self.ahead.offered.insert(id) {
+                continue;
+            }
+            self.ahead.last_module = 0;
+            if self.compile_dispatch_ahead(&d) {
+                self.stats.lookahead_queued += 1;
+            } else if self.ahead.deferred.len() < AHEAD_DEFERRED && self.ahead.deferred_ids.insert(id) {
+                self.ahead.deferred.push(Deferred { id, module: self.ahead.last_module, tries: 1, dispatch: d });
+            }
+        }
+        self.ahead.queue_only = false;
+    }
+
+    /// Queue the pipelines of upcoming dispatches that waited for their
+    /// lookahead modules (those still waiting are kept).
+    fn retry_deferred_ahead(&mut self) {
+        self.ahead.retry = false;
+        let deferred = std::mem::take(&mut self.ahead.deferred);
+        self.ahead.queue_only = true;
+        for mut e in deferred {
+            // Still waiting for its module: nothing to try yet.
+            if e.module != 0 && self.t.pending_modules.contains(&e.module) {
+                self.ahead.deferred.push(e);
+                continue;
+            }
+            self.ahead.last_module = 0;
+            if self.compile_dispatch_ahead(&e.dispatch) {
+                self.stats.lookahead_queued += 1;
+                self.ahead.deferred_ids.remove(&e.id);
+                continue;
+            }
+            e.module = self.ahead.last_module;
+            e.tries = e.tries.saturating_add(1);
+            if e.module == 0 && e.tries >= AHEAD_UNPREPARED_TRIES {
+                self.ahead.deferred_ids.remove(&e.id);
+            } else {
+                self.ahead.deferred.push(e);
+            }
+        }
+        self.ahead.queue_only = false;
     }
 
     /// Enter a finished compile job into the caches.
@@ -2924,6 +3283,9 @@ impl ShaderPipelines {
         match c {
             Compiled::Module { key, stage, address, compiler, result, translate_ns, module_ns, source, relocated } => {
                 self.t.pending_modules.w().remove(&key);
+                if self.ahead.modules.remove(&key) {
+                    self.ahead.retry = true;
+                }
                 self.t.relocating.w().remove(&key);
                 self.t.compile_times.w().translate.add(translate_ns);
                 if result.is_ok() {
@@ -2937,6 +3299,7 @@ impl ShaderPipelines {
                         // address's key.
                         let plain = relocated.map_or(key, |r| r.plain_key);
                         self.t.not_relocatable.w().insert(key);
+                        self.t.relocated_plain.w().insert(key, plain);
                         self.t.prewarm.w().add_module(plain, stage as u8, spirv, m.reflection.clone(), source);
                         self.t.modules.w().insert(plain, Ok(m.clone()));
                         Ok(m)
@@ -2983,7 +3346,9 @@ impl ShaderPipelines {
                         crate::perf::PIPELINE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.t.disk.w().note_created();
                         if let Some(r) = record {
-                            self.t.prewarm.w().add_graphics(r);
+                            if self.t.prewarm.w().add_graphics(r) {
+                                self.note_unlisted(key.vs, "graphics");
+                            }
                         }
                         self.queue_rebuild(rebuild);
                         if let Some(old) = self.t.graphics.w().insert(key, p) {
@@ -3030,7 +3395,9 @@ impl ShaderPipelines {
                         crate::perf::PIPELINE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.t.disk.w().note_created();
                         if let Some(r) = record {
-                            self.t.prewarm.w().add_compute(r);
+                            if self.t.prewarm.w().add_compute(r) {
+                                self.note_unlisted(key.cs, "compute");
+                            }
                         }
                         self.queue_rebuild(rebuild);
                         if let Some(old) = self.t.compute.w().insert(key, p) {
@@ -3136,6 +3503,12 @@ impl ShaderPipelines {
             return;
         }
         let t = std::time::Instant::now();
+        if !self.t.prewarm.graphics.is_empty() || !self.t.prewarm.compute.is_empty() {
+            let keys: crate::fxhash::HashSet<u64> = self.t.prewarm.modules.iter().map(|m| m.key).collect();
+            let programs: crate::fxhash::HashSet<u64> = self.t.prewarm.modules.iter().filter_map(|m| m.source.as_ref().map(|s| s.program.address)).collect();
+            *self.t.prewarm_listed.w() = keys;
+            *self.t.prewarm_listed_programs.w() = programs;
+        }
         for m in self.t.prewarm.modules.iter().filter(|m| m.fresh) {
             if let Ok(module) = create_shader_module(&self.dev, &m.spirv) {
                 let (address, relocation) = proven_relocation(m.source.as_deref());
@@ -3154,14 +3527,31 @@ impl ShaderPipelines {
         }
         let records: Vec<PrewarmPipeline> =
             self.t.prewarm.graphics.iter().cloned().map(PrewarmPipeline::Graphics).chain(self.t.prewarm.compute.iter().cloned().map(PrewarmPipeline::Compute)).collect();
+        // Pipelines over the bindless set need its layout: the set is made
+        // now rather than at the first draw that binds it (their records
+        // failed to queue before: GTA V's ray-tracing pipelines were built
+        // during play every run).
+        let bindless = |l: &[super::descriptors::BindingDesc]| l.last().is_some_and(|b| b.binding == super::descriptors::BINDLESS_SET_MARKER);
+        let wants_bindless = records.iter().any(|r| match r {
+            PrewarmPipeline::Graphics(g) => bindless(&g.layout),
+            PrewarmPipeline::Compute(c) => bindless(&c.layout),
+        });
+        if wants_bindless && self.t.layouts.bindless.is_none() && bindless_prewarm_enabled() {
+            let _ = self.bindless_set();
+        }
         let queued = self.queue_prewarm_pipelines(records);
         if !self.t.prewarm.modules.is_empty() {
+            let k = self.t.prewarm_counts.skipped;
             log::info!(
-                "ps5gpu: shader prewarm: {} modules in {:?}, {} to translate again, {queued} pipelines queued, {} waiting for their modules",
+                "ps5gpu: shader prewarm: {} modules in {:?}, {} to translate again, {queued} pipelines queued, {} waiting for their modules; not queued: {} without a module, {} layout failures, {} rect-list failures, {} the same pipeline as another record",
                 self.t.prewarm.modules.len(),
                 t.elapsed(),
                 self.t.prewarm_translating.len(),
-                self.t.prewarm_deferred.len()
+                self.t.prewarm_deferred.len(),
+                k[0],
+                k[1],
+                k[2],
+                k[3]
             );
         }
     }
@@ -3178,26 +3568,39 @@ impl ShaderPipelines {
                         self.t.prewarm_deferred.w().push(PrewarmPipeline::Graphics(g));
                         continue;
                     }
-                    let Some(Ok(vs)) = self.t.modules.get(&g.vs).cloned() else { continue };
+                    let Some(Ok(vs)) = self.t.modules.get(&g.vs).cloned() else {
+                        self.t.prewarm_counts.w().skipped[0] += 1;
+                        continue;
+                    };
                     let ps = match g.ps {
                         0 => None,
                         k => match self.t.modules.get(&k).cloned() {
                             Some(Ok(m)) => Some(m),
-                            _ => continue,
+                            _ => {
+                                self.t.prewarm_counts.w().skipped[0] += 1;
+                                continue;
+                            }
                         },
                     };
-                    let Ok(layout) = self.t.layouts.w().get(&g.layout, vk::ShaderStageFlags::from_raw(g.push_stages)) else { continue };
+                    let Ok(layout) = self.t.layouts.w().get(&g.layout, vk::ShaderStageFlags::from_raw(g.push_stages)) else {
+                        self.t.prewarm_counts.w().skipped[1] += 1;
+                        continue;
+                    };
                     self.t.layout_descs.w().entry(layout.pipeline_layout).or_insert_with(|| (g.layout.clone(), g.push_stages));
                     let tess = if g.ff.rect == RectMode::Tessellation {
                         match self.rect_modules(&vs.reflection) {
                             Ok(Some(t)) => Some(t),
-                            _ => continue,
+                            _ => {
+                                self.t.prewarm_counts.w().skipped[2] += 1;
+                                continue;
+                            }
                         }
                     } else {
                         None
                     };
                     let key = GraphicsKey { vs: g.vs, ps: g.ps, layout: layout.pipeline_layout, ff: g.ff.clone() };
                     if self.t.graphics.contains_key(&key) || !self.t.pending_graphics.w().insert(key.clone()) {
+                        self.t.prewarm_counts.w().skipped[3] += 1;
                         continue;
                     }
                     let tag = hash_of(&key);
@@ -3208,11 +3611,18 @@ impl ShaderPipelines {
                         self.t.prewarm_deferred.w().push(PrewarmPipeline::Compute(c));
                         continue;
                     }
-                    let Some(Ok(cs)) = self.t.modules.get(&c.cs).cloned() else { continue };
-                    let Ok(layout) = self.t.layouts.w().get(&c.layout, vk::ShaderStageFlags::COMPUTE) else { continue };
+                    let Some(Ok(cs)) = self.t.modules.get(&c.cs).cloned() else {
+                        self.t.prewarm_counts.w().skipped[0] += 1;
+                        continue;
+                    };
+                    let Ok(layout) = self.t.layouts.w().get(&c.layout, vk::ShaderStageFlags::COMPUTE) else {
+                        self.t.prewarm_counts.w().skipped[1] += 1;
+                        continue;
+                    };
                     self.t.layout_descs.w().entry(layout.pipeline_layout).or_insert_with(|| (c.layout.clone(), vk::ShaderStageFlags::COMPUTE.as_raw()));
                     let key = ComputeKey { cs: c.cs, layout: layout.pipeline_layout, subgroup32: c.subgroup32 };
                     if self.t.compute.contains_key(&key) || !self.t.pending_compute.w().insert(key) {
+                        self.t.prewarm_counts.w().skipped[3] += 1;
                         continue;
                     }
                     (Box::new(compute_job(self.dev.clone(), self.t.disk.cache, key, cs, None, self.fast_builds())), hash_of(&key))
@@ -3233,6 +3643,46 @@ impl ShaderPipelines {
             let deferred = std::mem::take(&mut *self.t.prewarm_deferred.w());
             self.queue_prewarm_pipelines(deferred);
         }
+    }
+
+    /// Load the prewarm list (when not loaded yet) and queue all of it on
+    /// the compile workers, to build while the game runs (the work draws
+    /// and dispatches ask for goes first). The corner indicator shows the
+    /// list's progress ([`Self::note_background_prewarm`]). Returns the
+    /// jobs queued.
+    pub fn start_prewarm(&mut self) -> usize {
+        self.load_prewarm();
+        let n = self.prewarm_left();
+        self.t.prewarm_counts.w().background_total = n;
+        self.note_background_prewarm();
+        n
+    }
+
+    /// Jobs of the prewarm list not finished: queued or running, and
+    /// pipelines waiting for modules of the list.
+    fn prewarm_left(&self) -> usize {
+        self.t.pool.as_ref().map_or(0, |p| p.prewarm_pending()) + self.t.prewarm_deferred.len()
+    }
+
+    /// Update the indicator of a background prewarm (once a frame); the
+    /// list is saved when it is done.
+    fn note_background_prewarm(&mut self) {
+        let total = self.t.prewarm_counts.background_total;
+        if total == 0 || self.speculative {
+            return;
+        }
+        let left = self.prewarm_left();
+        let total = total.max(left);
+        if left == 0 {
+            self.t.prewarm_counts.w().background_total = 0;
+            crate::osd::set_prewarm_progress(None);
+            let built = self.t.graphics.len() + self.t.compute.len();
+            log::info!("ps5gpu: shader prewarm: the list was built in the background ({built} pipelines in the provider)");
+            self.t.disk.w().save_in_background();
+            return;
+        }
+        self.t.prewarm_counts.w().background_total = total;
+        crate::osd::set_prewarm_progress(Some(((total - left) as u64, total as u64)));
     }
 
     /// Load the prewarm list (when not loaded yet) and build all of it now:
@@ -4898,9 +5348,13 @@ impl ShaderPipelines {
         if self.speculative {
             return Err(self.bail(crate::slices::spec::Hole::Pipeline));
         }
+        let (vs_listed, ps_listed) = {
+            let plain = &self.t.relocated_plain;
+            (plain.get(&key.vs).copied().unwrap_or(key.vs), plain.get(&key.ps).copied().unwrap_or(key.ps))
+        };
         let record = self.t.layout_descs.get(&key.layout).map(|(layout, push)| super::prewarm::GraphicsRecord {
-            vs: key.vs,
-            ps: key.ps,
+            vs: vs_listed,
+            ps: ps_listed,
             layout: layout.clone(),
             push_stages: *push,
             ff: key.ff.clone(),
@@ -4909,6 +5363,26 @@ impl ShaderPipelines {
         if self.linking() && !self.t.unlinkable.contains(&key) && !self.t.pending_graphics.contains(&key) {
             if let Some(r) = self.linked_pipeline(&key, vs, ps, tess, mesh, wait, &record) {
                 return r;
+            }
+        }
+        if !wait && self.compile_wait != std::time::Duration::MAX && self.t.pool.is_some() && !self.t.pending_graphics.contains(&key) && self.dev.caps.pipeline_creation_cache_control && inline_probe_enabled() {
+            // A draw about to be skipped: the pipeline cache may hold the
+            // pipeline (made in well under a millisecond); else the cache
+            // refuses at once and the pipeline is built on a worker.
+            let t = std::time::Instant::now();
+            let probed = create_graphics_pipeline(&self.dev, self.t.disk.cache, &key, vs, ps.map(|p| &**p), tess, mesh, vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED);
+            let ns = t.elapsed().as_nanos() as u64;
+            self.stats.inline_probe_ns += ns;
+            match probed {
+                Ok(p) if p != vk::Pipeline::null() => {
+                    self.stats.inline_probe_hits += 1;
+                    self.finish(Compiled::Graphics { key: key.clone(), result: Ok(p), record, built: Built { tier: Tier::Cached, ns }, rebuild: None });
+                    if let Some(&p) = self.t.graphics.get(&key) {
+                        return Ok(p);
+                    }
+                    return Err(Failure::Error("graphics pipeline creation failed".into()));
+                }
+                _ => self.stats.inline_probe_misses += 1,
             }
         }
         let job = graphics_job(self.dev.clone(), self.t.disk.cache, key.clone(), vs.clone(), ps.cloned(), tess, mesh, record, self.fast_builds());
@@ -4936,6 +5410,8 @@ impl ShaderPipelines {
         }
         self.stats.compile_waits += 1;
         let t = std::time::Instant::now();
+        let writes = self.draw_writes;
+        self.note_waiting_for(|| format!("graphics pipeline vs {:#x} ps {:#x} ({writes})", vs.address, ps.map_or(0, |p| p.address)));
         self.run_queued(hash_of(&key));
         loop {
             if let Some(&p) = self.t.graphics.get(&key) {
@@ -5080,24 +5556,50 @@ impl ShaderPipelines {
         if self.t.failed_compute.contains(&key) {
             return Err(Failure::Error("compute pipeline creation failed".into()));
         }
-        let record = self.t.layout_descs.get(&key.layout).map(|(layout, _)| super::prewarm::ComputeRecord { cs: key.cs, layout: layout.clone(), subgroup32: key.subgroup32 });
+        let cs_listed = self.t.relocated_plain.get(&key.cs).copied().unwrap_or(key.cs);
+        let record = self.t.layout_descs.get(&key.layout).map(|(layout, _)| super::prewarm::ComputeRecord { cs: cs_listed, layout: layout.clone(), subgroup32: key.subgroup32 });
         let job = compute_job(self.dev.clone(), self.t.disk.cache, key, cs.clone(), record, self.fast_builds());
         let t = std::time::Instant::now();
         match &*self.t.pool {
             None => self.finish(job()),
             Some(pool) => {
                 if self.t.pending_compute.w().insert(key) {
-                    if !self.ahead.queue_only {
+                    if self.ahead.queue_only {
+                        if self.ahead.pipelines_of.len() < 1 << 16 {
+                            self.ahead.pipelines_of.entry(key.cs).or_default().push(key);
+                        }
+                        pool.submit_lookahead(job, hash_of(&key));
+                    } else {
                         self.stats.ahead_misses += 1;
+                        let class = match self.ahead.pipelines_of.get(&key.cs) {
+                            Some(other) => {
+                                if self.ahead.misses[2] < 16 {
+                                    let o = other[0];
+                                    log::info!(
+                                        "ps5gpu: compile lookahead: cs {:#x} needed layout {:?} subgroup32 {}, the lookahead queued layout {:?} subgroup32 {}",
+                                        cs.address,
+                                        key.layout,
+                                        key.subgroup32,
+                                        o.layout,
+                                        o.subgroup32
+                                    );
+                                }
+                                2
+                            }
+                            None if self.ahead.programs.values().any(|&k| k == key.cs) => 1,
+                            None => 0,
+                        };
+                        self.ahead.misses[class] += 1;
+                        pool.submit_urgent(job, hash_of(&key));
                     }
-                    pool.submit_urgent(job, hash_of(&key));
-                } else {
+                } else if !self.ahead.queue_only {
                     pool.hurry(hash_of(&key));
                 }
                 if self.ahead.queue_only {
                     return Err(Failure::Compiling);
                 }
                 self.stats.compile_waits += 1;
+                self.note_waiting_for(|| format!("compute pipeline of cs {:#x} ({} words)", cs.address, cs.words));
                 self.run_queued(hash_of(&key));
             }
         }
@@ -5513,15 +6015,21 @@ impl ShaderPipelines {
             }
         });
         // A draw that writes memory (or runs without attachments) waits for
-        // its pipeline; others are skipped while it compiles.
-        let writes_memory = |p: &PreparedStage| {
-            let info = &p.resources.info;
-            info.buffers.iter().any(|b| b.written || b.atomic)
-                || info.images.iter().any(|i| i.written || i.atomic)
-                || p.snapshot.device_address_ranges.iter().any(|r| r.written)
-                || p.layout.find(DescriptorBindingKind::GlobalDataShare).is_some()
+        // its pipeline; others are skipped while it compiles (see
+        // `DrawWrites::skippable`).
+        let writes = DrawWrites::of(&vs_prepared).with(ps_prepared.as_ref().map(DrawWrites::of).unwrap_or_default());
+        let wait = attachmentless || (writes.any() && !(writes.skippable() && skip_image_writers_enabled()));
+        if writes.skippable() && !attachmentless && self.t.pool.as_ref().is_some_and(|p| p.foreground_in_flight() != 0) {
+            self.stats.image_writer_compiles += 1;
+        }
+        self.draw_writes = writes;
+        self.wait_class = if attachmentless {
+            WaitClass::DrawNoTargets
+        } else if wait {
+            WaitClass::DrawMemory
+        } else {
+            WaitClass::Draw
         };
-        let wait = attachmentless || writes_memory(&vs_prepared) || ps_prepared.as_ref().is_some_and(writes_memory);
         let lds_alloc = (d.shaders.gs.rsrc2 >> 19) & 0xFF;
         let clip_words = [
             clip_space.enabled as u32,
@@ -6747,14 +7255,19 @@ impl ShaderPipelines {
         let upcoming = super::lookahead::upcoming(super::lookahead::limit());
         self.ahead.queue_only = true;
         for d in &upcoming {
-            let id = hash_of(&(d.shader.address, &d.shader.user_data, d.threads, d.shader.rsrc1, d.shader.rsrc2, d.packet.dispatch_initiator & (1 << 15)));
+            let id = super::lookahead::identity(d);
             if self.ahead.handled.contains(&id) {
                 continue;
             }
+            self.ahead.last_module = 0;
             if self.compile_dispatch_ahead(d) {
-                self.ahead.handled.insert(id);
                 self.stats.lookahead_queued += 1;
+            } else if self.ahead.deferred.len() < AHEAD_DEFERRED && self.ahead.deferred_ids.insert(id) {
+                self.ahead.deferred.push(Deferred { id, module: self.ahead.last_module, tries: 1, dispatch: d.clone() });
             }
+            // Tried once per position: one still waiting for its module is
+            // deferred (tried again when a lookahead module finishes).
+            self.ahead.handled.insert(id);
         }
         self.ahead.queue_only = false;
     }
@@ -6762,35 +7275,46 @@ impl ShaderPipelines {
     /// Queue the module of upcoming dispatch `d`, and its pipeline once the
     /// module is there. True when nothing is left to queue for it.
     fn compile_dispatch_ahead(&mut self, d: &ResolvedDispatch) -> bool {
-        if !d.shader.bound() || indirect_thread_dimensions(d) {
-            return true;
+        let (done, why) = self.compile_dispatch_ahead_why(d);
+        self.ahead.outcomes[why as usize] += 1;
+        done
+    }
+
+    /// [`Self::compile_dispatch_ahead`] and what became of the dispatch
+    /// ([`AHEAD_OUTCOMES`]).
+    fn compile_dispatch_ahead_why(&mut self, d: &ResolvedDispatch) -> (bool, u8) {
+        if !d.shader.bound() {
+            return (true, 0);
         }
-        let (Some(compiler), Some(tracker)) = (self.compiler.clone(), self.ahead.tracker.clone()) else { return true };
+        if indirect_thread_dimensions(d) {
+            return (true, 1);
+        }
+        let (Some(compiler), Some(tracker)) = (self.compiler.clone(), self.ahead.tracker.clone()) else { return (true, 0) };
         let wave = if d.packet.dispatch_initiator & (1 << 15) != 0 { 32 } else { 64 };
         let count = d.shader.user_sgpr_count().min(16);
         let (cursor, thread_limits) = dispatch_layout(d);
         let prepared = {
             let mut f = self.frontend.lock().unwrap_or_else(|e| e.into_inner());
-            let Ok(program) = f.program_for(d.shader.address, ShaderStage::Compute, 0, count, wave, &d.shader.user_data) else { return true };
+            let Ok(program) = f.program_for(d.shader.address, ShaderStage::Compute, 0, count, wave, &d.shader.user_data) else { return (true, 2) };
             // Prepared from guest memory as it is now (GPU-written words
             // fail: the dispatch is prepared for real when it runs).
             match f.prepare_prefetch(&program, &d.shader.user_data, cursor, thread_limits, &tracker) {
                 Some((p, _)) => p,
-                None => return false,
+                None => return (false, 3),
             }
         };
         let perm = ComputePermutation::of(d, self.dev.caps.shader_shared_int64_atomics);
         let module = match self.module(&compiler, ShaderStage::Compute, &prepared, perm.options(), &|| perm.key, &perm.raw, None, d.shader.rsrc1, false) {
             Ok((key, m)) => (key, m),
-            Err(Failure::Compiling) => return false,
-            Err(_) => return true,
+            Err(Failure::Compiling) => return (false, 4),
+            Err(_) => return (true, 5),
         };
         let bound = [BoundStage { stage: ShaderStage::Compute, prepared }];
-        let Ok(layout) = self.draw_layout(&bound, false, vk::ShaderStageFlags::COMPUTE) else { return true };
+        let Ok(layout) = self.draw_layout(&bound, false, vk::ShaderStageFlags::COMPUTE) else { return (true, 6) };
         let subgroup32 = self.subgroup32(perm.threads, wave, &module.1);
         // Queued (or there, or failed): nothing is left to do for it.
         let _ = self.compute_pipeline(ComputeKey { cs: module.0, layout: layout.pipeline_layout, subgroup32 }, &module.1);
-        true
+        (true, 7)
     }
 
     fn try_dispatch(&mut self, ctx: &mut DrawContext, d: &ResolvedDispatch, compiler: Option<Arc<dyn ShaderCompiler>>) -> Result<DrawOutcome, Failure> {
@@ -7831,6 +8355,7 @@ impl ShaderPipelines {
         // One reference held for the draw (the compiler is shared with the
         // compile workers: each clone writes its count).
         let compiler = self.compiler.clone();
+        self.wait_class = WaitClass::Draw;
         let mut r = self.try_draw(ctx, draw, compiler.as_ref());
         if matches!(r, Err(Failure::StagingFull)) {
             // The open tick filled the ring: submit it, then the draw
@@ -7860,6 +8385,7 @@ impl ShaderPipelines {
         self.harvest();
         self.retire_swapped(ctx.sched);
         let compiler = self.compiler.clone();
+        self.wait_class = WaitClass::Dispatch;
         let mut r = self.try_dispatch(ctx, dispatch, compiler.clone());
         if matches!(r, Err(Failure::StagingFull)) {
             ctx.sched.flush();
@@ -8010,6 +8536,7 @@ impl PipelineProvider for ShaderPipelines {
         self.compile_wait_left = self.compile_wait;
         // Finished compiles are entered once a frame even when no draw asks.
         self.harvest();
+        self.note_background_prewarm();
         self.t.prewarm.w().tick();
         super::watch::check();
         if super::skiplog::enabled() {
@@ -8051,7 +8578,7 @@ impl PipelineProvider for ShaderPipelines {
             (g.stats, g.materialization_statistics())
         };
         Some(format!(
-            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu/{}early/{}batched cs-group-clamps={} cs-unsynced={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}miss/{}inline/{}first/{}msunlocked recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={}/{}memo prefetch-miss={:?} revalidated={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
+            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu/{}early/{}batched cs-group-clamps={} cs-unsynced={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}miss/{}inline/{}first/{}msunlocked{} recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={}/{}memo prefetch-miss={:?} revalidated={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
             s.recorded_draws,
             s.recorded_dispatches,
             s.needs_shader,
@@ -8092,6 +8619,7 @@ impl PipelineProvider for ShaderPipelines {
             s.inline_compiles,
             s.hastened_compiles,
             super::unlocked_wait::WAITED_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
+            wait_classes_text(&s, &self.ahead.misses, &self.ahead.outcomes),
             s.recipe_hits,
             s.recipe_misses,
             s.stream_memo_hits,
@@ -8380,12 +8908,14 @@ mod compile_mode_tests {
 
     #[test]
     fn game_pool_sizes() {
-        // Every core but two, for urgent work and the list alike.
-        assert_eq!(pool_size(32, None), (30, 30));
-        assert_eq!(pool_size(16, None), (14, 14));
+        // Every core but two; the list and the lookahead leave a reserve
+        // to the compiles items wait for.
+        assert_eq!(pool_size(32, None), (30, 27));
+        assert_eq!(pool_size(16, None), (14, 12));
         assert_eq!(pool_size(4, None), (2, 2));
         assert_eq!(pool_size(2, None), (2, 2));
-        assert_eq!(pool_size(32, Some(8)), (8, 8));
+        assert_eq!(pool_size(32, Some(8)), (8, 6));
+        assert_eq!(pool_size(32, Some(4)), (4, 2));
         assert_eq!(pool_size(32, Some(1)), (1, 1));
     }
 }

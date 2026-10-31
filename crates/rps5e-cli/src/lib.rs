@@ -315,15 +315,20 @@ struct RunOptions {
     /// Fixed controller light bar colour, `#RRGGBB` (overrides the game's).
     #[arg(long, value_name = "#RRGGBB")]
     controller_color: Option<String>,
-    /// Start the game at once and build its shader prewarm list in the
-    /// background (default: compile the whole list first)
-    /// [RPS5E_PREWARM_WAIT=0].
-    #[arg(long)]
+    /// Do not build the shader prewarm list at the start: it is queued
+    /// at the first draw [RPS5E_PREWARM_WAIT=0]. The default builds it on
+    /// all cores while the game runs (in the exact compile mode: before
+    /// the game starts).
+    #[arg(long, conflicts_with = "prewarm_wait")]
     no_prewarm_wait: bool,
+    /// Build the whole shader prewarm list before the game starts
+    /// [RPS5E_PREWARM_WAIT=1].
+    #[arg(long)]
+    prewarm_wait: bool,
     /// How long draws may wait per frame for shaders still compiling
     /// before they are skipped: milliseconds, or `exact` (always wait;
     /// what tests, replays and smoke runs use) [RPS5E_COMPILE_WAIT_MS,
-    /// default for play: 3].
+    /// default for play: 0, never wait].
     #[arg(long, value_name = "MS|exact")]
     compile_wait: Option<String>,
     /// Write every Nth presented frame as PPM into DIR [RPS5E_DUMP_FRAMES].
@@ -334,9 +339,11 @@ struct RunOptions {
     dump_every: Option<u64>,
 }
 
-/// The per-frame compile wait of interactive play (milliseconds): a module
-/// or pipeline the disk or driver cache holds is ready well within it.
-const DEFAULT_PLAY_COMPILE_WAIT_MS: &str = "3";
+/// The per-frame compile wait of interactive play (milliseconds): none. A
+/// draw whose pipeline is not ready is skipped at once (one the pipeline
+/// cache holds is made on the spot, `RPS5E_INLINE_PROBE`) and drawn from
+/// the frame its pipeline is built in.
+const DEFAULT_PLAY_COMPILE_WAIT_MS: &str = "0";
 
 impl RunOptions {
     /// Translate the options into the environment before any emulator
@@ -457,9 +464,12 @@ impl RunOptions {
         if self.no_prewarm_wait {
             set("RPS5E_PREWARM_WAIT", "0");
         }
+        if self.prewarm_wait {
+            set("RPS5E_PREWARM_WAIT", "1");
+        }
         // Interactive play never waits for a shader compile: a draw whose
-        // pipeline is not ready is skipped after a small per-frame budget
-        //; tests ask for the exact mode explicitly.
+        // pipeline is not ready is skipped; tests ask for the exact mode
+        // explicitly.
         match &self.compile_wait {
             Some(v) => {
                 if !v.eq_ignore_ascii_case("exact") && v.parse::<u64>().is_err() {

@@ -5,16 +5,21 @@
 //! Building a title's prewarm list before the game needs it.
 //!
 //! [`wait_before_guest`] runs at the start of `rps5e-cli run`, before any
-//! guest code: it loads the title's prewarm list, translates the modules of
-//! another translator again and builds every pipeline on all cores, showing
-//! the progress in the log, the window title and as the compile overlay
-//! over the black window (title, done/total, percent, time left, bar:
-//! [`crate::osd::set_compile_progress`]). The provider that did it becomes
-//! the back-end's provider ([`take_warm`]), so the game starts with every
-//! pipeline of the list created. `RPS5E_PREWARM_WAIT=0`
-//! (`--no-prewarm-wait`) leaves the list to the background as before: the
-//! game starts at once and the list is built behind the work its draws
-//! wait for.
+//! guest code. In interactive play (the default of `run`,
+//! [`super::provider::play_mode`]) it loads the title's prewarm list and
+//! queues all of it on the compile workers, and the game starts at once:
+//! the list builds on every core while the game runs, behind the work its
+//! draws and dispatches ask for and ahead of the compile lookahead, with
+//! its progress in the corner indicator ("Building the shader cache").
+//! In the exact mode (tests, replays, smoke runs), or with
+//! `RPS5E_PREWARM_WAIT=1` (`--prewarm-wait`), it builds every pipeline of
+//! the list on all cores before the guest starts instead, showing the
+//! progress in the log, the window title and as the compile overlay over
+//! the black window (title, done/total, percent, time left, bar:
+//! [`crate::osd::set_compile_progress`]). Either way the provider that did
+//! it becomes the back-end's provider ([`take_warm`]).
+//! `RPS5E_PREWARM_WAIT=0` (`--no-prewarm-wait`) leaves the list to the
+//! provider the back-end makes: it is queued at the first draw.
 //!
 //! [`precompile`] does the same without a game (`rps5e-cli precompile`),
 //! writing the module cache, the list and the pipeline cache; with `clear`
@@ -39,10 +44,37 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// `RPS5E_PREWARM_WAIT=0`: the game starts without waiting for its
-/// prewarm list (built in the background instead).
+/// How the prewarm list is built at the start of a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewarmStart {
+    /// Built on all cores before the guest starts.
+    Wait,
+    /// Queued before the guest starts and built while it runs.
+    Background,
+    /// Left to the back-end's provider (queued at the first draw).
+    Lazy,
+}
+
+/// `RPS5E_PREWARM_WAIT`: `1` waits before the guest, `0` leaves the list
+/// to the back-end; unset: in the background in play mode, else waiting
+/// (`play`: whether the run is in the play compile mode).
+pub fn start_mode(value: Option<&str>, play: bool) -> PrewarmStart {
+    match value.map(str::trim) {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("off") => PrewarmStart::Lazy,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("wait") => PrewarmStart::Wait,
+        Some(v) if v.eq_ignore_ascii_case("background") => PrewarmStart::Background,
+        _ if play => PrewarmStart::Background,
+        _ => PrewarmStart::Wait,
+    }
+}
+
+fn start_mode_now() -> PrewarmStart {
+    start_mode(std::env::var("RPS5E_PREWARM_WAIT").ok().as_deref(), super::provider::play_mode())
+}
+
+/// Whether the run builds its prewarm list before the guest starts.
 pub fn wait_enabled() -> bool {
-    !std::env::var("RPS5E_PREWARM_WAIT").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+    start_mode_now() == PrewarmStart::Wait
 }
 
 /// The provider that built the list before the game started.
@@ -151,7 +183,8 @@ fn usable_list(cache_path: &Path) -> Result<PathBuf, String> {
 /// the module notes). Nothing to do without a list, a title id, the
 /// shader compiler or a device.
 pub fn wait_before_guest() {
-    if !wait_enabled() || !super::prewarm::enabled() || !crate::shader::enabled() {
+    let mode = start_mode_now();
+    if mode == PrewarmStart::Lazy || !super::prewarm::enabled() || !crate::shader::enabled() {
         return;
     }
     let Some(dev) = GpuDevice::global() else { return };
@@ -163,6 +196,10 @@ pub fn wait_before_guest() {
             return;
         }
     };
+    if mode == PrewarmStart::Background {
+        start_in_background(dev, cache_path, &list);
+        return;
+    }
     if !crate::env_headless() && crate::display_available() {
         crate::presenter().ensure_started(1920, 1080);
     }
@@ -179,6 +216,25 @@ pub fn wait_before_guest() {
             *WARM.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::as_ptr(dev) as usize, p));
         }
         Err(e) => log::warn!("ps5gpu: shader prewarm: {e}"),
+    }
+}
+
+/// Load the list `list` into a provider with the game's compile workers,
+/// queue all of it, and hand the provider to the back-end: the game starts
+/// while the list builds.
+fn start_in_background(dev: &Arc<GpuDevice>, cache_path: PathBuf, list: &Path) {
+    let t = std::time::Instant::now();
+    let memory = crate::memory::global();
+    match ShaderPipelines::with_workers(dev, memory, Some(spirv_compiler(dev, memory)), Some(cache_path), None) {
+        Ok(mut p) => {
+            let queued = p.start_prewarm();
+            log::info!(
+                "ps5gpu: shader prewarm: {list:?} loaded in {:.1} s, {queued} jobs building in the background while the game runs (RPS5E_PREWARM_WAIT=1 or --prewarm-wait: before the game starts instead)",
+                t.elapsed().as_secs_f64()
+            );
+            *WARM.lock().unwrap_or_else(|e| e.into_inner()) = Some((Arc::as_ptr(dev) as usize, p));
+        }
+        Err(e) => log::warn!("ps5gpu: shader prewarm: pipeline provider: {e:?}"),
     }
 }
 
@@ -417,4 +473,21 @@ pub fn start_recompile(done: impl FnOnce(&str) + Send + 'static) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prewarm_start_modes() {
+        assert_eq!(start_mode(None, true), PrewarmStart::Background, "play: while the game runs");
+        assert_eq!(start_mode(None, false), PrewarmStart::Wait, "exact mode: before the guest");
+        assert_eq!(start_mode(Some("1"), true), PrewarmStart::Wait);
+        assert_eq!(start_mode(Some("wait"), true), PrewarmStart::Wait);
+        assert_eq!(start_mode(Some("0"), false), PrewarmStart::Lazy);
+        assert_eq!(start_mode(Some("off"), true), PrewarmStart::Lazy);
+        assert_eq!(start_mode(Some("background"), false), PrewarmStart::Background);
+        assert_eq!(start_mode(Some(""), false), PrewarmStart::Wait);
+    }
 }

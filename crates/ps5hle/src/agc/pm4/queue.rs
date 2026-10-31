@@ -16,7 +16,7 @@
 //! thread (default 1; `PS5_AGC_SUSPEND_POINTS_IN_FLIGHT=0` makes it
 //! synchronous). Retiring a boundary resets the graphics processor.
 
-use super::interp::{Execution, Interpreter, Progress, COMPUTE_QUEUE_BASE};
+use super::interp::{Cursor, Execution, Interpreter, Progress, COMPUTE_QUEUE_BASE};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -113,6 +113,24 @@ pub fn global() -> &'static GpuQueue {
     GLOBAL.get_or_init(|| GpuQueue::new(boundaries_in_flight()))
 }
 
+thread_local! {
+    /// The queue set whose slice this thread is processing.
+    static PROCESSING: std::cell::Cell<*const GpuQueue> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// The command streams submitted after the one being processed on this
+/// thread, for the compile lookahead (see [`GpuQueue::pending_streams`]);
+/// empty outside a slice.
+pub(super) fn pending_streams(queue: usize, max: usize) -> Vec<(usize, Vec<Cursor>)> {
+    let q = PROCESSING.with(|p| p.get());
+    if q.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: set by `run_slice` for the duration of the slice running
+    // further up this thread's stack.
+    unsafe { &*q }.pending_streams(queue, max)
+}
+
 impl GpuQueue {
     pub fn new(boundaries_in_flight: usize) -> Self {
         Self {
@@ -168,6 +186,28 @@ impl GpuQueue {
     /// Every submission enqueued before `ticket` was taken has completed.
     pub fn passed(&self, ticket: u64) -> bool {
         Self::oldest_pending(&self.lock()) >= ticket
+    }
+
+    /// Up to `max` command streams queued and not finished, for the compile
+    /// lookahead: the later submissions of `queue` (the one being
+    /// processed) first, then the other queues' in enqueue order. A
+    /// submission that started (a head parked on a wait) is given from the
+    /// packet it is parked on, others from their first packet. Copies only:
+    /// nothing is changed.
+    pub fn pending_streams(&self, queue: usize, max: usize) -> Vec<(usize, Vec<Cursor>)> {
+        let st = self.lock();
+        let stream = |s: &Submission| -> Option<(usize, Vec<Cursor>)> {
+            if s.kind != Kind::Commands {
+                return None;
+            }
+            let stack = if s.started { s.exec.stack.clone() } else { vec![Cursor::new(s.addr, s.dwords)] };
+            (!stack.is_empty()).then_some((s.queue, stack))
+        };
+        let mut out: Vec<(usize, Vec<Cursor>)> = st.queues.get(queue).into_iter().flatten().filter_map(stream).take(max).collect();
+        let mut others: Vec<&Submission> = st.queues.iter().enumerate().filter(|&(q, _)| q != queue).flat_map(|(_, q)| q.iter()).collect();
+        others.sort_by_key(|s| s.seq);
+        out.extend(others.into_iter().filter_map(stream).take(max.saturating_sub(out.len())));
+        out
     }
 
     /// Queue a graphics command buffer.
@@ -523,6 +563,13 @@ impl GpuQueue {
     }
 
     fn run_slice(&self, sub: &mut Submission) -> bool {
+        struct Restore(*const GpuQueue);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PROCESSING.with(|p| p.set(self.0));
+            }
+        }
+        let _restore = Restore(PROCESSING.with(|p| p.replace(self as *const GpuQueue)));
         // A new submission, or one resumed after a wait: what the CPU wrote
         // before it is visible to its commands.
         let mut interps = self.interpreters.lock().unwrap_or_else(|e| e.into_inner());

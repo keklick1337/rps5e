@@ -375,3 +375,76 @@ fn lookahead_resolves_the_dispatches_after_the_current_one() {
     let seen = ex.0.lock().unwrap().clone();
     assert_eq!(seen, vec![(a1, vec![a2, a3, a4]), (a2, vec![a3, a4]), (a3, vec![a4]), (a4, vec![])]);
 }
+
+/// The lookahead reads the command buffers queued after the current one
+/// (its own queue's first, then the other queues'), lists a program shown
+/// with the same state once, reads on past a COND_EXEC and a REWIND whose
+/// valid bit is set, and stops at a REWIND without it (the packets after
+/// it may not be written yet).
+#[test]
+fn lookahead_reads_queued_buffers_and_guesses_past_branches() {
+    let base = arena();
+    let pgm = |w: &mut Vec<u32>, a: u64| w.extend_from_slice(&[p4::make(4, op::SET_SH_REG, 0), 0x20C, lo(a >> 8), hi(a >> 8)]);
+    let dispatch = |w: &mut Vec<u32>| w.extend_from_slice(&[p4::make(5, op::DISPATCH_DIRECT, 0), 1, 1, 1, 1]);
+    let a = |n: u64| 0x1_0000_0000u64 + n * 0x100;
+    let flag = base + LABELS;
+    assert!(mem::write_dwords(flag, &[1]));
+    // First buffer: a1, a2 twice (listed once), a COND_EXEC over a3 (read
+    // as if run), a REWIND with its valid bit, a4.
+    let mut w1 = Vec::new();
+    pgm(&mut w1, a(1));
+    dispatch(&mut w1);
+    pgm(&mut w1, a(2));
+    dispatch(&mut w1);
+    dispatch(&mut w1);
+    let mut skipped = Vec::new();
+    pgm(&mut skipped, a(3));
+    dispatch(&mut skipped);
+    w1.extend_from_slice(&[p4::make(5, op::COND_EXEC, 0), lo(flag), hi(flag), 0, skipped.len() as u32]);
+    w1.extend_from_slice(&skipped);
+    w1.extend_from_slice(&[p4::make(2, op::REWIND, 0), 1 << 31]);
+    pgm(&mut w1, a(4));
+    dispatch(&mut w1);
+    // Second buffer on the same queue: a5, then a REWIND without the valid
+    // bit before a6 (not read ahead).
+    let mut w2 = Vec::new();
+    pgm(&mut w2, a(5));
+    dispatch(&mut w2);
+    w2.extend_from_slice(&[p4::make(2, op::REWIND, 0), 1 << 31]);
+    let mut w3 = Vec::new();
+    pgm(&mut w3, a(7));
+    dispatch(&mut w3);
+    let (at1, at2, at3) = (base + CMD, base + CMD + 0x400, base + CMD + 0x800);
+    assert!(mem::write_dwords(at1, &w1) && mem::write_dwords(at2, &w2) && mem::write_dwords(at3, &w3));
+    let ex = Arc::new(Ahead::default());
+    let q = GpuQueue::new(1);
+    q.with_interpreter(0, |i| i.executor = Some(ex.clone()));
+    q.with_interpreter(1, |i| i.executor = Some(ex.clone()));
+    q.submit_graphics(at1, w1.len() as u32);
+    q.submit_graphics(at2, w2.len() as u32);
+    // Another queue's buffer, after both.
+    assert!(q.submit_compute(0x20, at3, w3.len() as u32));
+    for _ in 0..100 {
+        if matches!(q.process_one(), SliceResult::NoWork) {
+            break;
+        }
+    }
+    let seen = ex.0.lock().unwrap().clone();
+    assert_eq!(seen[0], (a(1), vec![a(2), a(3), a(4), a(5), a(7)]), "{seen:x?}");
+    // A REWIND without its valid bit ends the scan of that buffer only.
+    let mut stopped = w2.clone();
+    *stopped.last_mut().unwrap() = 0;
+    pgm(&mut stopped, a(6));
+    dispatch(&mut stopped);
+    assert!(mem::write_dwords(at2, &stopped));
+    let ex = Arc::new(Ahead::default());
+    let q = GpuQueue::new(1);
+    q.with_interpreter(0, |i| i.executor = Some(ex.clone()));
+    q.with_interpreter(1, |i| i.executor = Some(ex.clone()));
+    q.submit_graphics(at1, w1.len() as u32);
+    q.submit_graphics(at2, stopped.len() as u32);
+    assert!(q.submit_compute(0x20, at3, w3.len() as u32));
+    let _ = q.process_one();
+    let seen = ex.0.lock().unwrap().clone();
+    assert_eq!(seen[0], (a(1), vec![a(2), a(3), a(4), a(5), a(7)]), "a6 after the open REWIND is not read: {seen:x?}");
+}

@@ -177,7 +177,7 @@ pub(crate) fn fps_label(ctx: &egui::Context, fps: f32) {
 /// The shader compile overlay ([`crate::osd::compile_overlay`]): the full
 /// panel (title, counts, percent, time left, bar) over the window while
 /// the game waits for its shaders, else a small corner indicator.
-pub(crate) fn compile_overlay(ctx: &egui::Context, overlay: &crate::osd::CompileOverlay) {
+pub fn compile_overlay(ctx: &egui::Context, overlay: &crate::osd::CompileOverlay) {
     use crate::osd::CompileOverlay;
     match overlay {
         CompileOverlay::Full(p) => {
@@ -211,7 +211,7 @@ pub(crate) fn compile_overlay(ctx: &egui::Context, overlay: &crate::osd::Compile
                         });
                 });
         }
-        CompileOverlay::Background { done, total } => {
+        CompileOverlay::Background { done, total, cache } => {
             let pct = if *total == 0 { 100 } else { done * 100 / total };
             egui::Area::new(egui::Id::new("rps5e-compile-indicator"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
@@ -225,7 +225,8 @@ pub(crate) fn compile_overlay(ctx: &egui::Context, overlay: &crate::osd::Compile
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new().size(14.0).color(egui::Color32::from_rgb(240, 210, 90)));
-                                ui.label(egui::RichText::new(format!("Compiling shaders: {done} / {total} ({pct}%)")).color(egui::Color32::from_gray(230)));
+                                let what = if *cache { "Building the shader cache" } else { "Compiling shaders" };
+                                ui.label(egui::RichText::new(format!("{what}: {done} / {total} ({pct}%)")).color(egui::Color32::from_gray(230)));
                             });
                             let frac = if *total == 0 { 1.0 } else { *done as f32 / *total as f32 };
                             ui.add(egui::ProgressBar::new(frac).desired_width(220.0).desired_height(6.0));
@@ -366,7 +367,8 @@ mod tests {
             out.shapes.len()
         };
         let n_full = shapes(&full);
-        let n_small = shapes(&CompileOverlay::Background { done: 3, total: 7 });
+        let n_small = shapes(&CompileOverlay::Background { done: 3, total: 7, cache: false });
+        assert!(shapes(&CompileOverlay::Background { done: 3, total: 7, cache: true }) > 0);
         assert!(n_full > 0 && n_small > 0);
         assert!(n_full > n_small, "the panel ({n_full} shapes) is more than the indicator ({n_small})");
     }

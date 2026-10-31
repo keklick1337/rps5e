@@ -1410,6 +1410,16 @@ mod tests {
         next.display_resolution = "1080p".into();
         app.state.set_settings(next);
         shot(&mut app, Vec::new(), "ingame-graphics.png");
+        // The corner indicators over a game frame: the shader cache list
+        // building in the background, and shaders the game asked for.
+        for (name, cache) in [("ingame-shader-cache.png", true), ("ingame-compiling.png", false)] {
+            let overlay = ps5gpu::osd::CompileOverlay::Background { done: 812, total: 2302, cache };
+            let mut img = (0, 0, Vec::new());
+            for _ in 0..30 {
+                img = r.frame(Vec::new(), |ctx| ps5gpu::menu::compile_overlay(ctx, &overlay));
+            }
+            crate::softrender::write_png(&out.join(name), img.0, img.1, &img.2);
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

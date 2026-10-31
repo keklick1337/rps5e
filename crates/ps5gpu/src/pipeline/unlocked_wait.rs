@@ -38,9 +38,26 @@ pub static PENDING_TRIES: AtomicU64 = AtomicU64::new(0);
 /// Time spent waiting for compiles with nothing locked (ns).
 pub static WAITED_NS: AtomicU64 = AtomicU64::new(0);
 
+/// [`WAITED_NS`] by what waited (`provider::WaitClass`).
+pub static WAITED_BY: [AtomicU64; super::provider::WAIT_CLASSES] = [const { AtomicU64::new(0) }; super::provider::WAIT_CLASSES];
+
 thread_local! {
     /// The caller of the provider can wait for compiles unlocked.
     static ALLOWED: Cell<bool> = const { Cell::new(false) };
+    /// What the item given up last is and waits for.
+    static ITEM: std::cell::RefCell<(usize, String)> = const { std::cell::RefCell::new((super::provider::WAIT_CLASSES - 1, String::new())) };
+}
+
+/// The provider gives an item of class `class` up, waiting for `what`.
+pub(crate) fn note_item(class: usize, what: &str) {
+    ITEM.with(|i| {
+        let mut i = i.borrow_mut();
+        i.0 = class.min(super::provider::WAIT_CLASSES - 1);
+        if i.1 != what {
+            i.1.clear();
+            i.1.push_str(what);
+        }
+    });
 }
 
 /// `RPS5E_UNLOCKED_COMPILE_WAIT=0`: compile waits stay under the lock.
@@ -72,6 +89,7 @@ pub(crate) fn forbidden<R>(f: impl FnOnce() -> R) -> R {
 /// (false for captures and verification modes that log every try).
 pub fn record<R>(allow: bool, mut attempt: impl FnMut() -> (R, bool)) -> R {
     let allow = allow && enabled();
+    let mut waited = 0u64;
     loop {
         // Read before the try: a job finishing during it ends the wait.
         let seen = super::pool::foreground_done();
@@ -79,11 +97,20 @@ pub fn record<R>(allow: bool, mut attempt: impl FnMut() -> (R, bool)) -> R {
         let (r, pending) = attempt();
         ALLOWED.with(|a| a.set(prev));
         if !pending || !allow {
+            if waited >= super::timing::SLOW_MS * 1_000_000 {
+                ITEM.with(|i| {
+                    let i = i.borrow();
+                    log::info!("ps5gpu: the command thread waited {} ms (back-end unlocked) for {} ({})", waited / 1_000_000, i.1, super::provider::WAIT_CLASS_NAMES[i.0]);
+                });
+            }
             return r;
         }
         PENDING_TRIES.fetch_add(1, Ordering::Relaxed);
         let t = std::time::Instant::now();
         super::pool::wait_foreground_progress(seen, WAIT_SLICE);
-        WAITED_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let ns = t.elapsed().as_nanos() as u64;
+        waited += ns;
+        WAITED_NS.fetch_add(ns, Ordering::Relaxed);
+        WAITED_BY[ITEM.with(|i| i.borrow().0)].fetch_add(ns, Ordering::Relaxed);
     }
 }

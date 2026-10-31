@@ -13,6 +13,14 @@
 //! layouts on its thread, pipelines on the compile workers), so the keys
 //! it later looks up are the ones the list recreated.
 //!
+//! Records are kept as soon as they are made: between the (whole-list)
+//! saves, every record added is appended within a second to a journal file
+//! next to the list (`<title>.prewarm.j<generation>`, each entry a small
+//! list in the same format, written on a thread of its own), so a run that
+//! is killed or crashes loses at most the last second of records. Loading
+//! merges the journals into the list; a whole-list save that covers a
+//! generation deletes its journal files.
+//!
 //! The list names the translator stamp its SPIR-V was made by
 //! ([`super::compiler::ShaderCompiler::translator_stamp`]). A list of
 //! another translator (an emulator update, another driver or device
@@ -33,6 +41,15 @@ use std::sync::Arc;
 /// (a list is hundreds of MiB: saves run on their own thread).
 const SAVE_INTERVAL: u32 = 64;
 const SAVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// New records are appended to the journal at most this often
+/// (`RPS5E_PREWARM_JOURNAL=0`: no journal, only the whole-list saves).
+const JOURNAL_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn journal_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_PREWARM_JOURNAL").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
 
 /// The signature line of every list file (the device, driver and
 /// translator are named by the stamp inside).
@@ -90,6 +107,131 @@ pub struct PrewarmList {
     /// one at a time and never over a later one).
     saves: u64,
     written: Arc<std::sync::Mutex<u64>>,
+    /// Records added since the last journal entry, the journal generation
+    /// new entries go to, when the last entry was handed to the writer,
+    /// and the writer thread's channel.
+    journal_pending: JournalEntry,
+    journal_generation: u64,
+    journal_written: Option<std::time::Instant>,
+    journal: Option<(std::sync::mpsc::Sender<(PathBuf, Vec<u8>)>, std::thread::JoinHandle<()>)>,
+}
+
+/// Records for one journal entry.
+#[derive(Default)]
+struct JournalEntry {
+    modules: Vec<ModuleRecord>,
+    graphics: Vec<GraphicsRecord>,
+    compute: Vec<ComputeRecord>,
+}
+
+impl JournalEntry {
+    fn is_empty(&self) -> bool {
+        self.modules.is_empty() && self.graphics.is_empty() && self.compute.is_empty()
+    }
+}
+
+/// The journal file of generation `generation` of the list `path`.
+pub(super) fn journal_path(path: &std::path::Path, generation: u64) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".j{generation}"));
+    path.with_file_name(name)
+}
+
+/// The journal files of the list `path` with their generations, oldest
+/// first.
+pub(super) fn journal_files(path: &std::path::Path) -> Vec<(u64, PathBuf)> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else { return Vec::new() };
+    let prefix = format!("{name}.j");
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let file = e.file_name();
+            let generation = file.to_str()?.strip_prefix(&prefix)?.parse().ok()?;
+            Some((generation, e.path()))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Append one journal entry (a small list: length, then the encoded list).
+fn append_journal(path: &std::path::Path, entry: &[u8]) {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut bytes = Vec::with_capacity(entry.len() + 8);
+    bytes.extend_from_slice(&(entry.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(entry);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(&bytes);
+    }
+}
+
+/// The entries of one journal file (a damaged or cut-off tail is ignored).
+fn journal_entries(file: &[u8]) -> Vec<Decoded> {
+    let mut out = Vec::new();
+    let mut rest = file;
+    while rest.len() >= 8 {
+        let n = u64::from_le_bytes(rest[..8].try_into().expect("8 bytes")) as usize;
+        let Some(entry) = rest.get(8..8 + n) else { break };
+        match decode(entry) {
+            Some(d) => out.push(d),
+            None => break,
+        }
+        rest = &rest[8 + n..];
+    }
+    out
+}
+
+/// The list file `path` with its journal entries merged in (modules by key,
+/// pipelines once; modules of an entry made by another translator than
+/// the list's are marked for translation). None: no list of this format
+/// and no journal; a damaged list with journals merges into an empty one.
+pub(super) fn read_merged(path: &std::path::Path) -> Option<Decoded> {
+    let journals = journal_files(path);
+    let main = std::fs::read(path).ok().and_then(|f| decode(&f));
+    if journals.is_empty() {
+        return main;
+    }
+    let had_main = main.is_some();
+    let (stamp, mut modules, mut graphics, mut compute) = main.unwrap_or((NO_TRANSLATOR, Vec::new(), Vec::new(), Vec::new()));
+    let mut keys: crate::fxhash::HashSet<u64> = modules.iter().map(|m| m.key).collect();
+    let mut graphics_seen: crate::fxhash::HashSet<GraphicsRecord> = graphics.iter().cloned().collect();
+    let mut compute_seen: crate::fxhash::HashSet<ComputeRecord> = compute.iter().cloned().collect();
+    let mut stamp = stamp;
+    let mut any = false;
+    for (_, file) in &journals {
+        let Ok(bytes) = std::fs::read(file) else { continue };
+        for (entry_stamp, m, g, c) in journal_entries(&bytes) {
+            if !had_main && !any {
+                stamp = entry_stamp;
+            }
+            any = true;
+            for mut m in m {
+                if entry_stamp != stamp {
+                    m.fresh = false;
+                    m.spirv = Arc::default();
+                }
+                if keys.insert(m.key) {
+                    modules.push(m);
+                }
+            }
+            graphics.extend(g.into_iter().filter(|g| graphics_seen.insert(g.clone())));
+            compute.extend(c.into_iter().filter(|c| compute_seen.insert(c.clone())));
+        }
+    }
+    (had_main || any).then_some((stamp, modules, graphics, compute))
+}
+
+/// Delete the journal files of `path` up to generation `upto`.
+fn remove_journals(path: &std::path::Path, upto: u64) {
+    for (generation, file) in journal_files(path) {
+        if generation <= upto {
+            let _ = std::fs::remove_file(file);
+        }
+    }
 }
 
 /// `RPS5E_SHADER_PREWARM=0`: no prewarm list is read or written.
@@ -117,7 +259,9 @@ pub enum ListStatus {
 
 /// The status of the list file `path`.
 pub fn list_status(path: &std::path::Path) -> ListStatus {
-    let Ok(file) = std::fs::read(path) else { return ListStatus::Missing };
+    let Ok(file) = std::fs::read(path) else {
+        return if read_merged(path).is_some() { ListStatus::Current } else { ListStatus::Missing };
+    };
     if decode(&file).is_some() {
         return ListStatus::Current;
     }
@@ -148,8 +292,7 @@ pub fn retire_old_list(path: &std::path::Path) -> Option<PathBuf> {
 /// recompile): the file is written again naming no translator. Returns the
 /// module keys.
 pub fn mark_for_recompile(path: &std::path::Path) -> Result<Vec<u64>, String> {
-    let file = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (_, modules, graphics, compute) = decode(&file).ok_or_else(|| format!("{}: not a prewarm list of this format", path.display()))?;
+    let (_, modules, graphics, compute) = read_merged(path).ok_or_else(|| format!("{}: not a prewarm list of this format", path.display()))?;
     let keys = modules.iter().map(|m| m.key).collect();
     let bytes = encode(NO_TRANSLATOR, &modules, &graphics, &compute);
     let tmp = temporary_path(path);
@@ -157,6 +300,7 @@ pub fn mark_for_recompile(path: &std::path::Path) -> Result<Vec<u64>, String> {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })?;
+    remove_journals(path, u64::MAX);
     Ok(keys)
 }
 
@@ -191,8 +335,12 @@ impl PrewarmList {
         list.stamp = stamp;
         let Some(path) = list.path.clone() else { return list };
         remove_stale_temporaries(&path);
-        let Ok(file) = std::fs::read(&path) else { return list };
-        match decode(&file) {
+        let journals = journal_files(&path);
+        list.journal_generation = journals.last().map_or(0, |j| j.0 + 1);
+        if !path.exists() && journals.is_empty() {
+            return list;
+        }
+        match read_merged(&path) {
             Some((file_stamp, modules, graphics, compute)) => {
                 let retranslate = file_stamp != stamp;
                 let (mut stale, mut dropped) = (0, 0);
@@ -223,8 +371,9 @@ impl PrewarmList {
                     list.insert_compute(c);
                 }
                 // A list taken over from another translator is written
-                // with this one's stamp.
-                list.unsaved = retranslate as u32;
+                // with this one's stamp; journals are folded into the list
+                // by its next save.
+                list.unsaved = (retranslate || !journals.is_empty()) as u32;
                 log::info!(
                     "ps5gpu: shader prewarm list: {} modules ({stale} to translate again, {dropped} without inputs dropped), {} graphics and {} compute pipelines from {path:?}",
                     list.modules.len(),
@@ -262,10 +411,12 @@ impl PrewarmList {
             Some(&i) => {
                 let source = record.source.clone().or_else(|| self.modules[i].source.take());
                 self.modules[i] = ModuleRecord { source, ..record };
+                self.journal_pending.modules.push(self.modules[i].clone());
                 self.note();
             }
             None => {
                 self.module_index.insert(key, self.modules.len());
+                self.journal_pending.modules.push(record.clone());
                 self.modules.push(record);
                 self.note();
             }
@@ -282,16 +433,24 @@ impl PrewarmList {
         self.unsaved += 1;
     }
 
-    pub fn add_graphics(&mut self, g: GraphicsRecord) {
-        if self.insert_graphics(g) {
+    /// Note a graphics pipeline; true when the list did not hold it.
+    pub fn add_graphics(&mut self, g: GraphicsRecord) -> bool {
+        if self.path.is_some() && self.insert_graphics(g.clone()) {
+            self.journal_pending.graphics.push(g);
             self.note();
+            return true;
         }
+        false
     }
 
-    pub fn add_compute(&mut self, c: ComputeRecord) {
-        if self.insert_compute(c) {
+    /// Note a compute pipeline; true when the list did not hold it.
+    pub fn add_compute(&mut self, c: ComputeRecord) -> bool {
+        if self.path.is_some() && self.insert_compute(c.clone()) {
+            self.journal_pending.compute.push(c);
             self.note();
+            return true;
         }
+        false
     }
 
     /// Enter a graphics record unless known. True when new.
@@ -316,6 +475,47 @@ impl PrewarmList {
         self.unsaved += 1;
         if self.unsaved >= SAVE_INTERVAL && self.save_due() {
             self.save_in_background();
+        } else {
+            self.journal_due();
+        }
+    }
+
+    /// Hand the records added since the last entry to the journal writer
+    /// when [`JOURNAL_PERIOD`] has passed.
+    fn journal_due(&mut self) {
+        if self.journal_pending.is_empty() || self.journal_written.is_some_and(|t| t.elapsed() < JOURNAL_PERIOD) {
+            return;
+        }
+        self.write_journal();
+    }
+
+    /// Append the pending records to the journal (on the writer thread).
+    fn write_journal(&mut self) {
+        let entry = std::mem::take(&mut self.journal_pending);
+        let Some(path) = self.path.clone() else { return };
+        if entry.is_empty() || !journal_enabled() {
+            return;
+        }
+        self.journal_written = Some(std::time::Instant::now());
+        let bytes = encode(self.stamp, &entry.modules, &entry.graphics, &entry.compute);
+        let file = journal_path(&path, self.journal_generation);
+        if self.journal.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, Vec<u8>)>();
+            let spawned = std::thread::Builder::new().name("rps5e-prewarm-journal".into()).spawn(move || {
+                while let Ok((file, bytes)) = rx.recv() {
+                    append_journal(&file, &bytes);
+                }
+            });
+            if let Ok(h) = spawned {
+                self.journal = Some((tx, h));
+            }
+        }
+        let sent = match &self.journal {
+            Some((tx, _)) => tx.send((file.clone(), bytes)).map_err(|e| e.0 .1),
+            None => Err(bytes),
+        };
+        if let Err(bytes) = sent {
+            append_journal(&file, &bytes);
         }
     }
 
@@ -330,12 +530,20 @@ impl PrewarmList {
     pub fn tick(&mut self) {
         if self.unsaved != 0 && self.save_due() {
             self.save_in_background();
+        } else {
+            self.journal_due();
         }
     }
 
     /// Write the list now (atomically through a temporary file), after any
     /// save still running on its thread.
     pub fn save(&mut self) {
+        // Entries handed to the journal writer land first: the save then
+        // deletes the journal files it covers.
+        if let Some((tx, h)) = self.journal.take() {
+            drop(tx);
+            let _ = h.join();
+        }
         if let Some((data, number)) = self.start_save() {
             write_save(&self.written, number, data);
         }
@@ -362,7 +570,12 @@ impl PrewarmList {
         self.last_save = Some(std::time::Instant::now());
         let path = self.path.clone()?;
         self.saves += 1;
-        let data = SaveData { path, stamp: self.stamp, modules: self.modules.clone(), graphics: self.graphics.clone(), compute: self.compute.clone() };
+        // The save holds every record: the journal so far is not needed
+        // once it is written, and later records go to the next generation.
+        self.journal_pending = JournalEntry::default();
+        let journal_upto = self.journal_generation;
+        self.journal_generation += 1;
+        let data = SaveData { path, stamp: self.stamp, modules: self.modules.clone(), graphics: self.graphics.clone(), compute: self.compute.clone(), journal_upto };
         Some((Arc::new(data), self.saves))
     }
 }
@@ -374,6 +587,8 @@ struct SaveData {
     modules: Vec<ModuleRecord>,
     graphics: Vec<GraphicsRecord>,
     compute: Vec<ComputeRecord>,
+    /// Journal generations the save covers.
+    journal_upto: u64,
 }
 
 /// Write save `number` unless a later one was written already (saves take
@@ -392,7 +607,9 @@ fn write_save(written: &std::sync::Mutex<u64>, number: u64, data: Arc<SaveData>)
     let tmp = temporary_path(path);
     if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return;
     }
+    remove_journals(path, data.journal_upto);
 }
 
 impl Drop for PrewarmList {
@@ -1019,6 +1236,58 @@ mod tests {
         std::fs::write(&dead_cache, b"x").unwrap();
         drop(PrewarmList::load(Some(&bin), 1));
         assert!(!dead_list.exists() && dead_cache.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Records reach the journal at once (within [`JOURNAL_PERIOD`]) and a
+    /// run that ends without its final save (killed) keeps them: the next
+    /// load merges the journal; a whole-list save deletes the journal
+    /// files it covers.
+    #[test]
+    fn journal_keeps_records_of_a_run_that_did_not_save() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../local/tmp/prewarm-journal-test-{}", std::process::id()));
+        let bin = dir.join("TEST00006.bin");
+        let path = list_path(&bin);
+        let compute = |i: u64| ComputeRecord { cs: i, layout: vec![], subgroup32: false };
+        let graphics = |i: u64| GraphicsRecord { vs: i, ps: 0, layout: vec![], push_stages: 0, ff: ff(), mesh: false };
+        {
+            let mut list = PrewarmList::load(Some(&bin), 4);
+            list.add_compute(compute(1));
+            list.add_module(5, 3, vec![0x0723_0203, 5], ShaderReflection::default(), None);
+            list.add_graphics(graphics(2));
+            // The first record was written at once, the others wait for
+            // the period: write them as the next tick after it would.
+            list.journal_written = None;
+            list.journal_due();
+            let (tx, h) = list.journal.take().expect("writer");
+            drop(tx);
+            h.join().unwrap();
+            // Killed: no save.
+            std::mem::forget(list);
+        }
+        assert!(!path.exists(), "no whole-list save happened");
+        assert_eq!(journal_files(&path).len(), 1);
+        assert_eq!(list_status(&path), ListStatus::Current);
+        let mut list = PrewarmList::load(Some(&bin), 4);
+        assert_eq!((list.modules.len(), list.graphics.len(), list.compute.len()), (1, 1, 1));
+        assert!(list.modules[0].fresh, "made by this translator");
+        list.add_compute(compute(3));
+        list.save();
+        assert!(journal_files(&path).is_empty(), "the save covers the journal");
+        let (_, m, g, c) = decode(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!((m.len(), g.len(), c.len()), (1, 1, 2));
+        drop(list);
+        // A damaged tail (a cut-off append) keeps the entries before it.
+        let entry = encode(4, &[], &[], &[compute(9)]);
+        append_journal(&journal_path(&path, 7), &entry);
+        let mut f = std::fs::OpenOptions::new().append(true).open(journal_path(&path, 7)).unwrap();
+        std::io::Write::write_all(&mut f, &[200, 0, 0, 0, 0, 0, 0, 0, 1, 2]).unwrap();
+        drop(f);
+        let list = PrewarmList::load(Some(&bin), 4);
+        assert_eq!(list.compute.len(), 3);
+        assert_eq!(list.journal_generation, 8, "new entries after the newest journal");
+        drop(list);
+        assert!(journal_files(&path).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

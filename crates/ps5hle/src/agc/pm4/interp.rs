@@ -271,7 +271,7 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    fn new(addr: u64, dwords: u32) -> Self {
+    pub(super) fn new(addr: u64, dwords: u32) -> Self {
         Self { addr, dwords, offset: 0 }
     }
 
@@ -988,6 +988,9 @@ impl Interpreter {
         let resolved = ps5gpu::render::resolve_dispatch(&self.banks(), &packet);
         if lookahead::enabled() {
             let ahead = Ahead { regs: &self.regs, queue: self.queue_id, dispatch_args_base: self.dispatch_args_base, predicate_skip: self.predicate_skip, stack, at: p.addr, len: p.len() };
+            // A program no scan has seen: the work after it is likely new
+            // too; its compiles are queued before the recording gets there.
+            lookahead::scan_unseen(resolved.shader.address, &ahead);
             lookahead::with_source(&ahead, || ex.dispatch(&resolved));
         } else {
             ex.dispatch(&resolved);
@@ -2235,7 +2238,13 @@ const AHEAD_PACKETS: u64 = 1 << 16;
 /// no interrupts or flips. It reads on past waits (they change no
 /// register) and stops at the first packet whose effect it cannot know
 /// without executing (a conditional, a branch, a register load the command
-/// processor produces), at a flip, and at the limit.
+/// processor produces), and at the limit. With
+/// `RPS5E_LOOKAHEAD_QUEUED` (on) it then reads the command buffers queued
+/// after this one, on this queue and the others ([`super::queue::pending_streams`]),
+/// each from a copy of the registers it starts with here (a guess: the
+/// state the earlier work leaves is not known; a wrong guess costs a
+/// compile), and reads on past flips (they change no register); without
+/// it the scan ends at the end of this buffer chain or at a flip.
 struct Ahead<'a> {
     regs: &'a RegisterFile,
     queue: usize,
@@ -2246,6 +2255,9 @@ struct Ahead<'a> {
     at: u64,
     len: u32,
 }
+
+/// Command buffers queued after the current one that one scan reads at most.
+const AHEAD_STREAMS: usize = 256;
 
 impl lookahead::Source for Ahead<'_> {
     fn position(&self) -> u64 {
@@ -2264,158 +2276,237 @@ impl lookahead::Source for Ahead<'_> {
         let mut dispatch_args_base = self.dispatch_args_base;
         let start = out.len();
         let mut packets = 0u64;
-        while let Some(&cur) = stack.last() {
-            if out.len() - start >= limit || packets >= AHEAD_PACKETS {
+        let mut seen = std::collections::HashSet::new();
+        let queued = lookahead::queued_streams();
+        let mut scan = Scan { limit, start, packets: &mut packets, seen: &mut seen, out };
+        let stop = scan_stream(&mut stack, &mut regs, &mut dispatch_args_base, self.predicate_skip, self.queue, queued, &mut scan);
+        lookahead::note_scan(stop, false);
+        if !queued || !matches!(stop, lookahead::Stop::End) {
+            return;
+        }
+        for (queue, mut stack) in super::queue::pending_streams(self.queue, AHEAD_STREAMS) {
+            if scan.full() {
                 return;
             }
-            packets += 1;
-            if cur.offset >= cur.dwords {
-                stack.pop();
-                continue;
-            }
-            let paddr = cur.addr + cur.offset as u64 * 4;
-            // SAFETY: the buffer's range was checked when it was entered.
-            let h = unsafe { std::ptr::read_volatile(paddr as *const u32) };
-            if packet_size(h) == 1 {
-                stack.last_mut().expect("non-empty").offset += 1;
-                continue;
-            }
-            let remaining = cur.remaining();
-            if remaining < 2 || super::packet_type(h) != 3 {
-                return;
-            }
-            let len = length(h);
-            if len > remaining {
-                return;
-            }
-            stack.last_mut().expect("non-empty").offset += len;
-            if predicated(h) && self.predicate_skip {
-                continue;
-            }
-            // SAFETY: inside the checked buffer range (len <= remaining).
-            let pl = unsafe { std::slice::from_raw_parts((paddr + 4) as *const u32, (len - 1) as usize) };
-            let p = Packet { header: h & !1, addr: paddr, remaining };
-            match super::opcode(p.header) {
-                op::SET_CONTEXT_REG | op::SET_SH_REG | op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => {
-                    let bank = match super::opcode(p.header) {
-                        op::SET_CONTEXT_REG => Bank::Context,
-                        op::SET_SH_REG => Bank::Shader,
-                        _ => Bank::UserConfig,
-                    };
-                    if pl.is_empty() || (bank == Bank::UserConfig && super::is_internal_data_packet(p.header, pl)) {
-                        continue;
-                    }
-                    let offset = if super::opcode(p.header) == op::SET_UCONFIG_REG_INDEX { pl[0] & 0x0FFF_FFFF } else { pl[0] & !super::REGISTER_SELECTOR_MASK };
-                    regs.set_run(bank, offset, &pl[1..]);
-                }
-                op::SET_CONTEXT_REG_INDIRECT | op::SET_SH_REG_INDIRECT | op::SET_UCONFIG_REG_INDIRECT => {
-                    let bank = match super::opcode(p.header) {
-                        op::SET_CONTEXT_REG_INDIRECT => Bank::Context,
-                        op::SET_SH_REG_INDIRECT => Bank::Shader,
-                        _ => Bank::UserConfig,
-                    };
-                    if p.len() != 5 {
-                        return;
-                    }
-                    let addr = (pl[0] & !3) as u64 | (pl[1] as u64) << 32;
-                    let count = pl[3] & 0x3FFF;
-                    let words = if pl[2] == 0x8000_0000 { count as u64 * 2 } else { count as u64 };
-                    if count == 0 {
-                        continue;
-                    }
-                    if addr == 0 || !mem::accessible(addr, words * 4, false) {
-                        return;
-                    }
-                    // SAFETY: checked readable just above.
-                    let values = unsafe { std::slice::from_raw_parts(addr as *const u32, words as usize) };
-                    if pl[2] == 0x8000_0000 {
-                        regs.table(bank, values);
-                    } else {
-                        regs.set_run(bank, pl[2] & !super::REGISTER_SELECTOR_MASK, values);
-                    }
-                }
-                op::CLEAR_STATE => {
-                    let _ = regs.context_state(ContextState::Clear);
-                }
-                op::SET_BASE => {
-                    if pl.len() >= 3 && pl[0] & 0xF == 1 && (p.header >> 1) & 1 != 0 {
-                        dispatch_args_base = (pl[1] & !7) as u64 | ((pl[2] & 0xFFFF) as u64) << 32;
-                    }
-                }
-                op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
-                    let packet = decode_dispatch(self.queue, dispatch_args_base, &p, pl);
-                    let dims = if packet.indirect_address == 0 { packet.groups } else { [0; 3] };
-                    regs.set_run(Bank::Shader, 0x200, &[packet.dispatch_initiator, dims[0], dims[1], dims[2]]);
-                    out.push(ps5gpu::render::resolve_dispatch(&regs.banks(), &packet));
-                }
-                op::INDIRECT_BUFFER => {
-                    if p.len() != 4 {
-                        // A conditional branch.
-                        return;
-                    }
-                    let addr = pl[0] as u64 | (pl[1] as u64) << 32;
-                    let dwords = pl[2] & 0xFFFFF;
-                    let chain = (pl[2] >> 20) & 1 != 0;
-                    if dwords == 0 {
-                        continue;
-                    }
-                    if check_buffer(addr, dwords).is_err() {
-                        return;
-                    }
-                    let cursor = Cursor::new(addr, dwords);
-                    let top = stack.last_mut().expect("non-empty");
-                    if chain || top.offset == top.dwords {
-                        *top = cursor;
-                    } else if stack.len() >= MAX_DEPTH {
-                        return;
-                    } else {
-                        stack.push(cursor);
-                    }
-                }
-                op::NOP => match custom(p.header) {
-                    nop::CONTEXT_STATE => {
-                        let operation = match pl.first() {
-                            Some(0) => ContextState::Clear,
-                            Some(1) => ContextState::Push,
-                            Some(2) => ContextState::Pop,
-                            Some(3) => ContextState::PushClear,
-                            _ => return,
-                        };
-                        let _ = regs.context_state(operation);
-                    }
-                    nop::DISPATCH_RESET => {
-                        regs.reset();
-                        dispatch_args_base = 0;
-                    }
-                    // A flip ends the frame the lookahead is for.
-                    nop::FLIP | nop::WAIT_FLIP_DONE => return,
-                    nop::ZERO if pl.first().is_some_and(|&f| f & 0xFFFF_0000 == MARKER_MAGIC && matches!(f & 0xFFF, 0x777 | 0x778 | 0x781)) => return,
-                    _ => {}
-                },
-                // COPY_DATA into a register.
-                op::COPY_DATA if pl.first().is_some_and(|&c| (c >> 8) & 0xF == 0) => return,
-                // Waits change no register: the dispatches after them are
-                // resolved from the same state (memory the scan reads may
-                // still change before the wait ends; a wrong guess costs a
-                // compile). `RPS5E_LOOKAHEAD_WAITS=0` stops at them.
-                op::WAIT_REG_MEM | op::WAIT_REG_MEM64 | op::MEM_SEMAPHORE | op::WAIT_ON_CE_COUNTER | op::WAIT_ON_DE_COUNTER_DIFF => {
-                    if !lookahead::past_waits() {
-                        return;
-                    }
-                }
-                // Packets that choose what runs next, may run before the
-                // packets after them are written, or load state the
-                // command processor itself produces.
-                op::REWIND
-                | op::COND_EXEC
-                | op::SET_PREDICATION
-                | op::INDEX_ATTRIBUTES_INDIRECT => return,
-                // Everything else writes memory or signals: no state the
-                // dispatches after it are resolved from.
-                _ => {}
-            }
+            // The queue's later work starts from the state this scan
+            // reached; another queue's from this queue's registers here.
+            let mut regs_copy;
+            let (regs, base) = if queue == self.queue {
+                (&mut regs, &mut dispatch_args_base)
+            } else {
+                regs_copy = (self.regs.clone(), self.dispatch_args_base);
+                (&mut regs_copy.0, &mut regs_copy.1)
+            };
+            let stop = scan_stream(&mut stack, regs, base, false, queue, true, &mut scan);
+            lookahead::note_scan(stop, true);
         }
     }
+}
+
+/// The output and bounds of one [`Ahead::scan`]: resolved dispatches of
+/// distinct compiles ([`lookahead::identity`]) go to `out` until it holds
+/// `limit` after `start`; `packets` counts the packets decoded (bounded by
+/// [`AHEAD_PACKETS`]).
+struct Scan<'a> {
+    limit: usize,
+    start: usize,
+    packets: &'a mut u64,
+    seen: &'a mut std::collections::HashSet<u64>,
+    out: &'a mut Vec<ps5gpu::render::ResolvedDispatch>,
+}
+
+impl Scan<'_> {
+    fn full(&self) -> bool {
+        self.out.len() - self.start >= self.limit || *self.packets >= AHEAD_PACKETS
+    }
+}
+
+/// Scan one command stream (`stack`) for [`Ahead::scan`]. `past_flips`: a
+/// flip does not end the scan.
+fn scan_stream(stack: &mut Vec<Cursor>, regs: &mut RegisterFile, dispatch_args_base: &mut u64, predicate_skip: bool, queue: usize, past_flips: bool, scan: &mut Scan) -> lookahead::Stop {
+    use lookahead::Stop;
+    let guess = lookahead::guess_branches();
+    while let Some(&cur) = stack.last() {
+        if scan.full() {
+            return Stop::Limit;
+        }
+        *scan.packets += 1;
+        if cur.offset >= cur.dwords {
+            stack.pop();
+            continue;
+        }
+        let paddr = cur.addr + cur.offset as u64 * 4;
+        // SAFETY: the buffer's range was checked when it was entered (a
+        // queued submission's range when it was submitted).
+        let h = unsafe { std::ptr::read_volatile(paddr as *const u32) };
+        if packet_size(h) == 1 {
+            stack.last_mut().expect("non-empty").offset += 1;
+            continue;
+        }
+        let remaining = cur.remaining();
+        if remaining < 2 || super::packet_type(h) != 3 {
+            return Stop::Bad;
+        }
+        let len = length(h);
+        if len > remaining {
+            return Stop::Bad;
+        }
+        stack.last_mut().expect("non-empty").offset += len;
+        if predicated(h) && predicate_skip {
+            continue;
+        }
+        // SAFETY: inside the checked buffer range (len <= remaining).
+        let pl = unsafe { std::slice::from_raw_parts((paddr + 4) as *const u32, (len - 1) as usize) };
+        let p = Packet { header: h & !1, addr: paddr, remaining };
+        match super::opcode(p.header) {
+            op::SET_CONTEXT_REG | op::SET_SH_REG | op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX => {
+                let bank = match super::opcode(p.header) {
+                    op::SET_CONTEXT_REG => Bank::Context,
+                    op::SET_SH_REG => Bank::Shader,
+                    _ => Bank::UserConfig,
+                };
+                if pl.is_empty() || (bank == Bank::UserConfig && super::is_internal_data_packet(p.header, pl)) {
+                    continue;
+                }
+                let offset = if super::opcode(p.header) == op::SET_UCONFIG_REG_INDEX { pl[0] & 0x0FFF_FFFF } else { pl[0] & !super::REGISTER_SELECTOR_MASK };
+                regs.set_run(bank, offset, &pl[1..]);
+            }
+            op::SET_CONTEXT_REG_INDIRECT | op::SET_SH_REG_INDIRECT | op::SET_UCONFIG_REG_INDIRECT => {
+                let bank = match super::opcode(p.header) {
+                    op::SET_CONTEXT_REG_INDIRECT => Bank::Context,
+                    op::SET_SH_REG_INDIRECT => Bank::Shader,
+                    _ => Bank::UserConfig,
+                };
+                if p.len() != 5 {
+                    return Stop::Bad;
+                }
+                let addr = (pl[0] & !3) as u64 | (pl[1] as u64) << 32;
+                let count = pl[3] & 0x3FFF;
+                let words = if pl[2] == 0x8000_0000 { count as u64 * 2 } else { count as u64 };
+                if count == 0 {
+                    continue;
+                }
+                if addr == 0 || !mem::accessible(addr, words * 4, false) {
+                    return Stop::Bad;
+                }
+                // SAFETY: checked readable just above.
+                let values = unsafe { std::slice::from_raw_parts(addr as *const u32, words as usize) };
+                if pl[2] == 0x8000_0000 {
+                    regs.table(bank, values);
+                } else {
+                    regs.set_run(bank, pl[2] & !super::REGISTER_SELECTOR_MASK, values);
+                }
+            }
+            op::CLEAR_STATE => {
+                let _ = regs.context_state(ContextState::Clear);
+            }
+            op::SET_BASE => {
+                if pl.len() >= 3 && pl[0] & 0xF == 1 && (p.header >> 1) & 1 != 0 {
+                    *dispatch_args_base = (pl[1] & !7) as u64 | ((pl[2] & 0xFFFF) as u64) << 32;
+                }
+            }
+            op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
+                let packet = decode_dispatch(queue, *dispatch_args_base, &p, pl);
+                let dims = if packet.indirect_address == 0 { packet.groups } else { [0; 3] };
+                regs.set_run(Bank::Shader, 0x200, &[packet.dispatch_initiator, dims[0], dims[1], dims[2]]);
+                let d = ps5gpu::render::resolve_dispatch(&regs.banks(), &packet);
+                if scan.seen.insert(lookahead::identity(&d)) {
+                    scan.out.push(d);
+                }
+            }
+            op::INDIRECT_BUFFER => {
+                if p.len() != 4 {
+                    // A conditional branch: not followed (a guess reads on
+                    // after it).
+                    lookahead::note_branch(op::INDIRECT_BUFFER);
+                    if guess {
+                        continue;
+                    }
+                    return Stop::Branch;
+                }
+                let addr = pl[0] as u64 | (pl[1] as u64) << 32;
+                let dwords = pl[2] & 0xFFFFF;
+                let chain = (pl[2] >> 20) & 1 != 0;
+                if dwords == 0 {
+                    continue;
+                }
+                if check_buffer(addr, dwords).is_err() {
+                    return Stop::Bad;
+                }
+                let cursor = Cursor::new(addr, dwords);
+                let top = stack.last_mut().expect("non-empty");
+                if chain || top.offset == top.dwords {
+                    *top = cursor;
+                } else if stack.len() >= MAX_DEPTH {
+                    return Stop::Bad;
+                } else {
+                    stack.push(cursor);
+                }
+            }
+            op::NOP => match custom(p.header) {
+                nop::CONTEXT_STATE => {
+                    let operation = match pl.first() {
+                        Some(0) => ContextState::Clear,
+                        Some(1) => ContextState::Push,
+                        Some(2) => ContextState::Pop,
+                        Some(3) => ContextState::PushClear,
+                        _ => return Stop::Bad,
+                    };
+                    let _ = regs.context_state(operation);
+                }
+                nop::DISPATCH_RESET => {
+                    regs.reset();
+                    *dispatch_args_base = 0;
+                }
+                // A flip ends the frame; the next frame's work follows.
+                nop::FLIP | nop::WAIT_FLIP_DONE if past_flips => {}
+                nop::FLIP | nop::WAIT_FLIP_DONE => return Stop::Flip,
+                nop::ZERO if pl.first().is_some_and(|&f| f & 0xFFFF_0000 == MARKER_MAGIC && matches!(f & 0xFFF, 0x777 | 0x778 | 0x781)) => {
+                    if !past_flips {
+                        return Stop::Flip;
+                    }
+                }
+                _ => {}
+            },
+            // COPY_DATA into a register (a guess keeps the register's value).
+            op::COPY_DATA if pl.first().is_some_and(|&c| (c >> 8) & 0xF == 0) => {
+                lookahead::note_branch(op::COPY_DATA);
+                if !guess {
+                    return Stop::Branch;
+                }
+            }
+            // Waits change no register: the dispatches after them are
+            // resolved from the same state (memory the scan reads may
+            // still change before the wait ends; a wrong guess costs a
+            // compile). `RPS5E_LOOKAHEAD_WAITS=0` stops at them.
+            op::WAIT_REG_MEM | op::WAIT_REG_MEM64 | op::MEM_SEMAPHORE | op::WAIT_ON_CE_COUNTER | op::WAIT_ON_DE_COUNTER_DIFF => {
+                if !lookahead::past_waits() {
+                    return Stop::Wait;
+                }
+            }
+            // Packets that choose what runs next or load state the command
+            // processor itself produces: a guess reads on as if the
+            // conditional packets run.
+            op::COND_EXEC | op::SET_PREDICATION | op::INDEX_ATTRIBUTES_INDIRECT => {
+                lookahead::note_branch(super::opcode(p.header));
+                if !guess {
+                    return Stop::Branch;
+                }
+            }
+            // Without its valid bit the packets after it may not be
+            // written yet (the command processor waits for the bit).
+            op::REWIND => {
+                if pl.first().is_none_or(|&w| w & (1 << 31) == 0) {
+                    lookahead::note_branch(op::REWIND);
+                    return Stop::Branch;
+                }
+            }
+            // Everything else writes memory or signals: no state the
+            // dispatches after it are resolved from.
+            _ => {}
+        }
+    }
+    Stop::End
 }
 
 static OUT_OF_BANK_WARNINGS: AtomicU64 = AtomicU64::new(0);

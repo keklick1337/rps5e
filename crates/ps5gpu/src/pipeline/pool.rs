@@ -25,11 +25,19 @@
 //! draw waits for always finds a free worker soon; they are dropped
 //! unrun at shutdown.
 //!
+//! Jobs of the compile lookahead (modules and pipelines of work the
+//! command stream holds after the item being recorded) run after the
+//! prewarm list and before background jobs ([`CompilePool::submit_lookahead`]):
+//! they are guesses, and work a draw or dispatch needs now, or the list a
+//! run collected, matters more. A lookahead job the recording then needs
+//! is moved in front like a prewarm job ([`CompilePool::hurry`]).
+//!
 //! Work a draw or dispatch asked for (urgent jobs) may take every worker;
-//! the prewarm list keeps to the pool's share and background jobs to less,
-//! so while nothing waits the game's own threads keep their cores
-//!. Urgent and prewarm jobs queued or running are counted
-//! in [`foreground_pending`] (the "compiling N shaders" indicator).
+//! the prewarm list and the lookahead keep to the pool's share and
+//! background jobs to less, so while nothing waits the game's own threads
+//! keep their cores. Urgent, prewarm and lookahead jobs queued or running
+//! are counted in [`foreground_pending`] (the "compiling N shaders"
+//! indicator).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -78,6 +86,14 @@ use std::time::{Duration, Instant};
 
 type Job<T> = Box<dyn FnOnce() -> T + Send>;
 
+/// The queue a tagged job goes to.
+#[derive(Clone, Copy)]
+enum Queue {
+    Urgent,
+    Prewarm,
+    Lookahead,
+}
+
 /// The tag of jobs nothing hurries or takes back.
 const UNTAGGED: u64 = u64::MAX;
 
@@ -86,6 +102,8 @@ struct State<T> {
     urgent: VecDeque<(u64, Job<T>)>,
     /// Prewarm jobs with their tags ([`CompilePool::hurry`]).
     prewarm: VecDeque<(u64, Job<T>)>,
+    /// Lookahead jobs with their tags (after the prewarm list).
+    lookahead: VecDeque<(u64, Job<T>)>,
     background: VecDeque<Job<T>>,
     /// Background jobs running now, and how many may run at once.
     background_running: usize,
@@ -93,6 +111,8 @@ struct State<T> {
     /// Prewarm jobs running now, and how many may run at once (the share).
     prewarm_running: usize,
     prewarm_limit: usize,
+    /// Lookahead jobs running now (they keep to the prewarm share too).
+    lookahead_running: usize,
     done: Vec<T>,
     stop: bool,
     /// Workers not yet exited (each counts down on exit).
@@ -115,6 +135,7 @@ struct Shared<T> {
 enum Kind {
     Urgent,
     Prewarm,
+    Lookahead,
     Background,
 }
 
@@ -140,11 +161,13 @@ impl<T: Send + 'static> CompilePool<T> {
             state: Mutex::new(State {
                 urgent: VecDeque::new(),
                 prewarm: VecDeque::new(),
+                lookahead: VecDeque::new(),
                 background: VecDeque::new(),
                 background_running: 0,
                 background_limit,
                 prewarm_running: 0,
                 prewarm_limit: share,
+                lookahead_running: 0,
                 done: Vec::new(),
                 stop: false,
                 running: 0,
@@ -185,6 +208,12 @@ impl<T: Send + 'static> CompilePool<T> {
                             break (j, Kind::Prewarm);
                         }
                     }
+                    if st.prewarm_running + st.lookahead_running < st.prewarm_limit {
+                        if let Some((_, j)) = st.lookahead.pop_front() {
+                            st.lookahead_running += 1;
+                            break (j, Kind::Lookahead);
+                        }
+                    }
                     if st.background_running < st.background_limit {
                         if let Some(j) = st.background.pop_front() {
                             st.background_running += 1;
@@ -199,6 +228,7 @@ impl<T: Send + 'static> CompilePool<T> {
             match kind {
                 Kind::Urgent => {}
                 Kind::Prewarm => st.prewarm_running -= 1,
+                Kind::Lookahead => st.lookahead_running -= 1,
                 Kind::Background => st.background_running -= 1,
             }
             if kind != Kind::Background {
@@ -227,12 +257,29 @@ impl<T: Send + 'static> CompilePool<T> {
     /// Queue `job` (behind the urgent jobs when `prewarm`, untagged).
     /// Dropped without running once the pool is shutting down.
     pub fn submit(&self, job: impl FnOnce() -> T + Send + 'static, prewarm: bool) {
-        self.enqueue(Box::new(job), prewarm, UNTAGGED);
+        self.enqueue(Box::new(job), if prewarm { Queue::Prewarm } else { Queue::Urgent }, UNTAGGED);
     }
 
     /// Queue urgent `job` under `tag` ([`CompilePool::take_queued`]).
     pub fn submit_urgent(&self, job: impl FnOnce() -> T + Send + 'static, tag: u64) {
-        self.enqueue(Box::new(job), false, tag);
+        self.enqueue(Box::new(job), Queue::Urgent, tag);
+    }
+
+    /// Queue lookahead `job` under `tag` (behind the prewarm list; see
+    /// [`CompilePool::hurry`]).
+    pub fn submit_lookahead(&self, job: impl FnOnce() -> T + Send + 'static, tag: u64) {
+        self.enqueue(Box::new(job), Queue::Lookahead, tag);
+    }
+
+    /// Take the queued job tagged `tag` out of the urgent, prewarm or
+    /// lookahead queue.
+    fn remove_tagged(st: &mut State<T>, tag: u64) -> Option<(u64, Job<T>)> {
+        for q in [&mut st.urgent, &mut st.prewarm, &mut st.lookahead] {
+            if let Some(i) = q.iter().position(|(t, _)| *t == tag) {
+                return q.remove(i);
+            }
+        }
+        None
     }
 
     /// The urgent or prewarm job tagged `tag` if no worker has started it,
@@ -245,13 +292,7 @@ impl<T: Send + 'static> CompilePool<T> {
             return None;
         }
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let job = match st.urgent.iter().position(|(t, _)| *t == tag) {
-            Some(i) => st.urgent.remove(i).map(|(_, j)| j),
-            None => {
-                let i = st.prewarm.iter().position(|(t, _)| *t == tag)?;
-                st.prewarm.remove(i).map(|(_, j)| j)
-            }
-        }?;
+        let (_, job) = Self::remove_tagged(&mut st, tag)?;
         drop(st);
         self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
         FOREGROUND.fetch_sub(1, Ordering::Relaxed);
@@ -268,14 +309,7 @@ impl<T: Send + 'static> CompilePool<T> {
             return false;
         }
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let job = match st.urgent.iter().position(|(t, _)| *t == tag) {
-            Some(i) => st.urgent.remove(i),
-            None => match st.prewarm.iter().position(|(t, _)| *t == tag) {
-                Some(i) => st.prewarm.remove(i),
-                None => None,
-            },
-        };
-        let Some(job) = job else { return false };
+        let Some(job) = Self::remove_tagged(&mut st, tag) else { return false };
         st.urgent.push_front(job);
         self.shared.work.notify_one();
         true
@@ -284,19 +318,20 @@ impl<T: Send + 'static> CompilePool<T> {
     /// Queue prewarm `job` under `tag` (behind every urgent job; see
     /// [`CompilePool::hurry`]).
     pub fn submit_prewarm(&self, job: impl FnOnce() -> T + Send + 'static, tag: u64) {
-        self.enqueue(Box::new(job), true, tag);
+        self.enqueue(Box::new(job), Queue::Prewarm, tag);
     }
 
-    fn enqueue(&self, job: Job<T>, prewarm: bool, tag: u64) {
+    fn enqueue(&self, job: Job<T>, queue: Queue, tag: u64) {
         self.shared.in_flight.fetch_add(1, Ordering::AcqRel);
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.stop {
             self.shared.in_flight.fetch_sub(1, Ordering::AcqRel);
             return;
         }
-        match prewarm {
-            true => st.prewarm.push_back((tag, job)),
-            false => st.urgent.push_back((tag, job)),
+        match queue {
+            Queue::Urgent => st.urgent.push_back((tag, job)),
+            Queue::Prewarm => st.prewarm.push_back((tag, job)),
+            Queue::Lookahead => st.lookahead.push_back((tag, job)),
         }
         FOREGROUND.fetch_add(1, Ordering::Relaxed);
         self.shared.work.notify_one();
@@ -344,15 +379,28 @@ impl<T: Send + 'static> CompilePool<T> {
         self.shared.in_flight.load(Ordering::Acquire)
     }
 
-    /// Move the queued prewarm job tagged `tag` behind the urgent jobs (a
-    /// draw waits for it); the other prewarm jobs stay behind any urgent
-    /// work. False when no such job is queued (it runs or ran).
+    /// Move the queued prewarm or lookahead job tagged `tag` behind the
+    /// urgent jobs (a draw waits for it); the other prewarm and lookahead
+    /// jobs stay behind any urgent work. False when no such job is queued
+    /// there (it runs, ran or is urgent already).
     pub fn hurry(&self, tag: u64) -> bool {
         let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(i) = st.prewarm.iter().position(|(t, _)| *t == tag) else { return false };
-        let job = st.prewarm.remove(i).expect("indexed");
+        let job = match st.prewarm.iter().position(|(t, _)| *t == tag) {
+            Some(i) => st.prewarm.remove(i),
+            None => match st.lookahead.iter().position(|(t, _)| *t == tag) {
+                Some(i) => st.lookahead.remove(i),
+                None => None,
+            },
+        };
+        let Some(job) = job else { return false };
         st.urgent.push_back(job);
         true
+    }
+
+    /// Prewarm jobs queued or running.
+    pub fn prewarm_pending(&self) -> usize {
+        let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.prewarm.len() + st.prewarm_running
     }
 
     /// Urgent and prewarm jobs queued or running in this pool.
@@ -661,6 +709,49 @@ mod tests {
         }
         assert_eq!(got.len(), 7);
         assert_eq!(pool.foreground_in_flight(), 0);
+        assert!(pool.shutdown().is_empty());
+    }
+
+    /// Lookahead jobs run after urgent work and the prewarm list and before
+    /// background jobs; one the recording needs is hurried in front, and a
+    /// waiting thread takes it back like any queued job.
+    #[test]
+    fn lookahead_jobs_run_after_the_prewarm_list() {
+        use std::sync::atomic::AtomicBool;
+        let mut pool: CompilePool<u32> = CompilePool::new(1);
+        let release = Arc::new(AtomicBool::new(false));
+        let r = release.clone();
+        pool.submit_urgent(
+            move || {
+                while !r.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                0
+            },
+            1,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.shared.state.lock().unwrap().urgent.len() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pool.submit_background(|| 900);
+        for tag in 10..13u64 {
+            pool.submit_lookahead(move || tag as u32, tag);
+        }
+        pool.submit_prewarm(|| 500, 500);
+        pool.submit_prewarm(|| 501, 501);
+        pool.submit_urgent(|| 100, 100);
+        assert!(pool.hurry(12), "a queued lookahead job is hurried");
+        assert!(!pool.hurry(100), "urgent already");
+        assert_eq!(pool.take_queued(11).expect("queued lookahead job")(), 11);
+        assert_eq!(pool.prewarm_pending(), 2);
+        release.store(true, Ordering::SeqCst);
+        let mut order = Vec::new();
+        while order.len() < 7 && Instant::now() < deadline {
+            order.extend(pool.take());
+            pool.wait(Duration::from_millis(5));
+        }
+        assert_eq!(order, vec![0, 100, 12, 500, 501, 10, 900], "urgent, hurried, prewarm, lookahead, background");
         assert!(pool.shutdown().is_empty());
     }
 
