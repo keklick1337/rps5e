@@ -1596,6 +1596,50 @@ fn cp_occlusion_query_with_host_counts_goes_to_the_executor() {
     assert_eq!(occlusion_sum(block), Some(12));
 }
 
+/// An executor taking dumps without being waited for (a recording
+/// thread): the interpreter writes nothing at once and hands over the
+/// conservative result, which the executor writes in order when the GPU
+/// does not count the query; the guest then reads a ready, visible result.
+#[test]
+fn cp_occlusion_dumps_queued_without_waiting() {
+    type Fallback = Box<dyn FnOnce() + Send>;
+    #[derive(Default)]
+    struct Queued {
+        later: Mutex<Vec<(u64, Fallback)>>,
+    }
+    impl ps5gpu::render::RenderExecutor for Queued {
+        fn draw(&self, _: &ps5gpu::render::ResolvedDraw) {}
+        fn dispatch(&self, _: &ps5gpu::render::ResolvedDispatch) {}
+        fn occlusion_counter_dump_or(&self, addr: u64, _write: &ps5gpu::render::OcclusionWrite, cpu: Fallback) -> bool {
+            self.later.lock().unwrap().push((addr, cpu));
+            true
+        }
+        fn occlusion_counter_dump(&self, _addr: u64, _write: &ps5gpu::render::OcclusionWrite) -> bool {
+            panic!("a queued dump is not asked for synchronously");
+        }
+    }
+    let e = Env::new();
+    let block = e.a(DATA + 0x1200);
+    assert!(mem::write(block, &[0u8; 256]));
+    let rec = std::sync::Arc::new(Queued::default());
+    let q = GpuQueue::new(1);
+    let ex: std::sync::Arc<dyn ps5gpu::render::RenderExecutor> = rec.clone();
+    q.with_interpreter(0, |i| i.executor = Some(ex));
+    let mut w = Vec::new();
+    w.extend_from_slice(&zpass_dump(block));
+    w.extend_from_slice(&zpass_dump(block + 8));
+    run_words(&q, e.a(CMD), &w);
+    let later = std::mem::take(&mut *rec.later.lock().unwrap());
+    assert_eq!(later.iter().map(|l| l.0).collect::<Vec<_>>(), vec![block, block + 8]);
+    assert_eq!(occlusion_sum(block), None, "nothing written before the executor runs the dumps");
+    // The recorder reaches them; the GPU does not count them.
+    for (_, cpu) in later {
+        cpu();
+    }
+    let sum = occlusion_sum(block).expect("every slot is ready");
+    assert!(sum > 0, "the object stays visible");
+}
+
 /// The private RELEASE_MEM uses the native dword layout.
 #[test]
 fn cp_private_release_mem_follows_the_native_layout() {
@@ -3099,4 +3143,40 @@ fn eop_release_performs_the_reserved_flip() {
     run_words(&q, e.a(CMD + 0x3400), &private);
     assert_eq!(EOP_FLIPS.lock().unwrap().as_slice(), &[77, 77]);
     crate::agc::set_eop_flip_hooks(None);
+}
+
+/// Dispatches with only register writes between them may run at the same
+/// time on the console (`DispatchPacket::unsynced`); an event (a partial
+/// flush), a draw or a processor reset between them orders them.
+#[test]
+fn dispatches_without_synchronisation_between_them_are_unsynced() {
+    use ps5gpu::render::regs::sh;
+    let e = Env::new();
+    let sh_reg = |off: u32, v: u32| {
+        e.call("sceAgcDcbSetShRegisterDirect", &[e.cb(), ((v as u64) << 32) | off as u64], &[]);
+    };
+    let dispatch = || {
+        e.call("sceAgcCbDispatch", &[e.cb(), 1, 1, 1, 0], &[]);
+    };
+    sh_reg(sh::COMPUTE_PGM_LO, 0x1234);
+    sh_reg(sh::COMPUTE_NUM_THREAD_X, 64);
+    dispatch();
+    dispatch();
+    sh_reg(sh::COMPUTE_USER_DATA_0, 7);
+    dispatch();
+    // CS_PARTIAL_FLUSH.
+    e.call("sceAgcDcbEventWrite", &[e.cb(), 7, 0], &[]);
+    dispatch();
+    e.call("sceAgcDcbDrawIndexAuto", &[e.cb(), 3, 0], &[]);
+    dispatch();
+    dispatch();
+
+    let rec = std::sync::Arc::new(Recorder::default());
+    let q = GpuQueue::new(1);
+    let ex: std::sync::Arc<dyn ps5gpu::render::RenderExecutor> = rec.clone();
+    q.with_interpreter(0, |i| i.executor = Some(ex));
+    submit_cb(&e, &q);
+    run_queue(&q);
+    let got: Vec<bool> = rec.dispatches.lock().unwrap().iter().map(|d| d.packet.unsynced).collect();
+    assert_eq!(got, [false, true, true, false, false, true]);
 }

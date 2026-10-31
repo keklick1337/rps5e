@@ -50,6 +50,15 @@ fn parse_limit(v: Option<&str>) -> usize {
     }
 }
 
+/// `RPS5E_LOOKAHEAD_WAITS=0`: the scan stops at the first packet that
+/// waits (memory or semaphore waits); by default it reads on past them,
+/// since a wait changes no register the dispatches after it are resolved
+/// from.
+pub fn past_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_LOOKAHEAD_WAITS").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
 /// Whether the command processor installs its source.
 pub fn enabled() -> bool {
     limit() != 0

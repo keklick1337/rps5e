@@ -335,8 +335,8 @@ impl RenderExecutor for Ahead {
 
 /// While a dispatch runs, the command stream after it is resolved without
 /// executing it: register writes (direct and through a called buffer)
-/// apply to the dispatches after them, and the scan stops at a wait (what
-/// follows depends on its outcome).
+/// apply to the dispatches after them, and the scan reads on past a wait
+/// (it changes no register).
 #[test]
 fn lookahead_resolves_the_dispatches_after_the_current_one() {
     let base = arena();
@@ -373,5 +373,5 @@ fn lookahead_resolves_the_dispatches_after_the_current_one() {
         }
     }
     let seen = ex.0.lock().unwrap().clone();
-    assert_eq!(seen, vec![(a1, vec![a2, a3]), (a2, vec![a3]), (a3, vec![]), (a4, vec![])]);
+    assert_eq!(seen, vec![(a1, vec![a2, a3, a4]), (a2, vec![a3, a4]), (a3, vec![a4]), (a4, vec![])]);
 }

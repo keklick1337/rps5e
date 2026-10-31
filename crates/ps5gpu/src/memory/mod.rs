@@ -28,6 +28,7 @@ pub mod lock;
 pub mod mask;
 pub mod region;
 pub mod tracker;
+pub mod uffd;
 pub mod views;
 
 use guard::PageGuard;
@@ -320,7 +321,32 @@ impl Default for GuestGpuMemory {
 thread_local! {
     /// (page, consecutive faults) of the last fault on this thread.
     static LAST_FAULT: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// The pages a write fault on this thread opened beyond its own
+    /// ([`region::fault_runs_enabled`]): (start, bytes), taken by the
+    /// handler for the frame capture.
+    static FAULT_RUN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
+
+/// The tracker opened `[addr, +size)` for the CPU on this thread's fault.
+pub(crate) fn note_fault_run(addr: u64, size: u64) {
+    FAULT_RUN.with(|c| c.set((addr, size)));
+}
+
+/// `RPS5E_PREMARK_WRITES` (default on; `0` off; A/B name
+/// `RPS5E_PREMARK_WRITES` in scope `release`): host code that writes a
+/// guest range through its own view (the HLE memcpy/memset) marks the
+/// write-watched pages of the range CPU-written in one call before it
+/// writes them ([`GuestGpuMemory::prepare_cpu_write`]), instead of taking
+/// one write fault per page.
+pub fn premark_writes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PREMARK_WRITES"))
+}
+
+/// Diagnostics: host writes that marked their pages ahead, and the pages
+/// they marked (the write faults saved).
+pub static PREMARKED_WRITES: AtomicU64 = AtomicU64::new(0);
+pub static PREMARKED_PAGES: AtomicU64 = AtomicU64::new(0);
 
 /// Consecutive faults on one page resolved the quick way (no back-end
 /// lock unless a download needs it). A store may answer "handled" while
@@ -1018,8 +1044,78 @@ impl GuestGpuMemory {
         false
     }
 
+    /// Host code is about to write `[addr, +len)` through the guest's view:
+    /// every maximal run of pages there that is write-watched but readable
+    /// (watched by the caches for CPU writes, not GPU-owned) is marked
+    /// CPU-written now, with the calls a write fault on each of its pages
+    /// would make. Pages a GPU-written image or buffer guards against reads
+    /// are left to their faults (their GPU bytes land first). Exact: the
+    /// same state changes, made before the bytes change; a page the GPU
+    /// side watches again in between faults as usual. Returns the pages
+    /// marked.
+    pub fn prepare_cpu_write(&self, addr: u64, len: u64) -> u64 {
+        if len < 2 * PAGE_BYTES && (addr % PAGE_BYTES) + len <= PAGE_BYTES {
+            return 0;
+        }
+        if !premark_writes_enabled() || !crate::backend::ab::release_fast("RPS5E_PREMARK_WRITES") {
+            return 0;
+        }
+        let (Some(buffers), Some(images)) = (self.buffers.get(), self.images.get()) else { return 0 };
+        let first = addr & !(PAGE_BYTES - 1);
+        let end = addr.saturating_add(len).div_ceil(PAGE_BYTES) * PAGE_BYTES;
+        // Write-blocked, readable pages: (read watch, write watches).
+        let blocked = |p: u64| matches!(self.pages.watchers(p), (false, w) if w != 0);
+        // Only worth a call with two such pages or more.
+        let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
+        let mut count = 0u64;
+        let mut p = first;
+        while p < end {
+            if blocked(p) {
+                let s = p;
+                while p < end && blocked(p) {
+                    p += PAGE_BYTES;
+                }
+                count += (p - s) / PAGE_BYTES;
+                runs.push((s, p - s));
+            } else {
+                p += PAGE_BYTES;
+            }
+        }
+        if count < 2 {
+            return 0;
+        }
+        let mut marked = 0;
+        for (s, n) in runs {
+            // The calls a write fault on each page would make, once.
+            let b = buffers.mark_cpu_write(s, n);
+            let i = images.mark_cpu_write(s, n);
+            if b || i {
+                marked += n / PAGE_BYTES;
+                let mut q = s;
+                while q < s + n {
+                    crate::capture::note_fault(self, q, true);
+                    q += PAGE_BYTES;
+                }
+            }
+        }
+        if marked != 0 {
+            PREMARKED_WRITES.fetch_add(1, Ordering::Relaxed);
+            PREMARKED_PAGES.fetch_add(marked, Ordering::Relaxed);
+        }
+        marked
+    }
+
     /// Resolve a fault on `addr`. True when the access should be retried.
     /// Runs in the signal handler: no allocation on this path.
+    /// [`handle_wp_fault`] for this manager.
+    pub fn try_resolve_wp_fault(&self, addr: u64) -> bool {
+        if !self.pages.write_protected(addr) {
+            return false;
+        }
+        // Protection left on an unwatched page goes at once.
+        self.pages.drop_stale_write_protection(addr) || self.try_resolve_fault(FaultKind::Write, addr)
+    }
+
     pub fn try_resolve_fault(&self, kind: FaultKind, addr: u64) -> bool {
         let page = addr & !(PAGE_BYTES - 1);
         let repeats = LAST_FAULT.with(|c| {
@@ -1111,6 +1207,12 @@ impl GuestGpuMemory {
                 FaultKind::Read => self.read_faults.fetch_add(1, Ordering::Relaxed),
             };
             crate::capture::note_fault(self, addr, kind == FaultKind::Write);
+            let (run, run_bytes) = FAULT_RUN.with(|c| c.replace((0, 0)));
+            let mut q = run;
+            while q < run + run_bytes {
+                crate::capture::note_fault(self, q, true);
+                q += PAGE_BYTES;
+            }
             return true;
         }
         // No store handled the fault and the watches disallowed it at the
@@ -1187,6 +1289,13 @@ pub fn handle_fault(addr: u64, is_write: bool) -> bool {
         Some(m) => m.try_resolve_fault(if is_write { FaultKind::Write } else { FaultKind::Read }, addr),
         None => false,
     }
+}
+
+/// A store hit a page's userfaultfd write protection (SIGBUS `BUS_ADRERR`,
+/// [`uffd`]): resolved like the write fault of a read-only page. False when
+/// the page's protection is not managed here (a genuine SIGBUS).
+pub fn handle_wp_fault(addr: u64) -> bool {
+    GLOBAL.get().is_some_and(|m| m.try_resolve_wp_fault(addr))
 }
 
 #[cfg(test)]

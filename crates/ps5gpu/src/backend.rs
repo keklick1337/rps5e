@@ -392,9 +392,10 @@ pub(crate) fn parse_early_policy(safe: bool, v: Option<&str>) -> Option<EarlyPol
 /// (GPU_PLAN §52 live A/B): +8-12 % in SILENT HILL's heavy apartment (the
 /// CPU's fault on a written page waits for less GPU backlog, wfault -22 %)
 /// and neutral in ASTRO BOT's eop-heavy profile (its in-run A/B counter).
+/// A/B in one run with `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=eager-through`.
 fn eager_through_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    ab::new_fast() && *ON.get_or_init(|| !ab::safe() && !std::env::var("RPS5E_EAGER_THROUGH").is_ok_and(|v| v == "0"))
+    ab::new_fast() && *ON.get_or_init(|| !ab::safe() && !std::env::var("RPS5E_EAGER_THROUGH").is_ok_and(|v| v == "0")) && ab::release_fast("eager-through")
 }
 
 /// `RPS5E_WHOLE_METADATA_WRITES=0`: a compute write of any size at a colour
@@ -2008,12 +2009,17 @@ impl Backend {
         if shape.threads != [64, 1, 1] || !shape.group_id_x || shape.thread_id_components != 1 {
             return None;
         }
-        let mut bytes = [0u8; 256];
-        if !self.memory.read_backing(d.shader.address, &mut bytes) {
-            return None;
-        }
-        let program = ps5shader::program::decode_blob(&bytes, d.shader.address).ok()?;
-        let f = detect_indexed_pattern_fill(&program)?;
+        let f = match crate::fill_kernels::memo::indexed_at(self.memory, d.shader.address) {
+            Some(f) => f?,
+            None => {
+                let mut bytes = [0u8; 256];
+                if !self.memory.read_backing(d.shader.address, &mut bytes) {
+                    return None;
+                }
+                let program = ps5shader::program::decode_blob(&bytes, d.shader.address).ok()?;
+                detect_indexed_pattern_fill(&program)?
+            }
+        };
         // The work-group id must sit in the first system SGPR (after the
         // user data) and every register the fill reads must be user data.
         if f.group != d.shader.user_sgpr_count() {
@@ -2072,12 +2078,17 @@ impl Backend {
             why(&format!("threads {:?} rsrc2 {:#x}", shape.threads, d.shader.rsrc2));
             return None;
         }
-        let mut bytes = [0u8; 64];
-        if !self.memory.read_backing(d.shader.address, &mut bytes) {
-            return None;
-        }
-        let program = ps5shader::program::decode_blob(&bytes, d.shader.address).ok()?;
-        let f = detect_constant_fill(&program)?;
+        let f = match crate::fill_kernels::memo::constant_at(self.memory, d.shader.address, 64) {
+            Some(f) => f?,
+            None => {
+                let mut bytes = [0u8; 64];
+                if !self.memory.read_backing(d.shader.address, &mut bytes) {
+                    return None;
+                }
+                let program = ps5shader::program::decode_blob(&bytes, d.shader.address).ok()?;
+                detect_constant_fill(&program)?
+            }
+        };
         why("(matched code)");
         // The work-group id must sit in the first system SGPR (after the
         // user data) and the V# must be user data.
@@ -2625,6 +2636,9 @@ impl Backend {
     /// The command processor publishes a write the guest can observe
     /// (see [`BufferCache::publish_point`]).
     pub fn publish_point(&mut self) {
+        // The guest may reuse what queued upload copies read once it sees
+        // the write.
+        crate::buffers::async_copy::drain();
         let done = self.sched.timeline.completed_tick();
         self.buffers.publish_point(done);
     }
@@ -2903,6 +2917,7 @@ impl Backend {
         self.bound_retired_bytes();
         self.housekeeping += 1;
         if self.housekeeping % 256 == 0 {
+            self.memory.pages.sync_mode();
             self.sched.run_completed();
             self.images.collect(&mut self.sched, &mut self.buffers, IMAGE_BUDGET);
             let tick = self.sched.current_tick();
@@ -3061,11 +3076,16 @@ static CELL: Cell = Cell { inner: Mutex::new(None), owner: AtomicI32::new(0), st
 
 struct Guard {
     g: MutexGuard<'static, Option<Backend>>,
+    /// The call site and the moment it took the lock (`RPS5E_LOCK_SITES`).
+    held: Option<(&'static std::panic::Location<'static>, std::time::Instant, u64)>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
         CELL.owner.store(0, Ordering::Release);
+        if let Some((at, t0, waited)) = self.held.take() {
+            profile::note_lock(at, waited, t0.elapsed().as_nanos() as u64);
+        }
     }
 }
 
@@ -3073,6 +3093,7 @@ fn enabled() -> bool {
     !std::env::var("RPS5E_GPU_BACKEND").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
 }
 
+#[track_caller]
 fn lock() -> Option<Guard> {
     if CELL.state.load(Ordering::Acquire) == FAILED {
         return None;
@@ -3081,8 +3102,19 @@ fn lock() -> Option<Guard> {
     if CELL.owner.load(Ordering::Acquire) == me {
         return None;
     }
+    let sites = profile::lock_sites();
+    let at = std::panic::Location::caller();
+    let t0 = sites.then(std::time::Instant::now);
+    let tw = (ab::enabled() && crate::perf::sys::is_recorder()).then(std::time::Instant::now);
     let mut g = profile::time(7, || CELL.inner.lock().unwrap_or_else(|e| e.into_inner()));
     CELL.owner.store(me, Ordering::Release);
+    if let Some(tw) = tw {
+        note_pipeline_ab(2, tw.elapsed().as_micros() as u64);
+    }
+    let held = t0.map(|t0| {
+        let now = std::time::Instant::now();
+        (at, now, (now - t0).as_nanos() as u64)
+    });
     if g.is_none() {
         if CELL.state.load(Ordering::Acquire) != UNINIT || !enabled() {
             CELL.state.store(FAILED, Ordering::Release);
@@ -3119,7 +3151,7 @@ fn lock() -> Option<Guard> {
             }
         }
     }
-    Some(Guard { g })
+    Some(Guard { g, held })
 }
 
 /// Route the CPU faults on `memory`'s watched pages to the caches of `b`
@@ -3134,6 +3166,7 @@ pub(crate) fn attach_faults(b: &Backend, memory: &GuestGpuMemory) {
 
 /// Run `f` with the back-end (initialised on first use). None when the
 /// back-end is unavailable or the calling thread already holds it.
+#[track_caller]
 pub fn with_backend<R>(f: impl FnOnce(&mut Backend) -> R) -> Option<R> {
     let mut g = lock()?;
     let b = g.g.as_mut()?;
@@ -3143,12 +3176,14 @@ pub fn with_backend<R>(f: impl FnOnce(&mut Backend) -> R) -> Option<R> {
 /// A write of the command processor the guest can observe is about to be
 /// made (a label): GPU results it orders reach guest memory before a CPU
 /// read of them ([`Backend::publish_point`]).
+#[track_caller]
 pub fn publish_point() {
     with_ready_backend(|b| b.publish_point());
 }
 
 /// An ordered write of the command processor (see [`Backend::cp_write`]):
 /// the publish point, then the write on the GPU, or `write` on the CPU.
+#[track_caller]
 pub fn ordered_cp_write(addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
     publish_point();
     if !with_ready_backend(|b| b.cp_write(addr, data)).unwrap_or(false) {
@@ -3157,6 +3192,7 @@ pub fn ordered_cp_write(addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>)
 }
 
 /// Run `f` only when the back-end already exists (fault / flip paths).
+#[track_caller]
 pub fn with_ready_backend<R>(f: impl FnOnce(&mut Backend) -> R) -> Option<R> {
     if CELL.state.load(Ordering::Acquire) != READY {
         return None;
@@ -3182,6 +3218,7 @@ pub fn writeback_display(desc: &crate::SurfaceDesc, addr: u64) -> bool {
 
 /// Bring the GPU-written pages of `[addr, addr+size)` back to guest memory
 /// (waits for the GPU only when there are any).
+#[track_caller]
 pub fn download_range(addr: u64, size: u64) {
     with_ready_backend(|b| {
         if b.buffers.has_gpu_dirty(addr, size) {
@@ -3476,6 +3513,26 @@ impl ImageStore for FaultImages {
             }
             return false;
         }
+        if crate::images::unlocked_target_read_enabled() {
+            // The GPU catches up with the read-back's copies while the
+            // back-end records on; the last round finishes without a wait.
+            for _ in 0..FAULT_DOWNLOAD_ROUNDS {
+                let step = with_ready_backend(|b| {
+                    match b.images.start_read_backs(&mut b.sched, &mut b.buffers, &hits) {
+                        Some(tick) => Some((tick, b.sched.timeline.clone())),
+                        None => {
+                            let tracker = b.tracker.clone();
+                            b.images.resolve_read_backs(&mut b.sched, &mut b.buffers, &tracker, &hits, true);
+                            None
+                        }
+                    }
+                });
+                match step {
+                    Some(Some((tick, timeline))) => timeline.wait(tick),
+                    _ => return true,
+                }
+            }
+        }
         with_ready_backend(|b| {
             let tracker = b.tracker.clone();
             // A write too: the GPU work storing to the image was submitted
@@ -3727,6 +3784,15 @@ pub mod ab {
     /// Flips longer than 100 ms after the one before (freezes), per mode.
     pub static FREEZES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+    /// GPU busy nanoseconds of the command buffers submitted in each mode
+    /// (with the GPU profile's timer).
+    pub static GPU_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    pub fn note_gpu(fast: bool, ns: u64) {
+        if enabled() {
+            GPU_NS[!fast as usize].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
     /// A flip (counted in the mode of the moment).
     pub fn note_flip() {
         if !enabled() {
@@ -3748,7 +3814,7 @@ pub mod ab {
             return String::new();
         }
         let g = |a: &[AtomicU64; 2]| [a[0].load(Ordering::Relaxed), a[1].load(Ordering::Relaxed)];
-        format!(" ab_draws={:?} ab_cpu_ms={:?} ab_flips={:?} ab_freezes={:?}", g(&DRAWS), g(&CPU_NS).map(|n| n / 1_000_000), g(&FLIPS), g(&FREEZES))
+        format!(" ab_draws={:?} ab_cpu_ms={:?} ab_flips={:?} ab_freezes={:?} ab_gpu_ms={:?}", g(&DRAWS), g(&CPU_NS).map(|n| n / 1_000_000), g(&FLIPS), g(&FREEZES), g(&GPU_NS).map(|n| n / 1_000_000))
     }
 }
 
@@ -3831,6 +3897,9 @@ pub(crate) mod profile {
     /// Charge `ns` to span `k` (thread-locally, moved to [`NANOS`] every
     /// [`LOCAL_FLUSH`]).
     fn add(k: usize, ns: u64) {
+        if crate::perf::items::enabled() {
+            crate::perf::items::note_span(k, ns);
+        }
         if !local_enabled() {
             NANOS[k].fetch_add(ns, Ordering::Relaxed);
             return;
@@ -4161,6 +4230,33 @@ pub(crate) mod profile {
         v.sort_unstable_by(|a, b| b.1 .1.cmp(&a.1 .1));
         v.iter().take(12).map(|((f, l, p), (n, ns))| if *p != 0 { format!("{f}:{l}<-p{p:#x}:{n}/{}ms", ns / 1_000_000) } else { format!("{f}:{l}:{n}/{}ms", ns / 1_000_000) }).collect::<Vec<_>>().join(" ")
     }
+    /// `RPS5E_LOCK_SITES=1` (with the profile): the back-end lock's holds
+    /// by call site and thread (count, held and waited nanoseconds).
+    pub fn lock_sites() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RPS5E_LOCK_SITES").is_ok_and(|v| v == "1")) && on()
+    }
+    type LockKey = (&'static str, u32, String);
+    static LOCKS: std::sync::Mutex<Option<std::collections::HashMap<LockKey, (u64, u64, u64)>>> = std::sync::Mutex::new(None);
+    pub fn note_lock(at: &'static std::panic::Location<'static>, waited: u64, held: u64) {
+        let file = at.file().rsplit('/').next().unwrap_or("");
+        let thread = std::thread::current()
+            .name()
+            .map(|n| n.split(|c: char| c.is_ascii_digit()).next().unwrap_or(n).chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect::<String>())
+            .unwrap_or_else(|| "guest".into());
+        let mut g = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g.get_or_insert_with(Default::default).entry((file, at.line(), thread)).or_default();
+        e.0 += 1;
+        e.1 += held;
+        e.2 += waited;
+    }
+    fn lock_line() -> String {
+        let g = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = g.as_ref() else { return String::new() };
+        let mut v: Vec<(&LockKey, &(u64, u64, u64))> = m.iter().collect();
+        v.sort_unstable_by(|a, b| (b.1 .1 + b.1 .2).cmp(&(a.1 .1 + a.1 .2)));
+        v.iter().take(14).map(|((f, l, t), (n, h, w))| format!("{f}:{l}[{t}]:{n}/{}ms/w{}ms", h / 1_000_000, w / 1_000_000)).collect::<Vec<_>>().join(" ")
+    }
     fn barrier_line() -> String {
         let g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = g.as_ref() else { return String::new() };
@@ -4256,7 +4352,7 @@ pub(crate) mod profile {
         faults.sort_unstable_by(|a, b| b.cmp(a));
         let top: Vec<String> = faults.iter().take(6).map(|(ns, n, a, w, rip)| format!("{a:#x}:{n}/{}ms{}@rip{rip:#x}{}", ns / 1_000_000, writer_of(*w), host_symbol(*rip))).collect();
         format!(
-            " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {} | full barriers: {} | gpu waits: {}{}",
+            " | ms: {} | fault windows: {} | CPU image writes (64 KiB): {} | write faults (1 MiB): {} | sync downloads: {} | full barriers: {} | gpu waits: {} | lock holds: {}{}",
             parts.join(" "),
             top.join(" "),
             iw.join(" "),
@@ -4264,6 +4360,7 @@ pub(crate) mod profile {
             download_line(),
             barrier_line(),
             wait_line(),
+            lock_line(),
             blocked_line()
         )
     }
@@ -4304,7 +4401,7 @@ pub(crate) mod profile {
         let g = ps5shader::resources::BLOCKED_READS.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<_> = g.iter().collect();
         v.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-        let parts: Vec<String> = v.iter().take(16).map(|((p, op), uses, n, a)| format!("p{p:#x} op{op} n{n} @{a:#x} {uses}")).collect();
+        let parts: Vec<String> = v.iter().take(64).map(|((p, op), uses, n, a)| format!("p{p:#x} op{op} n{n} @{a:#x} {uses}")).collect();
         format!("{records} | blocked reads: {}", parts.join("; "))
     }
 }
@@ -4389,8 +4486,9 @@ impl RenderExecutor for GpuExecutor {
             profile::set_work(profile::WORK_DRAW, if draw.shaders.ps.address != 0 { draw.shaders.ps.address } else { draw.shaders.vertex_program_address() });
             // A draw waiting for a compile does so with the back-end
             // unlocked (CPU faults on GPU-written pages need it meanwhile).
+            let program = if draw.shaders.ps.address != 0 { draw.shaders.ps.address } else { draw.shaders.vertex_program_address() };
             let ran = crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
-                let r = profile::time_cpu(|| profile::time(0, || with_backend(|b| (b.draw(draw), b.take_compile_pending()).1)));
+                let r = crate::perf::items::measure(crate::perf::items::DRAW, program, || profile::time_cpu(|| profile::time(0, || with_backend(|b| (b.draw(draw), b.take_compile_pending()).1))));
                 (r.is_some(), r == Some(true))
             });
             if !ran {
@@ -4406,7 +4504,7 @@ impl RenderExecutor for GpuExecutor {
         shadow::item(shadow::Kind::Dispatch, 0, || {
             profile::set_work(profile::WORK_DISPATCH, dispatch.shader.address);
             crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
-                let r = profile::time(1, || with_backend(|b| (b.dispatch(dispatch), b.take_compile_pending()).1));
+                let r = crate::perf::items::measure(crate::perf::items::DISPATCH, dispatch.shader.address, || profile::time(1, || with_backend(|b| (b.dispatch(dispatch), b.take_compile_pending()).1)));
                 ((), r == Some(true))
             });
         })
@@ -4532,14 +4630,187 @@ pub(crate) mod draw_prefetch {
     }
 }
 
-/// `RPS5E_GPU_RECORD_THREAD=1`: the PM4 interpreter hands its draws to
-/// the recording thread instead of recording them itself. Off by default:
-/// interpretation costs ~1.5 us per draw, the hand-over more (the draw
-/// copied across cores, transfers and labels moved to the recorder), so
-/// SILENT HILL records fewer draws per second with it.
+/// `RPS5E_GPU_RECORD_THREAD`: the PM4 interpreter hands its draws to
+/// the recording thread (`gpu-record`, on the recorder's reserved core)
+/// instead of recording them itself, and pre-materialises their stages
+/// meanwhile (a pipeline of two threads). `auto` (default): while the
+/// recorder stays busy ([`pipeline_policy`]); `1`: always; `0`: never.
+/// It pays where recording is CPU-bound (SILENT HILL's heavy room
+/// +10-20 %); where the frame is bound by synchronisations with the GPU,
+/// every round trip crosses two threads and one thread does better
+/// (SILENT HILL's light rooms -13 % with `1`).
 fn queued_recording() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RPS5E_GPU_RECORD_THREAD").is_ok_and(|v| v == "1"))
+    record_thread_mode() != RecordThread::Off
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordThread {
+    Off,
+    On,
+    /// On while it pays (see [`pipeline_policy`]).
+    Auto,
+}
+
+fn record_thread_mode() -> RecordThread {
+    static MODE: OnceLock<RecordThread> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("RPS5E_GPU_RECORD_THREAD").as_deref() {
+        Ok("1") | Ok("on") => RecordThread::On,
+        Ok("0") | Ok("off") => RecordThread::Off,
+        _ if ab::safe() => RecordThread::Off,
+        _ => RecordThread::Auto,
+    })
+}
+
+/// Draws and dispatches go to the recording thread now
+/// (`RPS5E_GPU_RECORD_THREAD=1`, not in an A/B slow period, and with
+/// `auto` while the policy keeps it on): the PM4 interpreter then leaves
+/// the recorder's core to it.
+pub fn records_on_own_thread() -> bool {
+    queued_recording() && crate::slices::configured() == 0 && pipeline_route()
+}
+
+/// Commands go through the recording thread now (see
+/// [`records_on_own_thread`]; the executor exists).
+fn pipeline_route() -> bool {
+    ab::thread_fast()
+        && (record_thread_mode() != RecordThread::Auto || {
+            pipeline_policy::tick();
+            pipeline_policy::on()
+        })
+}
+
+/// `RPS5E_GPU_RECORD_THREAD=auto`: the recording thread is used while the
+/// recorder is the busy end of the pipeline. Signal: the share of time the
+/// recorder idles on an empty queue (`PIPELINE_US[0]`). A pipeline whose
+/// recorder idles is bound by the latency of its synchronisations (the
+/// interpreter waits for labels the recorded work writes, and every such
+/// round trip now crosses two threads), and records slower than one
+/// thread doing both (SILENT HILL's light rooms: recorder idle 31-37 %,
+/// -13 % fps); a CPU-bound one keeps its recorder busy (SILENT HILL's
+/// heavy room 0-3 % idle, +10-20 % fps; GTA V's city).
+///
+/// On: a 1 s window with the recorder idle more than [`IDLE_LIMIT`]
+/// twice in a row turns it off for a back-off (15 s, doubling to 120 s
+/// while probes fail). Off: at the end of the back-off a 2 s probe runs
+/// with it on; a probe under the limit turns it on.
+mod pipeline_policy {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+    use std::sync::Mutex;
+
+    const IDLE_LIMIT: f64 = 0.20;
+    const WINDOW_MS: u64 = 1000;
+    const PROBE_MS: u64 = 2000;
+    const BACKOFF_MS: u64 = 15_000;
+    const BACKOFF_MAX_MS: u64 = 120_000;
+
+    const ON: u8 = 0;
+    const OFF: u8 = 1;
+    const PROBE: u8 = 2;
+    /// The first moments of a probe: the recorder's wait that spans the
+    /// off period ends now and is not counted.
+    const WARMUP: u8 = 3;
+    const WARMUP_MS: u64 = 250;
+
+    static STATE: AtomicU8 = AtomicU8::new(ON);
+    /// Milliseconds since the start at which the policy looks again.
+    static NEXT_MS: AtomicU64 = AtomicU64::new(WINDOW_MS);
+    /// Transitions (diagnostics: on, off).
+    pub static SWITCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    struct Window {
+        start_ms: u64,
+        idle_us: u64,
+        strikes: u8,
+        backoff_ms: u64,
+    }
+    static WINDOW: Mutex<Window> = Mutex::new(Window { start_ms: 0, idle_us: 0, strikes: 0, backoff_ms: BACKOFF_MS });
+
+    fn now_ms() -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
+
+    pub fn on() -> bool {
+        STATE.load(Relaxed) != OFF
+    }
+
+    /// The next state after a window in `state` whose recorder idled
+    /// `share` of the time, with the strike count and back-off carried.
+    pub(super) fn decide(state: u8, share: f64, strikes: u8, backoff_ms: u64) -> (u8, u8, u64) {
+        match state {
+            ON if share > IDLE_LIMIT && strikes + 1 >= 2 => (OFF, 0, backoff_ms),
+            ON if share > IDLE_LIMIT => (ON, strikes + 1, backoff_ms),
+            ON => (ON, 0, BACKOFF_MS),
+            PROBE if share > IDLE_LIMIT => (OFF, 0, (backoff_ms * 2).min(BACKOFF_MAX_MS)),
+            PROBE => (ON, 0, BACKOFF_MS),
+            WARMUP => (PROBE, strikes, backoff_ms),
+            _ => (WARMUP, strikes, backoff_ms),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// An idle recorder turns the thread off after two windows, a busy
+        /// one keeps it; probes come after a warm-up, a failed probe
+        /// doubles the back-off up to its cap, a passed one resets it.
+        #[test]
+        fn the_policy_follows_the_recorders_idle_share() {
+            assert_eq!(decide(ON, 0.05, 0, BACKOFF_MS), (ON, 0, BACKOFF_MS));
+            assert_eq!(decide(ON, 0.35, 0, BACKOFF_MS), (ON, 1, BACKOFF_MS));
+            assert_eq!(decide(ON, 0.05, 1, BACKOFF_MS), (ON, 0, BACKOFF_MS), "one idle window alone changes nothing");
+            assert_eq!(decide(ON, 0.35, 1, BACKOFF_MS), (OFF, 0, BACKOFF_MS));
+            assert_eq!(decide(OFF, 1.0, 0, BACKOFF_MS), (WARMUP, 0, BACKOFF_MS));
+            assert_eq!(decide(WARMUP, 5.0, 0, BACKOFF_MS), (PROBE, 0, BACKOFF_MS), "the warm-up is not judged");
+            assert_eq!(decide(PROBE, 0.35, 0, BACKOFF_MS), (OFF, 0, 2 * BACKOFF_MS));
+            assert_eq!(decide(PROBE, 0.35, 0, BACKOFF_MAX_MS), (OFF, 0, BACKOFF_MAX_MS));
+            assert_eq!(decide(PROBE, 0.10, 0, 4 * BACKOFF_MS), (ON, 0, BACKOFF_MS));
+        }
+    }
+
+    /// Called by the interpreter for every command it hands over or keeps:
+    /// cheap unless a window ended.
+    pub fn tick() {
+        let now = now_ms();
+        if now < NEXT_MS.load(Relaxed) {
+            return;
+        }
+        let Ok(mut w) = WINDOW.try_lock() else { return };
+        let idle = super::PIPELINE_US[0].load(Relaxed);
+        let span_ms = now.saturating_sub(w.start_ms).max(1);
+        let share = idle.saturating_sub(w.idle_us) as f64 / (span_ms * 1000) as f64;
+        let state = STATE.load(Relaxed);
+        let (next, strikes, backoff) = decide(state, share, w.strikes, w.backoff_ms);
+        w.strikes = strikes;
+        w.backoff_ms = backoff;
+        if next != state && next != PROBE {
+            log::info!(
+                "ps5gpu: recording thread {} (recorder idle {:.0} % of the last {} ms){}",
+                match next {
+                    ON => "on",
+                    OFF => "off",
+                    _ => "probed",
+                },
+                share * 100.0,
+                span_ms,
+                if next == OFF { format!(", next probe in {} s", w.backoff_ms / 1000) } else { String::new() }
+            );
+            SWITCHES[(next == OFF) as usize].fetch_add(1, Relaxed);
+        }
+        STATE.store(next, Relaxed);
+        w.start_ms = now;
+        w.idle_us = super::PIPELINE_US[0].load(Relaxed);
+        NEXT_MS.store(
+            now + match next {
+                OFF => w.backoff_ms,
+                PROBE => PROBE_MS,
+                WARMUP => WARMUP_MS,
+                _ => WINDOW_MS,
+            },
+            Relaxed,
+        );
+    }
 }
 
 /// One executor call handed to the recording thread.
@@ -4582,9 +4853,152 @@ pub struct QueuedExecutor {
     transfers: Arc<crate::slices::pending::PendingEvents>,
     /// Calls queued and not yet executed.
     pending: Arc<AtomicU64>,
-    /// Signalled by the recorder after every command it takes: a sender
-    /// waiting for space wakes the moment a slot frees.
-    space: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    /// Signalled by the recorder after a command it takes while a sender
+    /// waits: that sender wakes the moment a slot frees.
+    space: Arc<QueueSpace>,
+}
+
+/// The wake-up of an interpreter waiting for room in the recording queue.
+/// The recorder signals only while a sender has announced itself in
+/// `waiting` (a condition variable's notify is a system call even
+/// without waiters, which was one per recorded command). The sender
+/// announces itself before it tries the queue again and the recorder
+/// looks after it took a command, each behind a sequentially consistent
+/// fence: either the sender's retry sees the free slot or the recorder
+/// sees the sender (`RPS5E_QUEUE_SIGNAL_ALWAYS=1`: signal after every
+/// command, as before).
+/// Bytes of an occlusion query's result block from its dump address on.
+const OCCLUSION_BLOCK_BYTES: u64 = 256;
+
+/// `RPS5E_ASYNC_OCCLUSION=0`: with the recording thread, the interpreter
+/// waits at every occlusion counter dump until the recorder has recorded
+/// everything before it (to learn whether the GPU counts it). By default
+/// the dump is queued like a draw and its conservative CPU result, when
+/// the GPU does not count it, is written in order by the recorder (A/B
+/// scope release `async-occlusion`). SILENT HILL dumps ~5 000 times a
+/// second: every dump drained the queue and left the recorder idle a
+/// third of the time in light rooms.
+fn async_occlusion_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ab::switch_on("RPS5E_ASYNC_OCCLUSION")) && ab::release_fast("async-occlusion")
+}
+
+/// The recording pipeline's stalls (`RPS5E_GPU_RECORD_THREAD=1`), in
+/// microseconds: the recorder idle on an empty queue, the interpreter
+/// waiting for room, the interpreter waiting for a call's result (the
+/// queue drained first); then the number of such calls.
+pub static PIPELINE_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// With `RPS5E_AB_PERIOD`: the recorder idle on an empty queue, the
+/// interpreter waiting for room, the recorder waiting for the back-end
+/// lock and for the GPU, in microseconds per A/B mode (fast, then slow).
+pub static PIPELINE_AB_US: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+
+pub(crate) fn note_pipeline_ab(kind: usize, us: u64) {
+    if ab::enabled() {
+        PIPELINE_AB_US[!ab::mode_fast() as usize][kind].fetch_add(us, Ordering::Relaxed);
+    }
+}
+
+/// Calls that waited for the recorder, by kind: occlusion dump, copy,
+/// fill, write, GDS, drain (flips, reads), memory hazard, ordered read.
+pub static PIPELINE_CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn count_call(kind: usize) {
+    PIPELINE_CALLS[kind].fetch_add(1, Ordering::Relaxed);
+}
+
+/// `pipeline rec-idle .. full .. calls ../..` for the `[gpu-sys]` line.
+pub fn pipeline_stalls() -> String {
+    if !queued_recording() {
+        return String::new();
+    }
+    let g = |i: usize| PIPELINE_US[i].load(Ordering::Relaxed);
+    let k: Vec<u64> = PIPELINE_CALLS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let sw = |i: usize| pipeline_policy::SWITCHES[i].load(Ordering::Relaxed);
+    let ab = |m: usize, i: usize| PIPELINE_AB_US[m][i].load(Ordering::Relaxed) / 1000;
+    format!(
+        " pipeline rec-idle {} ms full {} ms calls {} ms/{} by kind {:?} switched on/off {}/{} ab_rec_idle_ms=[{}, {}] ab_full_ms=[{}, {}] ab_rec_lock_ms=[{}, {}] ab_rec_gpu_ms=[{}, {}]",
+        g(0) / 1000,
+        g(1) / 1000,
+        g(2) / 1000,
+        g(3),
+        k,
+        sw(0),
+        sw(1),
+        ab(0, 0),
+        ab(1, 0),
+        ab(0, 1),
+        ab(1, 1),
+        ab(0, 2),
+        ab(1, 2),
+        ab(0, 3),
+        ab(1, 3)
+    )
+}
+
+/// Waits for queue room that ended by the timeout instead of a signal
+/// (a lost wake-up would show here; tests).
+static QUEUE_SPACE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+struct QueueSpace {
+    lock: std::sync::Mutex<()>,
+    woke: std::sync::Condvar,
+    waiting: std::sync::atomic::AtomicUsize,
+}
+
+impl QueueSpace {
+    fn new() -> QueueSpace {
+        QueueSpace { lock: std::sync::Mutex::new(()), woke: std::sync::Condvar::new(), waiting: std::sync::atomic::AtomicUsize::new(0) }
+    }
+
+    /// Queue `item`, waiting for room when the queue is full.
+    fn send<T>(&self, tx: &std::sync::mpsc::SyncSender<T>, item: T) {
+        let mut item = match tx.try_send(item) {
+            Ok(()) => return,
+            Err(std::sync::mpsc::TrySendError::Full(c)) => c,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
+        };
+        let t = std::time::Instant::now();
+        let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Announced before the retry.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        loop {
+            match tx.try_send(item) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(c)) => {
+                    if ps5vm::shutdown::requested() {
+                        break;
+                    }
+                    item = c;
+                    let (g, timeout) = self.woke.wait_timeout(guard, std::time::Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner());
+                    if timeout.timed_out() {
+                        QUEUE_SPACE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    guard = g;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        let us = t.elapsed().as_micros() as u64;
+        PIPELINE_US[1].fetch_add(us, Ordering::Relaxed);
+        note_pipeline_ab(1, us);
+    }
+
+    /// The recorder took a command (its slot is free).
+    fn freed(&self) {
+        static ALWAYS: OnceLock<bool> = OnceLock::new();
+        let always = *ALWAYS.get_or_init(|| std::env::var("RPS5E_QUEUE_SIGNAL_ALWAYS").is_ok_and(|v| v == "1"));
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if always || self.waiting.load(Ordering::SeqCst) != 0 {
+            // Under the lock: a sender between its failed retry and its
+            // wait holds it, so the signal cannot fall in between.
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.woke.notify_all();
+        }
+    }
 }
 
 impl QueuedExecutor {
@@ -4595,20 +5009,47 @@ impl QueuedExecutor {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let s = stop.clone();
         let wake = tx.clone();
-        let space: Arc<(std::sync::Mutex<()>, std::sync::Condvar)> = Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new()));
+        let space = Arc::new(QueueSpace::new());
         let freed = space.clone();
         std::thread::Builder::new()
             .name("gpu-record".into())
             .spawn(move || {
-                ps5vm::topology::pin_current_thread_to_fast_cores("gpu-record");
+                // The recorder is the busy end of the pipeline: it takes the
+                // core kept for the recorder (the interpreter moves off it
+                // while commands go through this thread, see
+                // `records_on_own_thread`).
+                ps5vm::topology::pin_current_thread_to_recorder_core("gpu-record");
+                crate::perf::sys::mark_recorder_thread();
                 let ex = GpuExecutor;
-                while let Ok(cmd) = rx.recv() {
+                let mut taken = 0u32;
+                loop {
+                    // The recorder idles on an empty queue (counted: the
+                    // pipeline's balance, see `pipeline_stalls`).
+                    let cmd = match rx.try_recv() {
+                        Ok(c) => c,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            let t = std::time::Instant::now();
+                            let r = rx.recv();
+                            let us = t.elapsed().as_micros() as u64;
+                            PIPELINE_US[0].fetch_add(us, Ordering::Relaxed);
+                            note_pipeline_ab(0, us);
+                            match r {
+                                Ok(c) => c,
+                                Err(_) => break,
+                            }
+                        }
+                        Err(_) => break,
+                    };
+                    taken = taken.wrapping_add(1);
+                    if taken % 32 == 0 {
+                        crate::perf::sys::account_ab_mode_recorder();
+                    }
                     if s.load(Ordering::Acquire) {
                         break;
                     }
                     // A sender waiting for queue space wakes now: its slot
                     // is free the moment the command is taken.
-                    freed.1.notify_all();
+                    freed.freed();
                     match cmd {
                         Recorded::Draw(d, pre) => {
                             draw_prefetch::set(pre);
@@ -4640,7 +5081,7 @@ impl QueuedExecutor {
     /// The back-end records (before it exists nothing is queued: calls
     /// have no GPU side and run at once, in order).
     fn recording(&self) -> bool {
-        if !ab::thread_fast() {
+        if !pipeline_route() {
             // A/B slow mode: calls run on the interpreter, after the queue.
             self.drain();
             return false;
@@ -4656,23 +5097,7 @@ impl QueuedExecutor {
         // full queue - at a small queue that alone halved the frame rate,
         // GPU_PLAN §53.) The 100 ms timeout only checks for a shutdown;
         // the recorder drains the queue before it stops.
-        let mut cmd = cmd;
-        let (lock, woke) = &*self.space;
-        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            match self.tx.try_send(cmd) {
-                Ok(()) => return,
-                Err(std::sync::mpsc::TrySendError::Full(c)) => {
-                    if ps5vm::shutdown::requested() {
-                        return;
-                    }
-                    cmd = c;
-                    let (g, _) = woke.wait_timeout(guard, std::time::Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner());
-                    guard = g;
-                }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return,
-            }
-        }
+        self.space.send(&self.tx, cmd);
     }
 
     /// Run `f` on the recording thread after every call queued before it
@@ -4682,9 +5107,14 @@ impl QueuedExecutor {
         self.send(Recorded::Call(Box::new(move || {
             let _ = tx.send(f());
         })));
+        let t = std::time::Instant::now();
+        PIPELINE_US[3].fetch_add(1, Ordering::Relaxed);
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(r) => return Some(r),
+                Ok(r) => {
+                    PIPELINE_US[2].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    return Some(r);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !ps5vm::shutdown::requested() => {}
                 Err(_) => return None,
             }
@@ -4694,7 +5124,7 @@ impl QueuedExecutor {
 
 impl RenderExecutor for QueuedExecutor {
     fn draw(&self, draw: &ResolvedDraw) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.draw(draw);
         }
         // The interpreter thread pre-materialises the draw's stages while
@@ -4704,7 +5134,7 @@ impl RenderExecutor for QueuedExecutor {
     }
 
     fn dispatch(&self, dispatch: &ResolvedDispatch) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.dispatch(dispatch);
         }
         let pre = crate::pipeline::frontend::prefetch_dispatch(dispatch);
@@ -4712,21 +5142,21 @@ impl RenderExecutor for QueuedExecutor {
     }
 
     fn after_pipe(&self, done: Box<dyn FnOnce() + Send>) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.after_pipe(done);
         }
         self.send(Recorded::AfterPipe(done));
     }
 
     fn end_of_pipe(&self, done: Box<dyn FnOnce() + Send>) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.end_of_pipe(done);
         }
         self.send(Recorded::EndOfPipe(done));
     }
 
     fn memory_filled(&self, addr: u64, size: u64, value: u32) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.memory_filled(addr, size, value);
         }
         self.send(Recorded::MemoryFilled(addr, size, value));
@@ -4734,42 +5164,65 @@ impl RenderExecutor for QueuedExecutor {
 
     fn occlusion_counter_dump(&self, addr: u64, write: &crate::render::OcclusionWrite) -> bool {
         let write = write.clone();
+        count_call(0);
         self.call(move || GpuExecutor.occlusion_counter_dump(addr, &write)).unwrap_or(false)
     }
 
+    fn occlusion_counter_dump_or(&self, addr: u64, write: &crate::render::OcclusionWrite, cpu: Box<dyn FnOnce() + Send>) -> bool {
+        if !async_occlusion_enabled() || (!pipeline_route() && !self.recording()) {
+            return false;
+        }
+        // Queued: the interpreter goes on. Its reads of the result block
+        // wait for the dump (and a conservative result written by `cpu`).
+        let write = write.clone();
+        let transfers = self.transfers.clone();
+        let serial = transfers.add(addr, OCCLUSION_BLOCK_BYTES, None);
+        self.send(Recorded::Call(Box::new(move || {
+            if !GpuExecutor.occlusion_counter_dump(addr, &write) {
+                cpu();
+            }
+            transfers.remove(serial);
+        })));
+        true
+    }
+
     fn copy_memory(&self, dst: u64, src: u64, size: u64) -> bool {
+        count_call(1);
         self.call(move || GpuExecutor.copy_memory(dst, src, size)).unwrap_or(false)
     }
 
     fn fill_memory(&self, dst: u64, size: u64, value: u32) -> bool {
+        count_call(2);
         self.call(move || GpuExecutor.fill_memory(dst, size, value)).unwrap_or(false)
     }
 
     fn write_memory(&self, dst: u64, data: &[u8]) -> bool {
         let data = data.to_vec();
+        count_call(3);
         self.call(move || GpuExecutor.write_memory(dst, &data)).unwrap_or(false)
     }
 
     fn gds_transfer(&self, op: GdsTransfer) -> bool {
+        count_call(4);
         self.call(move || GpuExecutor.gds_transfer(op)).unwrap_or(false)
     }
 
     fn flush(&self) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.flush();
         }
         self.send(Recorded::Flush);
     }
 
     fn submission_complete(&self) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return GpuExecutor.submission_complete();
         }
         self.send(Recorded::SubmissionComplete);
     }
 
     fn sync_point(&self) {
-        if !ab::thread_fast() && !self.recording() {
+        if !pipeline_route() && !self.recording() {
             return crate::memory::note_sync_point();
         }
         self.send(Recorded::SyncPoint);
@@ -4777,6 +5230,7 @@ impl RenderExecutor for QueuedExecutor {
 
     fn drain(&self) {
         if self.pending.load(Ordering::Acquire) != 0 {
+            count_call(5);
             self.call(|| ());
         }
     }
@@ -4822,6 +5276,7 @@ impl RenderExecutor for QueuedExecutor {
 
     fn memory_hazard(&self, addr: u64, len: u64) {
         if self.transfers.overlaps(addr, len) {
+            count_call(6);
             self.drain();
         }
     }
@@ -4846,7 +5301,7 @@ impl RenderExecutor for QueuedExecutor {
     }
 
     fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
-        if !ab::thread_fast() {
+        if !pipeline_route() {
             self.drain();
             return read(out);
         }
@@ -4856,6 +5311,7 @@ impl RenderExecutor for QueuedExecutor {
             Some(ok) => ok,
             None => {
                 // A queued copy over the range: its bytes come from memory.
+                count_call(7);
                 self.drain();
                 read(out)
             }
@@ -4894,7 +5350,7 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | refills by caller: {}", b.images.refill_callers_top(24)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB, chunk-views {}) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, fault-runs {}/{}p of {} heated, premarked {}/{}p, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -4958,6 +5414,7 @@ fn summary_locked() -> Option<String> {
             bf.pressure_settles,
             bf.collected,
             bf.collected_bytes >> 20,
+            bf.chunk_host_views,
             crate::device::DEVICE_LOCAL_BYTES[0].load(Ordering::Relaxed) >> 20,
             crate::device::DEVICE_LOCAL_BYTES[1].load(Ordering::Relaxed) >> 20,
             m.faults_resolved,
@@ -4970,6 +5427,11 @@ fn summary_locked() -> Option<String> {
             crate::memory::region::HOT_PAGES.load(Ordering::Relaxed),
             crate::memory::region::HOT_CHANGED.load(Ordering::Relaxed),
             crate::memory::region::HOT_COMPARES.load(Ordering::Relaxed),
+            crate::memory::region::FAULT_RUNS.load(Ordering::Relaxed),
+            crate::memory::region::FAULT_RUN_OPENED.load(Ordering::Relaxed),
+            crate::memory::region::HEATED_WRITE_FAULTS.load(Ordering::Relaxed),
+            crate::memory::PREMARKED_WRITES.load(Ordering::Relaxed),
+            crate::memory::PREMARKED_PAGES.load(Ordering::Relaxed),
             crate::memory::sync_generation(),
             b.sched.timeline.completed_tick(),
             // eager write-throughs (after every writing dispatch) / hot
@@ -5045,4 +5507,42 @@ fn gpu_time_line(t: crate::scheduler::gpu_timer::GpuTime, top: &str) -> String {
         t.max_ns as f64 / 1e6,
         t.long
     )
+}
+
+#[cfg(test)]
+mod queue_space_tests {
+    use super::*;
+
+    /// A producer filling a two-slot queue faster than its consumer takes
+    /// from it is woken by the consumer's signals, never by the timeout,
+    /// and every item arrives in order.
+    #[test]
+    fn full_queue_senders_wake_without_timeouts() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(2);
+        let space = Arc::new(QueueSpace::new());
+        let freed = space.clone();
+        const N: u32 = 20_000;
+        let consumer = std::thread::spawn(move || {
+            let mut next = 0;
+            while let Ok(v) = rx.recv() {
+                freed.freed();
+                assert_eq!(v, next);
+                next += 1;
+                if next % 64 == 0 {
+                    // Let the queue fill now and then.
+                    std::thread::yield_now();
+                }
+            }
+            next
+        });
+        let before = QUEUE_SPACE_TIMEOUTS.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        for i in 0..N {
+            space.send(&tx, i);
+        }
+        drop(tx);
+        assert_eq!(consumer.join().unwrap(), N);
+        assert_eq!(QUEUE_SPACE_TIMEOUTS.load(Ordering::Relaxed), before, "a sender waited for the timeout");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
 }

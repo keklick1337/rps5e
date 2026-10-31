@@ -2322,8 +2322,14 @@ impl<'a, 'p> Emitter<'a, 'p> {
             Op::FNeg => un(self, S::FNegate)?,
             Op::FAbs => gl1(self, GLOp::FAbs)?,
             Op::FMin | Op::FMax if !ty.is_vector() => {
-                let (x, y) = (a(self, 0)?, a(self, 1)?);
-                self.float_min_max(ty, x, y, d.op == Op::FMax)
+                let zero_side = if d.op == Op::FMax && self.feat.emit.zero_max { (0..2).find(|&i| self.f.as_const(d.args[i]) == Some(0)) } else { None };
+                if let Some(i) = zero_side {
+                    let (zero, y) = (a(self, i)?, a(self, 1 - i)?);
+                    self.max_with_positive_zero(ty, zero, y)
+                } else {
+                    let (x, y) = (a(self, 0)?, a(self, 1)?);
+                    self.float_min_max(ty, x, y, d.op == Op::FMax)
+                }
             }
             Op::FMin => gl2(self, GLOp::NMin)?,
             Op::FMax => gl2(self, GLOp::NMax)?,
@@ -2736,6 +2742,31 @@ impl<'a, 'p> Emitter<'a, 'p> {
     /// the host's NaN or signed-zero behaviour): a NaN operand yields the
     /// other one (the first when both are NaN); for two zeros min ORs and
     /// max ANDs the bits, so -0 < +0.
+    /// [`Self::float_min_max`] (max) with `zero` the constant +0: `y` when
+    /// `y > +0` in the compare `float_min_max` uses, else +0 (a NaN `y`
+    /// yields the other operand, two zeros AND to +0, a negative `y` is
+    /// below +0). One compare and one select instead of the general
+    /// NaN and signed-zero selects (`RPS5E_ZERO_MAX`).
+    fn max_with_positive_zero(&mut self, ty: Type, zero: Word, y: Word) -> Word {
+        let t = self.ty(ty);
+        let it = match ty.component() {
+            Scalar::F16 => Type::U16,
+            Scalar::F64 => Type::U64,
+            _ => Type::U32,
+        };
+        let iw = self.ty(it);
+        let tb = self.t_bool();
+        let above = if ty == Type::F32 && self.f32_compares_flush() {
+            self.fcmp_bits(FCmp::OGt, y, zero)
+        } else {
+            self.ins(S::FOrdGreaterThan, tb, &[y, zero])
+        };
+        let yb = self.bitcast(iw, y);
+        let zb = self.konst(it, 0);
+        let r = self.select(iw, above, yb, zb);
+        self.bitcast(t, r)
+    }
+
     fn float_min_max(&mut self, ty: Type, x: Word, y: Word, max: bool) -> Word {
         let t = self.ty(ty);
         let (it, mag, inf) = match ty.component() {

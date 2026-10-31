@@ -1174,9 +1174,17 @@ pub fn main_entry(bin: &'static str) -> Result<()> {
         Err(e) => e.exit(),
     };
     if matches!(cli.cmd, Some(Cmd::Run { .. })) {
+        // Before any thread exists: one physical core stays free for the
+        // GPU command recorder (every later thread inherits the mask).
+        ps5vm::topology::reserve_recorder_core();
         // Before any thread exists: SIGINT/SIGTERM/SIGHUP go to the
         // shutdown thread (window close and guest exit end there too).
         ps5vm::shutdown::install();
+        #[cfg(target_os = "linux")]
+        {
+            host_alloc::start_ab_ticker();
+            log::info!("host heap: {}", host_alloc::describe());
+        }
     }
     let Some(cmd) = cli.cmd else { return gui(false) };
     match cmd {
@@ -1260,4 +1268,10 @@ fn mount_package(path: &std::path::Path, opts: &ps5pkg::OpenOptions) -> Result<s
     Ok(cache.join("eboot.bin"))
 }
 
+#[cfg(target_os = "linux")]
+mod host_alloc;
 mod pkg_cli;
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static HOST_HEAP: host_alloc::HostAlloc = host_alloc::HostAlloc;

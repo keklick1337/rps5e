@@ -71,12 +71,18 @@ impl<'a> Translator<'a> {
     /// with IEEE_MODE; an invalid operation (inf - inf, inf * 0) gives
     /// 0xffc00000. With `invalid_product` (fma forms) a NaN addend is not
     /// returned when the product is inf * 0.
+    ///
+    /// With [`super::rewrites::NAN_ONCE`] the NaN is picked from the
+    /// sources alone (the same order) and the host result is tested once:
+    /// on a host that propagates NaNs a NaN source makes the result a NaN,
+    /// and a result that is not a NaN had none, so both forms agree.
     pub fn nan_result_f32(&mut self, sources: &[Value], result: Value, invalid_product: Option<Value>) -> Value {
         let is_nan = |t: &mut Self, bits: Value| t.is_nan_bits(bits);
-        let mut bits = self.bits(result);
-        let result_nan = is_nan(self, bits);
+        let once = self.options.rewrites & super::rewrites::NAN_ONCE != 0;
+        let result_bits = self.bits(result);
+        let result_nan = is_nan(self, result_bits);
         let default_nan = self.b().u32(0xFFC0_0000);
-        bits = self.b().select(result_nan, default_nan, bits);
+        let mut bits = if once { default_nan } else { self.b().select(result_nan, default_nan, result_bits) };
         let qb = self.nan_quiet_bit(false);
         for (i, &source) in sources.iter().enumerate().rev() {
             let source_bits = self.bits(source);
@@ -89,6 +95,9 @@ impl<'a> Translator<'a> {
             }
             let quiet = self.b().or(source_bits, qb);
             bits = self.b().select(selected, quiet, bits);
+        }
+        if once {
+            bits = self.b().select(result_nan, bits, result_bits);
         }
         let r = self.float(bits);
         // A NaN is not a denormal: the selection keeps the result's class.

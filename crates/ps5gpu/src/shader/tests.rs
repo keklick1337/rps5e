@@ -289,6 +289,20 @@ fn corpus(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../ps5shader/tests/corpus").join(name)
 }
 
+/// `RPS5E_ZERO_MAX`: a compute program with 26 `v_max_f32 v, 0, v` is
+/// emitted shorter with the switch than without it.
+#[test]
+fn zero_max_shortens_relu_programs() {
+    let path = corpus("0081df7de03c5d27.bin");
+    let validator = spirv_val();
+    let words = |zero_max: bool| {
+        let emit = super::EmitOptions { zero_max, ..super::EmitOptions::DEFAULT };
+        compile_emit(&path, validator.as_deref(), |_, _| true, None, emit).unwrap().unwrap().spirv.len()
+    };
+    let (on, off) = (words(true), words(false));
+    assert!(on + 26 * 8 <= off, "{on} words with RPS5E_ZERO_MAX, {off} without");
+}
+
 /// A pixel program spilling through ADDTID LDS (slots 256 bytes apart,
 /// lane * 4 within a slot) keeps one private dword per slot it touches.
 #[test]

@@ -44,10 +44,15 @@ extern "C" fn test_segv(sig: libc::c_int, info: *mut libc::siginfo_t, uc: *mut l
         let err = (*uc).uc_mcontext.gregs[libc::REG_ERR as usize] as u64;
         let addr = (*info).si_addr() as u64;
         if (*info).si_code == 2 {
-            let kind = if err & 2 != 0 { crate::memory::FaultKind::Write } else { crate::memory::FaultKind::Read };
+            let kind = if err & 2 != 0 || sig == libc::SIGBUS { crate::memory::FaultKind::Write } else { crate::memory::FaultKind::Read };
             for slot in &MEMORIES {
                 let p = slot.load(Ordering::Acquire);
-                if !p.is_null() && (*p).is_tracked(addr, 1) && (*p).try_resolve_fault(kind, addr) {
+                if p.is_null() || !(*p).is_tracked(addr, 1) {
+                    continue;
+                }
+                // SIGBUS: a store hit a page's userfaultfd write protection.
+                let resolved = if sig == libc::SIGBUS { (*p).try_resolve_wp_fault(addr) } else { (*p).try_resolve_fault(kind, addr) };
+                if resolved {
                     return;
                 }
             }
@@ -69,6 +74,7 @@ pub fn test_memory() -> &'static GuestGpuMemory {
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
         }
     });
     let m: &'static GuestGpuMemory = Box::leak(Box::new(GuestGpuMemory::new()));
@@ -203,8 +209,24 @@ pub fn perms(addr: u64) -> String {
         let (s, e) = range.split_once('-').unwrap();
         let (s, e) = (u64::from_str_radix(s, 16).unwrap(), u64::from_str_radix(e, 16).unwrap());
         if addr >= s && addr < e {
-            return p[..3].to_string();
+            let mut p = p[..3].to_string();
+            // A page under userfaultfd write protection is read-only too.
+            if uffd_write_protected(addr) {
+                p.replace_range(1..2, "-");
+            }
+            return p;
         }
     }
     "---".into()
+}
+
+/// The page of `addr` has userfaultfd write protection (pagemap bit 57).
+pub fn uffd_write_protected(addr: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open("/proc/self/pagemap") else { return false };
+    let mut entry = [0u8; 8];
+    if f.seek(SeekFrom::Start(addr / 4096 * 8)).is_err() || f.read_exact(&mut entry).is_err() {
+        return false;
+    }
+    u64::from_le_bytes(entry) & (1 << 57) != 0
 }

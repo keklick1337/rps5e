@@ -14,6 +14,11 @@
 //! mapped host page is copied as on the console, an unmapped one makes the
 //! operation stop there instead of faulting. A silent no-op would leave
 //! stale bytes behind (stale vertex or skinning data for the GPU).
+//!
+//! A destination spanning several pages the GPU caches write-watch is
+//! marked CPU-written in one call first
+//! (`ps5gpu::memory::GuestGpuMemory::prepare_cpu_write`), so the copy does
+//! not fault once per page.
 
 #[cfg(windows)]
 #[allow(unused_imports)]
@@ -102,6 +107,7 @@ pub fn copy(op: &'static str, dst: u64, src: u64, len: u64, caller: u64) -> u64 
     let src_ok = ps5vm::ranges::accessible(src, len, false);
     let dst_ok = ps5vm::ranges::accessible(dst, len, true);
     if src_ok && dst_ok {
+        ps5gpu::memory::global().prepare_cpu_write(dst, len);
         // SAFETY: both ranges are mapped with the needed access; `copy`
         // handles overlap (memmove).
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
@@ -124,6 +130,7 @@ pub fn store(op: &'static str, dst: u64, data: &[u8], caller: u64) -> u64 {
         return 0;
     }
     if ps5vm::ranges::accessible(dst, len, true) {
+        ps5gpu::memory::global().prepare_cpu_write(dst, len);
         // SAFETY: the range is mapped writable; `data` is a host buffer.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, data.len()) };
         return len;
@@ -138,6 +145,7 @@ pub fn fill(op: &'static str, dst: u64, value: u8, len: u64, caller: u64) -> u64
         return 0;
     }
     if ps5vm::ranges::accessible(dst, len, true) {
+        ps5gpu::memory::global().prepare_cpu_write(dst, len);
         // SAFETY: the range is mapped writable.
         unsafe { std::ptr::write_bytes(dst as *mut u8, value, len as usize) };
         return len;

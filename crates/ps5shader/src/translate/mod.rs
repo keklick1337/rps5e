@@ -192,7 +192,14 @@ pub mod rewrites {
     /// loop waiting for EXEC to empty would never end. The EXEC words keep
     /// the guest's bits (the hardware reads them back as written).
     pub const PRESENT_EXEC: u32 = 1 << 5;
-    pub const ALL: u32 = LEAN_FLUSH | LANE_ACTIVE_EXEC | FLUSH_ELISION | FLOAT_CLASS_COMPARE | HALF_FMA_FAST | PRESENT_EXEC;
+    /// The NaN an f32 add/sub/mul/fma returns is chosen among the sources
+    /// off the result's dependency chain, and the result passes through one
+    /// select (`isnan(r) ? pick : r`) instead of one per source. Exact only
+    /// where the host propagates NaNs (SignedZeroInfNanPreserve): a NaN
+    /// source then always makes the host result a NaN, so the result is
+    /// tested once ([`Translator::nan_result_f32`]).
+    pub const NAN_ONCE: u32 = 1 << 6;
+    pub const ALL: u32 = LEAN_FLUSH | LANE_ACTIVE_EXEC | FLUSH_ELISION | FLOAT_CLASS_COMPARE | HALF_FMA_FAST | PRESENT_EXEC | NAN_ONCE;
 }
 
 /// Bits of [`TranslateOptions::float_rules`].

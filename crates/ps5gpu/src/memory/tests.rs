@@ -325,6 +325,58 @@ fn page_guard_watcher_counts_and_protection() {
     assert_eq!(guard::WATCH_ERRORS.load(Ordering::Relaxed), 0);
 }
 
+/// Re-watching scattered pages of a block whose neighbours are watched
+/// already takes one protection change over the runs and the pages
+/// between them (`RPS5E_PROTECT_BRIDGE`); pages with another protection
+/// end the bridge, and every page ends with its own protection.
+#[test]
+fn watch_changes_bridge_pages_with_the_same_protection() {
+    let mem = test_memory();
+    let (view, _) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let g = &mem.pages;
+    let applied = || guard::APPLIED.with(|a| a.get());
+    // Pages 0..40 watched; 5, 9 and 20 lose their watch (the guest wrote
+    // them), page 30 is read-watched (GPU-written).
+    g.add_watch(view, 40 * PAGE_BYTES, false);
+    // Write watches as userfaultfd write protection (Linux, memfd views).
+    let uffd = crate::testutil::uffd_write_protected(view);
+    let mut written = mask::PageMask::empty();
+    for p in [5, 9, 20] {
+        written.set(p);
+    }
+    assert!(g.remove_watch_mask(view, &written, false, false));
+    g.add_watch(view + 30 * PAGE_BYTES, PAGE_BYTES, true);
+    assert_eq!(perms(view + 5 * PAGE_BYTES), "rw-");
+    // Uploaded: watched again.
+    let before = applied();
+    g.add_watch_mask(view, &written, false);
+    let calls = applied() - before;
+    for p in 0..40 {
+        assert_eq!(perms(view + p * PAGE_BYTES), if p == 30 { "---" } else { "r--" }, "page {p}");
+    }
+    assert_eq!(perms(view + 40 * PAGE_BYTES), "rw-");
+    if cfg!(unix) && std::env::var("RPS5E_PROTECT_BRIDGE").as_deref() != Ok("0") {
+        assert_eq!(calls, 1, "one change over 5..=20");
+    } else {
+        assert_eq!(calls, 3);
+    }
+    // A run next to the read-watched page: the protection bridge stops at
+    // it; write protection goes on over it (the page keeps its write watch).
+    let mut m = mask::PageMask::empty();
+    m.set(29);
+    m.set(31);
+    assert!(g.remove_watch_mask(view, &m, false, false));
+    let before = applied();
+    g.add_watch_mask(view, &m, false);
+    assert_eq!(applied() - before, if uffd { 1 } else { 2 });
+    assert_eq!(perms(view + 29 * PAGE_BYTES), "r--");
+    assert_eq!(perms(view + 30 * PAGE_BYTES), "---");
+    assert_eq!(perms(view + 31 * PAGE_BYTES), "r--");
+    g.remove_watch(view + 30 * PAGE_BYTES, PAGE_BYTES, true);
+    g.remove_watch(view, 40 * PAGE_BYTES, false);
+    assert_eq!(perms(view + 30 * PAGE_BYTES), "rw-");
+}
+
 struct MapLog(std::sync::Mutex<Vec<(u64, u64)>>);
 impl BufferStore for MapLog {
     fn mark_cpu_write(&self, _addr: u64, _size: u64) -> bool {
@@ -656,6 +708,79 @@ fn page_deps_follow_writes_to_their_pages_only() {
     assert!(!deps.current(&tracker, mem), "a mapping came");
 }
 
+/// A result whose pages changed stands again when they still hold the
+/// bytes it read and no GPU results are pending over them
+/// (`PageDeps::revalidate`); it then follows the pages' generations anew.
+#[test]
+fn page_deps_revalidate_by_the_bytes_read() {
+    use super::deps::PageDeps;
+    let mem = test_memory();
+    let (view, _alias) = guest_mapping(mem, 4 * BLOCK_BYTES as usize);
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let buffers = Arc::new(TestBuffers { tracker: tracker.clone(), mem, downloads: AtomicUsize::new(0), gpu_byte: 0xAB });
+    mem.attach(buffers.clone(), Arc::new(NoImages), Arc::new(NoUnmap));
+    let a = view + BLOCK_BYTES;
+    let upload = || assert!(tracker.for_each_upload_range(a, 4 * PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true));
+    let write = |addr: u64, v: u32| {
+        // SAFETY: a mapped guest page (a watched page faults and is resolved).
+        unsafe { std::ptr::write_volatile(addr as *mut u32, v) }
+    };
+    let read = |addr: u64| {
+        let mut w = [0u8; 4];
+        assert!(mem.read_backing(addr, &mut w));
+        w
+    };
+    write(a + 16, 7);
+    upload();
+    let derive = || {
+        let mut d = PageDeps::begin(mem);
+        d.record_contents();
+        d.note(&tracker, a + 16, 4);
+        d.read(a + 16, &read(a + 16));
+        d.note(&tracker, a + PAGE_BYTES, 4);
+        d.gpu_state(a + PAGE_BYTES, 4, false);
+        d
+    };
+    let mut deps = derive();
+    assert!(deps.current(&tracker, mem));
+    // The same word written again: the page moved, the bytes did not.
+    write(a + 16, 7);
+    assert!(!deps.current(&tracker, mem));
+    assert!(deps.revalidate(&tracker, mem));
+    assert!(deps.current(&tracker, mem), "follows the generations taken anew");
+    // Another word of the page changed: still the same input.
+    write(a + 64, 9);
+    assert!(deps.revalidate(&tracker, mem));
+    // The word read changed.
+    write(a + 16, 8);
+    assert!(!deps.revalidate(&tracker, mem));
+    // A GPU-state input that changed.
+    write(a + 16, 7);
+    upload();
+    let mut deps = derive();
+    tracker.mark_gpu_dirty_pages(a + PAGE_BYTES, PAGE_BYTES);
+    assert!(!deps.current(&tracker, mem));
+    assert!(!deps.revalidate(&tracker, mem), "the GPU writes a page whose state was an input");
+    tracker.clear_gpu_dirty_pages(a + PAGE_BYTES, PAGE_BYTES);
+    assert!(deps.revalidate(&tracker, mem));
+    // GPU results pending over the bytes read (the page uploaded first: a
+    // CPU-dirty page does not take GPU results).
+    upload();
+    let mut deps = derive();
+    tracker.mark_gpu_dirty_pages(a, PAGE_BYTES);
+    assert!(tracker.has_gpu_dirty_pages(a + 16, 4));
+    assert!(!deps.revalidate(&tracker, mem));
+    tracker.clear_gpu_dirty_pages(a, PAGE_BYTES);
+    // Without recorded inputs, or after a mapping change, never.
+    let mut plain = PageDeps::begin(mem);
+    plain.note(&tracker, a + 16, 4);
+    write(a + 16, 7);
+    assert!(!plain.revalidate(&tracker, mem));
+    let mut deps = derive();
+    let _ = guest_mapping(mem, PAGE_BYTES as usize);
+    assert!(!deps.revalidate(&tracker, mem), "a mapping came");
+}
+
 /// A page walk keeping the region of its block answers as the per-page
 /// lookup does, across block boundaries and blocks without a region; a
 /// read spanning two blocks follows writes to the pages of either.
@@ -934,4 +1059,166 @@ fn unresolvable_fault_is_declined_after_bounded_tries() {
         assert_eq!(faults, bound, "{settles:?}");
         assert_eq!(mem.stats().faults_declined, 1);
     }
+}
+
+/// A write fault on a page the CPU rewrote between uploads at least
+/// `HOT_UPLOADS` times opens the run of such pages around it (one fault per
+/// rewritten ring instead of one per page); a GPU-written page ends the run
+/// and pages without that history stay watched. The opened pages are
+/// uploaded and watched again at their next use.
+#[test]
+fn write_fault_opens_the_rewritten_run() {
+    if !super::region::fault_runs_enabled() {
+        // Opt-in (RPS5E_FAULT_RUNS=1); run with the switch to check it.
+        return;
+    }
+    let mem = test_memory();
+    let (view, _alias) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let tracker = GuestPageTracker::new(mem.pages.clone());
+    let ring = view + 32 * PAGE_BYTES;
+    let pages = 16u64;
+    let page = |i: u64| ring + i * PAGE_BYTES;
+    // A page next to the ring that is uploaded once (static data).
+    let cold = page(pages);
+    tracker.for_each_upload_range(cold, PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true);
+    // The ring: uploaded, then rewritten by the CPU page by page, again
+    // and again.
+    tracker.for_each_upload_range(ring, pages * PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true);
+    for _ in 1..super::region::HOT_UPLOADS {
+        for i in 0..pages {
+            assert_eq!(tracker.invalidate_region(page(i) + 8, 8, true), Some((true, false)));
+        }
+        tracker.for_each_upload_range(ring, pages * PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true);
+    }
+    assert_eq!(perms(page(3)), "r--");
+    // The GPU writes page 10 of it.
+    tracker.mark_gpu_dirty_pages(page(10), PAGE_BYTES);
+    assert_eq!(perms(page(10)), "---");
+    // One write fault on page 3.
+    assert_eq!(tracker.invalidate_region(page(3) + 8, 8, true), Some((true, false)));
+    for i in 0..3 {
+        assert_eq!(tracker.page_state(page(i)), Some((false, false)), "page {i} before the fault stays watched");
+    }
+    assert_eq!(tracker.invalidate_region(page(0) + 8, 8, true), Some((true, false)));
+    for i in 0..10 {
+        assert_eq!(tracker.page_state(page(i)), Some((true, false)), "page {i} opened");
+        assert_eq!(perms(page(i)), "rw-", "page {i} writable");
+    }
+    assert_eq!(tracker.page_state(page(10)), Some((false, true)), "the GPU-dirty page ends the run");
+    assert_eq!(perms(page(10)), "---");
+    for i in 11..pages {
+        assert_eq!(tracker.page_state(page(i)), Some((false, false)), "page {i} after the GPU page");
+        assert_eq!(perms(page(i)), "r--");
+    }
+    assert_eq!(tracker.page_state(cold), Some((false, false)));
+    assert_eq!(tracker.page_state(view + 31 * PAGE_BYTES).map(|s| s.0), Some(true), "never uploaded: dirty from the start");
+    // The next use uploads the opened pages and watches them again.
+    let mut runs = Vec::new();
+    tracker.for_each_upload_range(ring, 10 * PAGE_BYTES, false, None, &mut |a, n| runs.push((a, n)), &mut || true);
+    assert_eq!(runs, vec![(ring, 10 * PAGE_BYTES)]);
+    assert_eq!(perms(page(0)), "r--");
+    assert_eq!(perms(page(9)), "r--");
+    // A page without the history opens only itself.
+    assert_eq!(tracker.invalidate_region(cold + 8, 8, true), Some((true, false)));
+    assert_eq!(tracker.page_state(cold), Some((true, false)));
+    assert_eq!(tracker.page_state(page(15)), Some((false, false)));
+}
+
+/// Host code that writes a guest range through the guest's view (the HLE
+/// memcpy/memset) marks its write-watched pages CPU-written in one call
+/// first: the write takes no fault, the pages are CPU-dirty and the next
+/// use uploads them. Pages the GPU owns (read-watched) are left to their
+/// fault.
+#[test]
+fn premarked_host_write_takes_no_faults() {
+    let mem = test_memory();
+    let (view, _alias) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let buffers = Arc::new(TestBuffers { tracker: tracker.clone(), mem, downloads: AtomicUsize::new(0), gpu_byte: 0xAB });
+    mem.attach(buffers.clone(), Arc::new(NoImages), Arc::new(NoUnmap));
+    let dst = view + 8 * PAGE_BYTES;
+    let len = 8 * PAGE_BYTES;
+    tracker.for_each_upload_range(dst, len, false, None, &mut |_, _| {}, &mut || true);
+    // Page 6 of the range belongs to the GPU.
+    tracker.for_each_upload_range(dst + 6 * PAGE_BYTES, PAGE_BYTES, true, None, &mut |_, _| {}, &mut || true);
+    assert_eq!(perms(dst), "r--");
+    assert_eq!(perms(dst + 6 * PAGE_BYTES), "---");
+    let before = mem.stats().write_faults;
+    // A write inside one page is left to its fault.
+    assert_eq!(mem.prepare_cpu_write(dst + 16, 64), 0);
+    assert_eq!(mem.prepare_cpu_write(dst + 100, len - 200), 7, "the seven write-watched pages, not the GPU's");
+    for i in 0..8u64 {
+        let want = if i == 6 { (false, true) } else { (true, false) };
+        assert_eq!(tracker.page_state(dst + i * PAGE_BYTES), Some(want), "page {i}");
+    }
+    // SAFETY: mapped guest view; pages 0..6 are writable now.
+    unsafe { std::ptr::write_bytes((dst + 100) as *mut u8, 0x5A, (6 * PAGE_BYTES - 100) as usize) };
+    assert_eq!(mem.stats().write_faults, before, "no write faults on the marked pages");
+    // The GPU page still faults (its bytes are downloaded first).
+    // SAFETY: mapped guest view; the fault is resolved by the handler.
+    unsafe { std::ptr::write_volatile((dst + 6 * PAGE_BYTES + 8) as *mut u8, 1) };
+    assert_eq!(mem.stats().write_faults, before + 1);
+    // The next use uploads the written pages.
+    let mut runs = Vec::new();
+    tracker.for_each_upload_range(dst, 6 * PAGE_BYTES, false, None, &mut |a, n| runs.push((a, n)), &mut || true);
+    assert_eq!(runs, vec![(dst, 6 * PAGE_BYTES)]);
+}
+
+/// Userfaultfd write watches (Linux): a watched page is write-protected in
+/// its page table entry, the mapping keeps its protection and stays whole,
+/// a guest protection change keeps the write protection, and a store to a
+/// page whose protection outlived its watch (a failed change) is let
+/// through once the stale protection is dropped.
+#[test]
+fn uffd_write_watches_follow_the_watch_counts() {
+    let mem = test_memory();
+    let (view, _) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let g = &mem.pages;
+    let p = view + 3 * PAGE_BYTES;
+    g.add_watch(p, PAGE_BYTES, false);
+    if !crate::testutil::uffd_write_protected(p) {
+        // No userfaultfd here (another system, RPS5E_UFFD_WATCH=0).
+        g.remove_watch(p, PAGE_BYTES, false);
+        return;
+    }
+    let maps = |a: u64| {
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        maps.lines().filter(|l| {
+            let (s, e) = l.split_whitespace().next().unwrap().split_once('-').unwrap();
+            let (s, e) = (u64::from_str_radix(s, 16).unwrap(), u64::from_str_radix(e, 16).unwrap());
+            s <= a && a < e
+        }).map(|l| l.split_whitespace().nth(1).unwrap().to_string()).next().unwrap()
+    };
+    assert_eq!(&maps(p)[..3], "rw-", "the mapping keeps its protection");
+    assert!(g.write_protected(p));
+    // A guest protection change keeps the write protection.
+    assert!(g.set_guest_protection(view, BLOCK_BYTES, guard::PROT_READ));
+    assert!(g.set_guest_protection(view, BLOCK_BYTES, guard::PROT_READ | guard::PROT_WRITE));
+    assert!(crate::testutil::uffd_write_protected(p), "write protection survives mprotect");
+    assert!(!crate::testutil::uffd_write_protected(p + PAGE_BYTES));
+    g.remove_watch(p, PAGE_BYTES, false);
+    assert!(!crate::testutil::uffd_write_protected(p));
+    // Stale protection on an unwatched page: dropped by the store's fault.
+    let q = view + 7 * PAGE_BYTES;
+    assert!(uffd::protect(q, PAGE_BYTES, true));
+    let before = guard::STALE_WRITE_PROTECTION.load(Ordering::Relaxed);
+    // SAFETY: the test owns the view.
+    unsafe { std::ptr::write_volatile(q as *mut u8, 0x5A) };
+    assert_eq!(guard::STALE_WRITE_PROTECTION.load(Ordering::Relaxed), before + 1);
+    assert!(!crate::testutil::uffd_write_protected(q));
+    // SAFETY: as above.
+    assert_eq!(unsafe { std::ptr::read_volatile(q as *const u8) }, 0x5A);
+    // The A/B switch moves the watches between write protection and the
+    // page protection, and back.
+    let r = view + 11 * PAGE_BYTES;
+    g.add_watch(r, PAGE_BYTES, false);
+    g.sync_mode_to(false);
+    assert_eq!(&maps(r)[..3], "r--");
+    assert!(!crate::testutil::uffd_write_protected(r));
+    assert_eq!(&maps(r + PAGE_BYTES)[..3], "rw-");
+    g.sync_mode_to(true);
+    assert_eq!(&maps(r)[..3], "rw-");
+    assert!(crate::testutil::uffd_write_protected(r));
+    g.remove_watch(r, PAGE_BYTES, false);
+    assert_eq!(perms(r), "rw-");
 }

@@ -24,6 +24,14 @@
 //! Work whose reads have no ranges (device addresses without a planned
 //! range, buffers read in guest memory, draws that did not report their
 //! ranges) counts as reading everything.
+//!
+//! Guest dispatches the console may run at the same time (one queue, no
+//! partial flush, cache action, wait or command-processor write between
+//! them: [`crate::render::DispatchPacket::unsynced`]) form a run: their
+//! compute accesses are kept apart ([`Hazards::note_guest_dispatch`]) and
+//! order only dispatches after the run, not the run's later members
+//! ([`Hazards::guest_dispatch_barrier`]), as on the console, where such
+//! dispatches overlap and the title orders dependent ones itself.
 
 use std::collections::BTreeMap;
 
@@ -187,6 +195,12 @@ pub struct Hazards {
     transfer_writes: RangeSet,
     compute_reads: RangeSet,
     compute_reads_unknown: bool,
+    /// Compute writes and reads of the current run of guest dispatches
+    /// (see the module documentation): they order the dispatches after the
+    /// run, not its members.
+    run_writes: RangeSet,
+    run_reads: RangeSet,
+    run_reads_unknown: bool,
     graphics_reads: RangeSet,
     /// Reads of draws recorded since `graphics_reads` was last looked at,
     /// `(start, end)` in recording order (a range touching the previous
@@ -213,10 +227,32 @@ impl Hazards {
         self.transfer_writes.clear();
         self.compute_reads.clear();
         self.compute_reads_unknown = false;
+        self.clear_run();
         self.graphics_reads.clear();
         self.graphics_pending.clear();
         self.graphics_reads_unknown = false;
         self.transfer_reads.clear();
+    }
+
+    fn clear_run(&mut self) {
+        self.run_writes.clear();
+        self.run_reads.clear();
+        self.run_reads_unknown = false;
+    }
+
+    /// The current run of guest dispatches ended: its accesses order every
+    /// later dispatch.
+    fn end_run(&mut self) {
+        if self.run_writes.is_empty() && self.run_reads.is_empty() && !self.run_reads_unknown {
+            return;
+        }
+        for (s, e) in std::mem::take(&mut self.run_writes).spans {
+            self.compute_writes.insert(s, e - s);
+        }
+        for (s, e) in std::mem::take(&mut self.run_reads).spans {
+            self.compute_reads.insert(s, e - s);
+        }
+        self.compute_reads_unknown |= std::mem::take(&mut self.run_reads_unknown);
     }
 
     /// Merge the pending draw reads into `graphics_reads`.
@@ -250,7 +286,7 @@ impl Hazards {
     }
 
     fn settled_spans(&self) -> usize {
-        self.writes.len() + self.compute_writes.len() + self.transfer_writes.len() + self.compute_reads.len() + self.graphics_reads.len() + self.transfer_reads.len()
+        self.writes.len() + self.compute_writes.len() + self.transfer_writes.len() + self.compute_reads.len() + self.run_writes.len() + self.run_reads.len() + self.graphics_reads.len() + self.transfer_reads.len()
     }
 
     /// [`Self::spans`] `> max`, settling the pending draw reads only when
@@ -265,6 +301,22 @@ impl Hazards {
     /// The dependency a dispatch reading `reads` and writing `writes` needs
     /// (`unknown_reads`: it also reads memory it has no ranges for).
     pub fn dispatch_barrier(&mut self, reads: &[(u64, u64)], writes: &[(u64, u64)], unknown_reads: bool) -> DispatchBarrier {
+        self.end_run();
+        self.ordered_barrier(reads, writes, unknown_reads)
+    }
+
+    /// [`Self::dispatch_barrier`] of a guest dispatch; `follow`: it
+    /// continues the run of the dispatches noted before it (the console may
+    /// run it alongside them), so their accesses do not order it.
+    pub fn guest_dispatch_barrier(&mut self, reads: &[(u64, u64)], writes: &[(u64, u64)], unknown_reads: bool, follow: bool) -> DispatchBarrier {
+        if !follow {
+            self.end_run();
+        }
+        self.ordered_barrier(reads, writes, unknown_reads)
+    }
+
+    /// The dependency on the accesses outside the current run.
+    fn ordered_barrier(&mut self, reads: &[(u64, u64)], writes: &[(u64, u64)], unknown_reads: bool) -> DispatchBarrier {
         if !self.graphics_reads_unknown && writes.iter().any(|w| w.1 != 0) {
             self.settle_graphics_reads();
         }
@@ -280,11 +332,18 @@ impl Hazards {
         }
     }
 
+    /// Compute writes not yet visible to compute shaders overlap
+    /// `[addr, addr + size)`.
+    pub fn compute_write_pending(&self, addr: u64, size: u64) -> bool {
+        self.compute_writes.overlaps(addr, size) || self.run_writes.overlaps(addr, size)
+    }
+
     /// The barrier [`Self::dispatch_barrier`] returned was recorded.
     pub fn compute_barrier_recorded(&mut self, graphics: bool, transfer: bool) {
         self.compute_writes.clear();
         self.compute_reads.clear();
         self.compute_reads_unknown = false;
+        self.clear_run();
         if graphics {
             self.graphics_reads.clear();
             self.graphics_pending.clear();
@@ -297,6 +356,7 @@ impl Hazards {
 
     /// A dispatch reading `reads` and writing `writes` was recorded.
     pub fn note_dispatch(&mut self, reads: &[(u64, u64)], writes: &[(u64, u64)], unknown_reads: bool) {
+        self.end_run();
         for &(a, n) in writes {
             self.writes.insert(a, n);
             self.compute_writes.insert(a, n);
@@ -306,6 +366,22 @@ impl Hazards {
             self.compute_reads.insert(a, n);
         }
         self.compute_reads_unknown |= unknown_reads;
+    }
+
+    /// A guest dispatch reading `reads` and writing `writes` was recorded
+    /// after [`Self::guest_dispatch_barrier`]: it joins the current run.
+    /// Its writes are unordered for graphics, host and transfer work as any
+    /// dispatch's.
+    pub fn note_guest_dispatch(&mut self, reads: &[(u64, u64)], writes: &[(u64, u64)], unknown_reads: bool) {
+        for &(a, n) in writes {
+            self.writes.insert(a, n);
+            self.run_writes.insert(a, n);
+            self.transfer_writes.insert(a, n);
+        }
+        for &(a, n) in reads {
+            self.run_reads.insert(a, n);
+        }
+        self.run_reads_unknown |= unknown_reads;
     }
 
     /// The next draw recorded into a rendering scope reads `reads` (and
@@ -496,6 +572,44 @@ mod tests {
         assert_ne!(h.dispatch_barrier(&[], &[(0x9_0000, 4)], false), DispatchBarrier::None);
         h.full_barrier();
         assert_eq!(h.dispatch_barrier(&[], &[(0x6ffc, 4)], false), DispatchBarrier::None);
+        assert_eq!(h.spans(), 0);
+    }
+
+    /// Guest dispatches with nothing between them on the console overlap:
+    /// a run member is not ordered after the earlier members, the first
+    /// dispatch after the run is ordered after all of them.
+    #[test]
+    fn guest_dispatch_runs_order_only_the_dispatches_after_them() {
+        let mut h = Hazards::default();
+        // Writes before the run order its members.
+        h.note_dispatch(&[], &[(0x9000, 0x100)], false);
+        assert_ne!(h.guest_dispatch_barrier(&[(0x9000, 4)], &[], false, false), DispatchBarrier::None);
+        h.compute_barrier_recorded(false, false);
+        // A run writing one range (write after write) and reading it.
+        assert_eq!(h.guest_dispatch_barrier(&[(0x1000, 0x100)], &[(0x1000, 0x100)], false, false), DispatchBarrier::None);
+        h.note_guest_dispatch(&[(0x1000, 0x100)], &[(0x1000, 0x100)], false);
+        for _ in 0..3 {
+            assert_eq!(h.guest_dispatch_barrier(&[(0x1000, 0x100)], &[(0x1000, 0x100)], true, true), DispatchBarrier::None, "a member of the run");
+            h.note_guest_dispatch(&[(0x1000, 0x100)], &[(0x1000, 0x100)], true);
+        }
+        assert!(h.compute_write_pending(0x10f0, 4) && !h.compute_write_pending(0x1100, 4));
+        // Unordered for transfers and graphics as any compute write.
+        assert!(h.transfer_read_barrier(&[(0x1000, 4)]));
+        assert!(h.writes.overlaps(0x1000, 4));
+        // The dispatch after the run (a synchronisation point between).
+        let after = h.guest_dispatch_barrier(&[(0x1000, 4)], &[], false, false);
+        assert_eq!(after, DispatchBarrier::Compute { graphics: false, transfer: false });
+        h.compute_barrier_recorded(false, false);
+        assert!(!h.compute_write_pending(0x1000, 0x100));
+        // Write after read of a run member, seen by a dispatch outside the
+        // run, and by an ordinary dispatch.
+        h.note_guest_dispatch(&[(0x4000, 0x10)], &[], false);
+        assert_eq!(h.guest_dispatch_barrier(&[], &[(0x4000, 4)], false, true), DispatchBarrier::None);
+        assert_eq!(h.dispatch_barrier(&[], &[(0x4000, 4)], false), DispatchBarrier::Compute { graphics: false, transfer: false });
+        // A full barrier ends everything.
+        h.note_guest_dispatch(&[], &[(0x5000, 0x10)], true);
+        h.full_barrier();
+        assert_eq!(h.guest_dispatch_barrier(&[(0x5000, 4)], &[], true, false), DispatchBarrier::None);
         assert_eq!(h.spans(), 0);
     }
 

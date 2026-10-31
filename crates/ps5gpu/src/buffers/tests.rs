@@ -123,10 +123,10 @@ fn buffer_cache_uploads_downloads_and_merges() {
         assert_eq!(got[0], 0xEE);
     }
 
-    // --- GPU write of a small range: written through, the pages stay
-    // readable (read-through) and hold the GPU data once it completed ---
     let gw = view + (4 << 20);
     let gn = 3 * PAGE_BYTES;
+    // --- GPU write of a small range: written through, the pages stay
+    // readable (read-through) and hold the GPU data once it completed ---
     {
         let mut g = shared.lock().unwrap();
         let Shared { sched, cache } = &mut *g;
@@ -214,6 +214,29 @@ fn buffer_cache_uploads_downloads_and_merges() {
     assert!(mem.read_backing(gw, &mut b));
     assert_eq!(u32::from_le_bytes(b), 0x0BAD_F00D);
     assert_eq!(perms(gw), "rw-");
+
+    // --- With `RPS5E_READ_THROUGHS=1`: GPU write of a range over 16 KiB
+    // the CPU never read: not written through, the pages stay protected
+    // and the first read downloads them ---
+    if read_throughs_enabled() {
+        let unread = view + (13 << 20);
+        let n = 8 * PAGE_BYTES;
+        {
+            let mut g = shared.lock().unwrap();
+            let Shared { sched, cache } = &mut *g;
+            let s = cache.obtain(sched, unread, n, true).unwrap();
+            let cb = sched.cmd();
+            // SAFETY: recording buffer, range inside the buffer.
+            unsafe { dev.device.cmd_fill_buffer(cb, s.buffer, s.offset, n, 0x1111_1111) };
+            cache.flush_write_through(sched);
+            sched.flush_and_wait();
+        }
+        assert_eq!(perms(unread), "---", "not written through");
+        for p in 0..8 {
+            // SAFETY: the reads fault; the handler downloads the pages.
+            assert_eq!(unsafe { std::ptr::read_volatile((unread + p * PAGE_BYTES) as *const u32) }, 0x1111_1111);
+        }
+    }
     dev.wait_idle();
 }
 
@@ -776,6 +799,18 @@ fn descriptor_reads_download_their_window_once() {
 fn published_labels_order_reads_of_written_through_pages() {
     let (view, dev, shared, _tracker) = setup(0x51);
     let gw = view + 8 * PAGE_BYTES;
+    // The CPU read the page back before: its GPU writes are written through.
+    {
+        let mut g = shared.lock().unwrap();
+        let Shared { sched, cache } = &mut *g;
+        let s = cache.obtain(sched, gw, PAGE_BYTES, true).unwrap();
+        // SAFETY: recording buffer, range inside the buffer.
+        unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, PAGE_BYTES, 0x6666_6666) };
+        cache.flush_write_through(sched);
+        sched.flush_and_wait();
+    }
+    // SAFETY: the read faults and downloads the page.
+    assert_eq!(unsafe { std::ptr::read_volatile((gw + 8) as *const u32) }, 0x6666_6666);
     {
         let mut g = shared.lock().unwrap();
         let Shared { sched, cache } = &mut *g;
@@ -1021,5 +1056,116 @@ fn known_fills_last_until_the_next_gpu_write() {
     assert_eq!(cache.known_fill(a, PAGE_BYTES), None, "the whole fill is forgotten");
     sched.flush_and_wait();
     drop(g);
+    dev.wait_idle();
+}
+
+/// A descriptor word whose last GPU write landed with a direct
+/// write-through is read without a new download once that write-through
+/// completed, also after its page's write-through spans were dropped (the
+/// list keeps [`super::through::ThroughSpans::MAX`]; GTA V records ~3000
+/// per frame): the exact write record decides (`RPS5E_WORD_LANDED_ALONE`).
+/// A newer GPU write next to it on the page leaves it landed; a newer
+/// write over it makes the read download again.
+#[test]
+#[ignore]
+fn landed_words_need_no_download_after_their_spans_went() {
+    let (view, dev, shared, tracker) = setup(0x61);
+    let p = view + (1 << 20) + 5 * PAGE_BYTES;
+    let mut g = shared.lock().unwrap();
+    let Shared { sched, cache } = &mut *g;
+    cache.set_zero_copy(true);
+    let fill = |cache: &mut BufferCache, sched: &mut Scheduler, a: u64, n: u64, v: u32| {
+        let s = cache.obtain(sched, a, n, true).unwrap();
+        sched.full_barrier();
+        // SAFETY: recording buffer, range inside the buffer.
+        unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, n, v) };
+        sched.full_barrier();
+        cache.flush_write_through(sched);
+    };
+    fill(cache, sched, p, 256, 0x1234_5678);
+    sched.flush_and_wait();
+    assert!(tracker.has_gpu_dirty_pages(p, 4));
+    // The spans are dropped (as when the list overflows); a newer GPU
+    // write lands next to the word on the same page.
+    cache.written_through.clear();
+    fill(cache, sched, p + 1024, 64, 0x0BAD_F00D);
+    sched.flush_and_wait();
+    cache.written_through.clear();
+    let submits = sched.stats().submits;
+    let downloads = cache.stats.downloads;
+    assert!(cache.download_window(sched, p + 16));
+    let mut w = [0u8; 4];
+    assert!(cache.memory.read_backing(p + 16, &mut w));
+    assert_eq!(u32::from_le_bytes(w), 0x1234_5678, "the landed GPU word");
+    if word_landed_alone_enabled() {
+        assert_eq!(sched.stats().submits, submits, "no submit and no GPU wait");
+        assert_eq!(cache.stats.downloads, downloads, "no download");
+    } else {
+        assert!(cache.stats.downloads > downloads, "RPS5E_WORD_LANDED_ALONE=0: the page is downloaded");
+    }
+    // A GPU write over the word (not written through yet): the read
+    // downloads the newer bytes.
+    let s = cache.obtain(sched, p, 256, true).unwrap();
+    sched.full_barrier();
+    // SAFETY: recording buffer, range inside the buffer.
+    unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, 256, 0x7777_7777) };
+    sched.full_barrier();
+    if tracker.has_gpu_dirty_pages(p, 4) {
+        assert!(cache.download_window(sched, p + 16));
+    }
+    sched.flush_and_wait();
+    assert!(cache.memory.read_backing(p + 16, &mut w));
+    assert_eq!(u32::from_le_bytes(w), 0x7777_7777, "the newer GPU word");
+    drop(g);
+    dev.wait_idle();
+}
+
+/// While a frame capture records, GPU results reach guest memory only by
+/// CPU copies the capture sees: a later read of the page records nothing.
+/// A copy straight into the guest-memory import would change the page
+/// behind the capture's back, and its next read would record the GPU's
+/// bytes as a CPU write, which a replay then writes over its own GPU
+/// results (GTA V's capture hung its replay in a BVH parent walk).
+#[test]
+#[ignore]
+fn captured_gpu_results_are_not_recorded_as_cpu_writes() {
+    use crate::capture::format::{Event, Record};
+    let (view, dev, shared, _tracker) = setup(0x71);
+    let p = view + (1 << 20) + 9 * PAGE_BYTES;
+    let dir = std::env::temp_dir().join(format!("rps5e-capture-through-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mem = shared.lock().unwrap().cache.memory;
+    crate::capture::start(mem, &dir.join("through.ps5cap"), 0).unwrap();
+    {
+        let mut g = shared.lock().unwrap();
+        let Shared { sched, cache } = &mut *g;
+        cache.set_zero_copy(true);
+        let s = cache.obtain(sched, p, 256, true).unwrap();
+        sched.full_barrier();
+        // SAFETY: recording buffer, range inside the buffer.
+        unsafe { dev.device.cmd_fill_buffer(sched.cmd(), s.buffer, s.offset, 256, 0x7777_7777) };
+        sched.full_barrier();
+        cache.flush_write_through(sched);
+        sched.flush_and_wait();
+        // The CPU reads the result (a descriptor word, say).
+        assert!(cache.download_window(sched, p + 16));
+    }
+    let mut w = [0u8; 4];
+    crate::capture::around(mem, || mem.read_backing(p + 16, &mut w), |_| Event::Flush);
+    assert_eq!(u32::from_le_bytes(w), 0x7777_7777, "the GPU result reached guest memory");
+    let summary = crate::capture::finish().unwrap();
+    let c = crate::capture::format::Capture::open(&summary.path).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // The page's first read (the upload) is recorded with its guest bytes;
+    // the GPU's bytes never are.
+    let gpu_bytes = c.records.iter().any(|r| match r {
+        Record::Patch { addr, data } if *addr <= p + 16 && p + 20 <= addr + c.data(data).len() as u64 => {
+            let o = (p + 16 - addr) as usize;
+            c.data(data)[o..o + 4] == 0x7777_7777u32.to_le_bytes()
+        }
+        _ => false,
+    });
+    assert!(!gpu_bytes, "the GPU's bytes were recorded as a CPU write");
+    shared.lock().unwrap().sched.flush_and_wait();
     dev.wait_idle();
 }

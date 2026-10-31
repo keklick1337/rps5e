@@ -23,6 +23,21 @@
 //! back; a tick's queries are allocated while it is recorded and freed in
 //! submission order.
 
+/// `RPS5E_GPU_TIMER=0`: the GPU profile (`RPS5E_GPU_PROFILE`) times no GPU
+/// work: its other counters for A/B runs that compare how GPU work
+/// overlaps (the timestamps between items order the work around them).
+pub fn wanted() -> bool {
+    !std::env::var("RPS5E_GPU_TIMER").is_ok_and(|v| v == "0")
+}
+
+/// `RPS5E_GPU_TIMER=buffers`: only whole command buffers are timed (busy
+/// time with the work inside a buffer overlapping as it would unprofiled);
+/// each buffer is charged to the label active when it ends.
+fn buffers_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_GPU_TIMER").is_ok_and(|v| v == "buffers"))
+}
+
 use crate::device::GpuDevice;
 use ash::vk;
 use std::collections::{HashMap, VecDeque};
@@ -153,6 +168,8 @@ struct Open {
 
 struct Inflight {
     tick: u64,
+    /// The A/B mode when it was submitted (fast: true).
+    fast: bool,
     /// Ring position after the tick's last query.
     end: u32,
     open: Open,
@@ -298,7 +315,7 @@ impl GpuTimer {
         if prev == l || prev == label::OVERFLOW {
             return prev;
         }
-        if let (Some(cb), true) = (cb, self.touched) {
+        if let (Some(cb), true, false) = (cb, self.touched, buffers_only()) {
             if self.open.as_ref().is_some_and(|o| o.start.is_some()) {
                 match self.take(2) {
                     Some(q) => {
@@ -337,7 +354,7 @@ impl GpuTimer {
     /// The command buffers of the open tick were submitted as `tick`.
     pub fn submitted(&mut self, tick: u64) {
         if let Some(open) = self.open.take() {
-            self.inflight.push_back(Inflight { tick, end: self.head, open });
+            self.inflight.push_back(Inflight { tick, fast: crate::backend::ab::mode_fast(), end: self.head, open });
         }
     }
 
@@ -392,6 +409,7 @@ impl GpuTimer {
                 continue;
             }
             self.time.busy_ns += ns;
+            crate::backend::ab::note_gpu(f.fast, ns);
             self.time.max_ns = self.time.max_ns.max(ns);
             self.time.buffers += 1;
             self.time.long += (ns >= 16_000_000) as u64;

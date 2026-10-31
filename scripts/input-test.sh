@@ -30,7 +30,7 @@ game_key() {
 }
 
 wait_lock() {
-    if pgrep -f "rps5e-cli run" >/dev/null; then echo "another emulator is running; waiting for it" >&2; fi
+    if pgrep -x rps5e-cli >/dev/null; then echo "another emulator is running; waiting for it" >&2; fi
     flock "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/rps5e-run.lock" true
 }
 

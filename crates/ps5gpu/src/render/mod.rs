@@ -952,6 +952,12 @@ pub struct DispatchPacket {
     /// Argument record address (indirect dispatches; 0 when direct).
     pub indirect_address: u64,
     pub dispatch_initiator: u32,
+    /// Only register writes and markers stand between the previous dispatch
+    /// of the queue and this one: no partial flush, cache action, wait or
+    /// command-processor write, so the console may run both at once and the
+    /// title does not rely on one finishing before the other. Not kept in
+    /// frame captures (a replay orders every dispatch by its ranges).
+    pub unsynced: bool,
 }
 
 /// A dispatch resolved from the shader bank.
@@ -1052,6 +1058,14 @@ pub trait RenderExecutor: Send + Sync {
     /// through `write` once the GPU retired them; false: the caller
     /// publishes a conservative result itself.
     fn occlusion_counter_dump(&self, _addr: u64, _write: &OcclusionWrite) -> bool {
+        false
+    }
+    /// [`Self::occlusion_counter_dump`] without waiting for its answer:
+    /// when the dump is not counted on the GPU, `cpu` (publishing the
+    /// conservative result) runs in order with the executor's work. False
+    /// when the executor does not take dumps this way (nothing was done:
+    /// the caller asks [`Self::occlusion_counter_dump`]).
+    fn occlusion_counter_dump_or(&self, _addr: u64, _write: &OcclusionWrite, _cpu: Box<dyn FnOnce() + Send>) -> bool {
         false
     }
     /// End of a submission slice: submit what was recorded.

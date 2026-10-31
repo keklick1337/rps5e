@@ -339,3 +339,46 @@ fn source_slice_reads_guest_bytes() {
     assert!(g.source_slice(view + CACHING_PAGE * 7, CACHING_PAGE * 3).is_none(), "a hole in the range");
     s.flush_and_wait();
 }
+
+/// `resident_runs` passes over whole words and still finds exactly the
+/// runs a page-by-page walk finds, marking the same pages resident.
+#[test]
+fn resident_runs_match_a_page_walk() {
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for _ in 0..500 {
+        let words = 8;
+        let backed: Vec<u64> = (0..words).map(|_| match next() % 4 { 0 => 0, 1 => !0, _ => next() }).collect();
+        let resident0: Vec<u64> = (0..words).map(|i| match next() % 4 { 0 => 0, 1 => backed[i], _ => next() & backed[i] }).collect();
+        let dirty: Vec<u64> = (0..words).map(|_| if next() % 3 == 0 { 0 } else { next() }).collect();
+        let current = |p: u64| dirty[(p / 64) as usize] & (1 << (p % 64)) == 0;
+        let first = next() % (words as u64 * 64);
+        let last = (first + next() % (words as u64 * 64)).min(words as u64 * 64);
+        // The page walk.
+        let mut want_res = resident0.clone();
+        let mut want = Vec::new();
+        let mut open = None;
+        for p in first..last {
+            let take = bit(&backed, p) && !bit(&want_res, p) && current(p);
+            if take {
+                set_bit(&mut want_res, p, true);
+                open.get_or_insert(p);
+            } else if let Some(s) = open.take() {
+                want.push((s, p));
+            }
+        }
+        if let Some(s) = open {
+            want.push((s, last));
+        }
+        let mut got_res = resident0.clone();
+        let mut got = Vec::new();
+        resident_runs(&backed, &mut got_res, first, last, current, |s, e| got.push((s, e)));
+        assert_eq!(got, want, "runs of {first}..{last}");
+        assert_eq!(got_res, want_res);
+    }
+}

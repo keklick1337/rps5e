@@ -785,6 +785,19 @@ pub fn set_fault_hook(hook: FaultHook) {
     FAULT_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Consulted before a SIGBUS `BUS_ADRERR` is reported: `fault address ->
+/// retry`. A store to a page under userfaultfd write protection raises it
+/// (the GPU memory tracker's write watches on Linux). Same rules as
+/// [`FaultHook`].
+pub type WriteProtectHook = fn(u64) -> bool;
+
+static WRITE_PROTECT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the write-protection fault hook (replaces any previous one).
+pub fn set_write_protect_hook(hook: WriteProtectHook) {
+    WRITE_PROTECT_HOOK.store(hook as usize, Ordering::Release);
+}
+
 /// Describes a guest address for the report of a fatal guest fault (the
 /// memory manager's view of it); None for addresses it does not know.
 pub type DescribeHook = fn(u64) -> Option<String>;
@@ -802,6 +815,9 @@ pub static HOOK_RESOLVED_FAULTS: AtomicU64 = AtomicU64::new(0);
 /// Ask the fault hook about a SIGSEGV/SIGBUS. Only access-rights faults on
 /// mapped pages (`SEGV_ACCERR`) are offered to it.
 fn try_fault_hook(signum: crate::ctx::c_int, info: *mut crate::ctx::siginfo_t, uc: *mut crate::ctx::ucontext_t) -> bool {
+    if signum == crate::ctx::SIGBUS {
+        return try_write_protect_hook(info, uc);
+    }
     if signum != crate::ctx::SIGSEGV {
         return false;
     }
@@ -821,6 +837,29 @@ fn try_fault_hook(signum: crate::ctx::c_int, info: *mut crate::ctx::siginfo_t, u
     ps5vm::fault_site::set(unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 });
     // Page-fault error code bit 1: the access was a write.
     let resolved = hook(addr, err & 2 != 0);
+    if resolved {
+        HOOK_RESOLVED_FAULTS.fetch_add(1, Ordering::Relaxed);
+    }
+    resolved
+}
+
+/// A SIGBUS `BUS_ADRERR` offered to the write-protection hook.
+fn try_write_protect_hook(info: *mut crate::ctx::siginfo_t, uc: *mut crate::ctx::ucontext_t) -> bool {
+    let raw = WRITE_PROTECT_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: kernel-provided signal info.
+    let (code, addr) = unsafe { ((*info).si_code, (*info).si_addr() as u64) };
+    const BUS_ADRERR: crate::ctx::c_int = 2;
+    if code != BUS_ADRERR {
+        return false;
+    }
+    // SAFETY: the value was stored from a `WriteProtectHook`.
+    let hook: WriteProtectHook = unsafe { std::mem::transmute::<usize, WriteProtectHook>(raw) };
+    // SAFETY: kernel-provided signal context.
+    ps5vm::fault_site::set(unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 });
+    let resolved = hook(addr);
     if resolved {
         HOOK_RESOLVED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }

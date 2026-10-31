@@ -643,7 +643,7 @@ pub fn put_draw(e: &mut Enc, d: &ResolvedDraw) {
 }
 
 pub fn put_dispatch(e: &mut Enc, d: &ResolvedDispatch) {
-    let ResolvedDispatch { packet: DispatchPacket { queue, packet_address, groups, indirect_address, dispatch_initiator }, shader, rsrc3, threads, start } = d;
+    let ResolvedDispatch { packet: DispatchPacket { queue, packet_address, groups, indirect_address, dispatch_initiator, unsynced: _ }, shader, rsrc3, threads, start } = d;
     e.u64(*queue as u64);
     e.u64(*packet_address);
     e.u32s(groups);
@@ -1069,7 +1069,7 @@ pub fn get_draw(d: &mut Dec) -> Result<ResolvedDraw, FormatError> {
 }
 
 pub fn get_dispatch(d: &mut Dec) -> Result<ResolvedDispatch, FormatError> {
-    let packet = DispatchPacket { queue: d.u64()? as usize, packet_address: d.u64()?, groups: d.u32s()?, indirect_address: d.u64()?, dispatch_initiator: d.u32()? };
+    let packet = DispatchPacket { queue: d.u64()? as usize, packet_address: d.u64()?, groups: d.u32s()?, indirect_address: d.u64()?, dispatch_initiator: d.u32()?, unsynced: false };
     Ok(ResolvedDispatch { packet, shader: get_stage(d)?, rsrc3: d.u32()?, threads: d.u32s()?, start: d.u32s()? })
 }
 

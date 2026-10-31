@@ -1626,6 +1626,8 @@ pub struct ImageCache {
     memory: &'static GuestGpuMemory,
     pub tiler: GpuTiler,
     images: HashMap<u64, CachedImage>,
+    /// Bytes of the images' keys (kept as images come and go).
+    image_bytes: u64,
     /// Image of each key.
     by_key: HashMap<ImageKey, u64>,
     /// Every plane of every image: (address, id) -> end.
@@ -1939,6 +1941,32 @@ fn readback_targets_enabled() -> bool {
     *ON.get_or_init(|| crate::backend::ab::switch_value(false, std::env::var("RPS5E_READBACK_TARGETS").ok().as_deref()))
 }
 
+/// `RPS5E_EAGER_TARGET_READBACK=0`: a small tiled target enrolled for CPU
+/// read-back is written back only when the CPU touches it, which waits for
+/// all the GPU work recorded by then. On, it is also written back and
+/// settled into guest memory at the guest's next submit after each GPU
+/// write ([`ImageCache::process_downloads`]): a CPU read later waits for
+/// that copy only (usually done by then). A/B in one run with
+/// `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=eager-target-readback`.
+fn eager_target_readback_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_EAGER_TARGET_READBACK")) && crate::backend::ab::release_fast("eager-target-readback")
+}
+
+/// `RPS5E_UNLOCKED_TARGET_READ=1` (opt-in): a CPU read of a render
+/// target's pages (a small target the CPU reads back) records the
+/// write-back and the copies, releases the back-end while the GPU runs
+/// them, and finishes without a wait ([`ImageCache::start_read_backs`]):
+/// the recording thread goes on meanwhile. By default the read-back holds
+/// the back-end while the GPU catches up. GTA V's main thread reads a 1x1
+/// target every frame (~30 ms held): with the switch the recording
+/// thread's lock waits went (10 → 1 ms per flip) but its GPU waits and CPU
+/// grew by as much, and the frame rate stayed.
+pub fn unlocked_target_read_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::backend::ab::safe() && std::env::var("RPS5E_UNLOCKED_TARGET_READ").is_ok_and(|v| v == "1")) && crate::backend::ab::release_fast("unlocked-target-read")
+}
+
 fn alias_same_mips_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // A correctness rule: RPS5E_SAFE does not turn it off.
@@ -2135,6 +2163,7 @@ impl ImageCache {
             memory,
             tiler: GpuTiler::new(dev)?,
             images: HashMap::default(),
+            image_bytes: 0,
             by_key: HashMap::default(),
             planes: BTreeMap::new(),
             page_owners: ImagePageTable::new(),
@@ -2176,7 +2205,9 @@ impl ImageCache {
     }
 
     pub fn stats(&self) -> ImageStats {
-        ImageStats { images: self.images.len(), reused: self.pool.reused, ..self.stats }
+        // The modified bytes are summed here, for the report only.
+        let modified = self.images.values().filter(|i| i.gpu_modified).map(|i| i.key.size()).sum();
+        ImageStats { images: self.images.len(), reused: self.pool.reused, bytes: self.image_bytes, modified_bytes: modified, ..self.stats }
     }
 
     /// Changes when anything a texture lookup depends on may have changed:
@@ -2687,6 +2718,7 @@ impl ImageCache {
             self.register_pages(id, &p);
         }
         self.by_key.insert(*key, id);
+        self.image_bytes += key.size();
         self.images.insert(
             id,
             CachedImage {
@@ -2855,6 +2887,7 @@ impl ImageCache {
     pub fn delete(&mut self, sched: &mut Scheduler, id: u64) {
         self.changed(id);
         let Some(img) = self.images.remove(&id) else { return };
+        self.image_bytes -= img.key.size();
         self.table.remove(id);
         if self.by_key.get(&img.key) == Some(&id) {
             self.by_key.remove(&img.key);
@@ -5084,11 +5117,34 @@ impl ImageCache {
     ) {
         let pages = self.table.pages().clone();
         for &(begin, end, id) in hits {
+            let why = fault && crate::backend::profile::desc_wait_why() && {
+                static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200
+            };
+            if why {
+                let i = self.images.get(&id);
+                log::info!(
+                    "ps5gpu: cpu read-back of image {id} at {begin:#x}+{:#x} (seq {:?} written back {:?}, last use {:?}, tick {}, completed {}): {:?}",
+                    end - begin,
+                    i.map(|i| i.seq),
+                    i.map(|i| i.written_back_seq),
+                    i.map(|i| i.last_use),
+                    sched.current_tick(),
+                    sched.timeline.completed_tick(),
+                    i.map(|i| i.key)
+                );
+            }
             if self.read_back_linear(sched, id) {
                 tracker.note_written(begin, end - begin);
             } else {
-                // Not a plain linear image: through its buffer mirror.
-                self.writeback(sched, buffers, id);
+                // Not a plain linear image: through its buffer mirror. One
+                // written back since its last GPU write (eagerly, at a
+                // submit) has its bytes on the way: the download waits for
+                // that copy only.
+                let current = eager_target_readback_enabled() && self.images.get(&id).is_some_and(|i| i.written_back_seq == i.seq);
+                if !current {
+                    self.writeback(sched, buffers, id);
+                }
                 buffers.download(sched, begin, end - begin);
             }
             for page in (begin..end).step_by(PAGE_BYTES as usize) {
@@ -5101,6 +5157,41 @@ impl ImageCache {
                 }
             }
         }
+    }
+
+    /// The GPU work of [`Self::resolve_read_backs`] for `hits`, recorded
+    /// and submitted without waiting for it (`RPS5E_UNLOCKED_TARGET_READ`):
+    /// the images are written back into their buffer mirrors (unless the
+    /// eager write-back at a submit did so since their last GPU write) and
+    /// the GPU-dirty pages' copies into guest memory are recorded the way
+    /// a CPU read-back downloads them. Returns the tick to wait for, with
+    /// the back-end unlocked, before calling again; None when nothing is
+    /// left to wait for: [`Self::resolve_read_backs`] then finishes without
+    /// a GPU wait (or, for the cases this does not handle, waits itself).
+    ///
+    /// GPU work recorded during the wait may write the images or the pages
+    /// again: the next call records their copies anew, and the read watch
+    /// of an image enrolled again stays until a read-back took it.
+    pub fn start_read_backs(&mut self, sched: &mut Scheduler, buffers: &mut BufferCache, hits: &[(u64, u64, u64)]) -> Option<u64> {
+        if !eager_target_readback_enabled() {
+            return None;
+        }
+        let mut wait = 0;
+        for &(begin, end, id) in hits {
+            let Some(i) = self.images.get(&id) else { continue };
+            // Linear images are read back by a copy of their texels.
+            if i.key.main.swizzle == crate::tiling::SWIZZLE_LINEAR {
+                return None;
+            }
+            if i.written_back_seq != i.seq && !self.writeback(sched, buffers, id) {
+                return None;
+            }
+            match buffers.download_async_as(sched, begin, end - begin, false) {
+                crate::buffers::DownloadStep::Done(_) => {}
+                crate::buffers::DownloadStep::Wait(t) => wait = wait.max(t),
+            }
+        }
+        (wait != 0).then_some(wait)
     }
 
     /// Copy the texels of linear image `id` straight into guest memory
@@ -5187,6 +5278,9 @@ impl ImageCache {
         } else if key.width <= TARGET_READ_BACK_TILED_EDGE && key.height <= TARGET_READ_BACK_TILED_EDGE && self.readback_linear != LinearReadback::Off {
             for p in key.planes() {
                 self.table.watch_reads(id, p.addr, p.addr + p.size());
+            }
+            if eager_target_readback_enabled() && !self.downloads.contains(&id) {
+                self.downloads.push(id);
             }
         }
     }
@@ -5351,9 +5445,10 @@ impl ImageCache {
             self.delete(sched, id);
             self.stats.drops[1] += 1;
         }
-        let total: u64 = self.images.values().map(|i| i.key.size()).sum();
-        self.stats.bytes = total;
-        self.stats.modified_bytes = self.images.values().filter(|i| i.gpu_modified).map(|i| i.key.size()).sum();
+        // Kept as images come and go: no walk over ~10k images every 256
+        // draws (the modified bytes are summed for the report only).
+        let total = self.image_bytes;
+        debug_assert_eq!(total, self.images.values().map(|i| i.key.size()).sum::<u64>());
         if total <= budget {
             return;
         }
@@ -5592,8 +5687,17 @@ impl ImageCache {
         let (mut pressured, mut aggressive, age, mut deletions) = crate::gc::image_run(*usage, t, allow_aggressive);
         let cutoff = ticks.cutoff(age).min(self.cutoff_after(sched.current_tick(), crate::gc::idle_frames(pressured, aggressive)));
         let mut candidates: Vec<(u64, u64)> = self.images.values().filter(|i| i.last_use < cutoff).map(|i| (i.last_use, i.id)).collect();
+        // The `deletions` least recently used, in order (a selection, not
+        // a sort of every idle image: this runs at every completed tick).
+        if deletions < candidates.len() {
+            if deletions == 0 {
+                candidates.clear();
+            } else {
+                candidates.select_nth_unstable(deletions - 1);
+                candidates.truncate(deletions);
+            }
+        }
         candidates.sort_unstable();
-        candidates.truncate(deletions);
         for (_, id) in candidates {
             if deletions == 0 {
                 break;

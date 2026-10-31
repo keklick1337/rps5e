@@ -218,10 +218,20 @@ pub struct EmitOptions {
     /// `s_buffer_load`: SGPR operands, no EXEC) once and both lane halves
     /// share the words, instead of loading them per half.
     pub smem_once: bool,
+    /// `RPS5E_NAN_ONCE`: the NaN result of the f32 add/sub/mul/fma is
+    /// picked among the sources off the result's chain and the result is
+    /// tested once (`ps5shader::translate::rewrites::NAN_ONCE`), where the
+    /// device preserves NaNs. Exact.
+    pub nan_once: bool,
     /// `RPS5E_BVH_VECTOR_LOADS`: a BVH node (64-byte aligned) is read with
     /// one residency branch and 16-byte vector loads instead of a branch
     /// per four dwords and one load per dword.
     pub bvh_vector_loads: bool,
+    /// `RPS5E_ZERO_MAX`: a scalar float max with a constant +0 operand
+    /// (`v_max_f32 v, 0, v`) is one compare and one select
+    /// (`Emitter::max_with_positive_zero`), not the general NaN and
+    /// signed-zero selects. Exact.
+    pub zero_max: bool,
 }
 
 impl EmitOptions {
@@ -250,6 +260,8 @@ impl EmitOptions {
         lane_reductions: true,
         smem_once: true,
         bvh_vector_loads: true,
+        nan_once: true,
+        zero_max: true,
     };
     /// Every exact switch on, on a device with every feature they use
     /// (tests).
@@ -278,6 +290,8 @@ impl EmitOptions {
         lane_reductions: false,
         smem_once: false,
         bvh_vector_loads: false,
+        nan_once: false,
+        zero_max: false,
     };
 
     /// The switches from the environment (read once).
@@ -313,6 +327,8 @@ impl EmitOptions {
                 lane_reductions: on("RPS5E_LANE_REDUCTIONS"),
                 smem_once: on("RPS5E_SMEM_ONCE"),
                 bvh_vector_loads: on("RPS5E_BVH_VECTOR_LOADS"),
+                nan_once: on("RPS5E_NAN_ONCE"),
+                zero_max: on("RPS5E_ZERO_MAX"),
             };
             if o.fast_transcendental {
                 log::warn!("[shader] RPS5E_FAST_TRANSCENDENTAL=1: v_exp/log/rcp/rsq/sqrt_f32 use the host's precision and special values");
@@ -805,6 +821,9 @@ impl SpirvCompiler {
         apply_emit_options(&mut options, &feats.emit);
         if feats.emit.float_class_compare && feats.preserve_inf_nan[1] {
             options.rewrites |= translate::rewrites::FLOAT_CLASS_COMPARE;
+        }
+        if feats.emit.nan_once && feats.preserve_inf_nan[1] {
+            options.rewrites |= translate::rewrites::NAN_ONCE;
         }
         if self.features.emit.full_wave_exec && stage == ShaderStage::Compute && mesh.is_none() && full_waves(r) {
             options.initial_exec = InitialExec::All;

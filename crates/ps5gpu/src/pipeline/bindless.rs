@@ -186,43 +186,73 @@ impl Drop for BindlessSet {
     }
 }
 
+/// Why a table element has no view (it reads the null view). Formatted
+/// only when logged: failed elements are looked at again whenever images
+/// change.
+#[derive(Debug)]
+enum NoView {
+    Null,
+    Dimension(ImageDimension, ImageDimension),
+    Converted(u32),
+    Atomic64,
+    DepthCompare(u32),
+    Numeric(u32, ImageNumericClass),
+    NotCached,
+    View(String),
+}
+
+impl std::fmt::Display for NoView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoView::Null => write!(f, "null T#"),
+            NoView::Dimension(bound, dimension) => write!(f, "{bound:?} T# read as {dimension:?}"),
+            NoView::Converted(format) => write!(f, "format {format} converted by the program"),
+            NoView::Atomic64 => write!(f, "64-bit image atomics through a table"),
+            NoView::DepthCompare(format) => write!(f, "depth compare of colour format {format}"),
+            NoView::Numeric(format, numeric) => write!(f, "format {format} read as {numeric:?}"),
+            NoView::NotCached => write!(f, "no cached image"),
+            NoView::View(why) => f.write_str(why),
+        }
+    }
+}
+
 /// The view an image selected through binding `kind` reads, its image and
 /// its class ([`bindless::MODE_FLOAT`]...), or why there is none (it then
 /// reads the null view).
-fn table_view(ctx: &mut DrawContext, dummies: &mut DummyResources, dev: &GpuDevice, words: &[u32; 8], kind: DescriptorBindingKind) -> Result<(vk::ImageView, u64, u32), String> {
+fn table_view(ctx: &mut DrawContext, dummies: &mut DummyResources, dev: &GpuDevice, words: &[u32; 8], kind: DescriptorBindingKind) -> Result<(vk::ImageView, u64, u32), NoView> {
     let (_, _, dimension, _) = image_binding::describe(kind);
     if TextureSharp::from_words(words).is_null() {
-        return Err("null T#".into());
+        return Err(NoView::Null);
     }
     // The program declares the instruction's view; a T# the hardware reads
     // as another shape has no view of it.
     let bound = descriptor_dimension(words, dimension);
     let same = bound == dimension || (dimension == ImageDimension::Dim2DArray && bound == ImageDimension::Dim2D) || (dimension == ImageDimension::Dim1DArray && bound == ImageDimension::Dim1D);
     if !same {
-        return Err(format!("{bound:?} T# read as {dimension:?}"));
+        return Err(NoView::Dimension(bound, dimension));
     }
     let format = image_format::format_of(words);
     if image_format::remap(format) != format {
-        return Err(format!("format {format} converted by the program"));
+        return Err(NoView::Converted(format));
     }
     let (_, _, _, atomic) = image_binding::describe(kind);
     if image_binding::is_atomic64(kind) {
         // No R64ui view on the table path: the element reads zeros and its
         // atomic faults nowhere (64-bit table atomics stay unsupported).
-        return Err("64-bit image atomics through a table".into());
+        return Err(NoView::Atomic64);
     }
     if atomic {
         // A 32-bit atomic runs on an R32ui storage view of the element
         // (the same view class its map word's mode selects).
         let req = TextureRequest { numeric: ImageNumericClass::Uint, dimension, storage: true, cube: false, host_swizzle: true, mip_offset: 0, single_level: false, atomic64: false, srgb: false };
-        return match sharps::texture_view(ctx, Some(dummies), dev, words, &req)? {
+        return match sharps::texture_view(ctx, Some(dummies), dev, words, &req).map_err(NoView::View)? {
             (view, Some(id)) => Ok((view, id, bindless::MODE_UINT)),
-            (_, None) => Err("no cached image".into()),
+            (_, None) => Err(NoView::NotCached),
         };
     }
     let compare = image_binding::is_compare(kind);
     if compare && !image_format::has_depth_equivalent(format) {
-        return Err(format!("depth compare of colour format {format}"));
+        return Err(NoView::DepthCompare(format));
     }
     // The program reads float, unsigned and signed views (a depth
     // reference only float ones).
@@ -231,12 +261,12 @@ fn table_view(ctx: &mut DrawContext, dummies: &mut DummyResources, dev: &GpuDevi
         ImageNumericClass::Float => bindless::MODE_FLOAT,
         ImageNumericClass::Uint if !compare => bindless::MODE_UINT,
         ImageNumericClass::Sint if !compare => bindless::MODE_SINT,
-        _ => return Err(format!("format {format} read as {numeric:?}")),
+        _ => return Err(NoView::Numeric(format, numeric)),
     };
     let req = TextureRequest { numeric, dimension, storage: false, cube: false, host_swizzle: true, mip_offset: 0, single_level: false, atomic64: false, srgb: false };
-    match sharps::texture_view(ctx, Some(dummies), dev, words, &req)? {
+    match sharps::texture_view(ctx, Some(dummies), dev, words, &req).map_err(NoView::View)? {
         (view, Some(id)) => Ok((view, id, mode)),
-        (_, None) => Err("no cached image".into()),
+        (_, None) => Err(NoView::NotCached),
     }
 }
 
@@ -857,5 +887,28 @@ impl BindlessSet {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod no_view_tests {
+    use super::*;
+
+    /// The lazily formatted reasons read as the strings formatted before.
+    #[test]
+    fn reasons_format_as_before() {
+        let cases: [(NoView, &str); 8] = [
+            (NoView::Null, "null T#"),
+            (NoView::Dimension(ImageDimension::Dim3D, ImageDimension::Dim2D), "Dim3D T# read as Dim2D"),
+            (NoView::Converted(7), "format 7 converted by the program"),
+            (NoView::Atomic64, "64-bit image atomics through a table"),
+            (NoView::DepthCompare(9), "depth compare of colour format 9"),
+            (NoView::Numeric(4, ImageNumericClass::Uint), "format 4 read as Uint"),
+            (NoView::NotCached, "no cached image"),
+            (NoView::View("unmapped".into()), "unmapped"),
+        ];
+        for (why, text) in cases {
+            assert_eq!(why.to_string(), text);
+        }
     }
 }

@@ -35,5 +35,9 @@ log.workspace = true
 libc.workspace = true
 rps5e-gui = { path = "../rps5e-gui" }
 
+# The host heap on Linux (see src/host_alloc.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "0.1.49", features = ["extended", "v2"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

@@ -148,6 +148,39 @@ fn bit(map: &[u64], page: u64) -> bool {
     map.get((page / 64) as usize).is_some_and(|w| w & (1 << (page % 64)) != 0)
 }
 
+/// The runs `[s, e)` of pages in `[first, last)` that are backed, not
+/// resident and `current`: they are marked resident and passed to `run`.
+/// Whole words of pages with none backed and not resident are passed over
+/// without asking `current` (a buffer's pages are mostly resident after
+/// its first use, and unranged reads look at every buffer).
+fn resident_runs(backed: &[u64], resident: &mut [u64], first: u64, last: u64, current: impl Fn(u64) -> bool, mut run: impl FnMut(u64, u64)) {
+    let mut open: Option<u64> = None;
+    let mut page = first;
+    while page < last {
+        if page % 64 == 0 && page + 64 <= last {
+            let w = (page / 64) as usize;
+            if backed.get(w).zip(resident.get(w)).is_none_or(|(b, r)| b & !r == 0) {
+                if let Some(s) = open.take() {
+                    run(s, page);
+                }
+                page += 64;
+                continue;
+            }
+        }
+        let take = bit(backed, page) && !bit(resident, page) && current(page);
+        if take {
+            set_bit(resident, page, true);
+            open.get_or_insert(page);
+        } else if let Some(s) = open.take() {
+            run(s, page);
+        }
+        page += 1;
+    }
+    if let Some(s) = open {
+        run(s, last);
+    }
+}
+
 fn set_bit(map: &mut [u64], page: u64, on: bool) {
     if let Some(w) = map.get_mut((page / 64) as usize) {
         if on {
@@ -252,6 +285,19 @@ impl GuestImports {
         let (buffer, _, len) = self.chunk((b >> CHUNK_BITS) as usize)?;
         let off = b & (CHUNK - 1);
         (off + size <= len).then_some((buffer, off))
+    }
+
+    /// [`Self::source_slice`] of a chunk already imported (None instead
+    /// of importing one).
+    pub fn imported_slice(&mut self, addr: u64, size: u64) -> Option<(vk::Buffer, u64)> {
+        let runs = self.memory.backing_runs(addr, size);
+        let &[(g, b, n)] = runs.as_slice() else { return None };
+        if g != addr || n != size || size == 0 || (b >> CHUNK_BITS) != ((b + size - 1) >> CHUNK_BITS) {
+            return None;
+        }
+        let Some(Chunk::Imported(c)) = self.chunks.get((b >> CHUNK_BITS) as usize) else { return None };
+        let off = b & (CHUNK - 1);
+        (off + size <= c.size).then_some((c.buffer, off))
     }
 
     /// Device address of backing bytes `[b, b+len)` (inside one chunk).
@@ -548,26 +594,16 @@ impl GuestImports {
     /// bytes at `mirror(page address)`. True when an entry was written.
     pub fn make_resident(&mut self, sched: &mut Scheduler, start: u64, end: u64, mirror: impl Fn(u64) -> u64, current: impl Fn(u64) -> bool) -> bool {
         let (first, last) = (start >> CACHING_PAGE_BITS, (end >> CACHING_PAGE_BITS).min(BDA_PAGE_COUNT));
-        let mut wrote = false;
+        let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
+        resident_runs(&self.backed, &mut self.resident, first, last, |p| current(p << CACHING_PAGE_BITS), |s, e| runs.push((s, e)));
         let mut run: Vec<u64> = Vec::new();
-        let mut run_first = 0;
-        for page in first..last {
-            let take = bit(&self.backed, page) && !bit(&self.resident, page) && current(page << CACHING_PAGE_BITS);
-            if take {
-                if run.is_empty() {
-                    run_first = page;
-                }
-                run.push(mirror(page << CACHING_PAGE_BITS));
-                set_bit(&mut self.resident, page, true);
-                self.stats.resident_pages += 1;
-            }
-            if (!take || page + 1 == last) && !run.is_empty() {
-                self.write_run(sched, run_first, &run);
-                run.clear();
-                wrote = true;
-            }
+        for &(s, e) in &runs {
+            run.clear();
+            run.extend((s..e).map(|p| mirror(p << CACHING_PAGE_BITS)));
+            self.stats.resident_pages += e - s;
+            self.write_run(sched, s, &run);
         }
-        wrote
+        !runs.is_empty()
     }
 
     /// Point the resident pages of `[start, end)` for which

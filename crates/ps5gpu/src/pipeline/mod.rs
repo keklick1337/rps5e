@@ -33,6 +33,7 @@ pub mod descriptors;
 pub mod frontend;
 pub mod hazards;
 pub mod indirect;
+pub mod library;
 pub mod lookahead;
 pub mod indirect_mesh;
 pub mod indirect_threads;

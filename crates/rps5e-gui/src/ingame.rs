@@ -109,7 +109,7 @@ pub const GPU_SWITCHES: &[GpuSwitch] = &[
     GpuSwitch { env: "RPS5E_GPU_ZERO_COPY", label: "Zero-copy GPU downloads", default_on: true },
     GpuSwitch { env: "RPS5E_BUFFER_SUBALLOC", label: "Buffer sub-allocation", default_on: true },
     GpuSwitch { env: "RPS5E_BDA", label: "Shaders read guest memory directly (BDA, experimental)", default_on: false },
-    GpuSwitch { env: "RPS5E_GPU_RECORD_THREAD", label: "Separate recording thread (experimental)", default_on: false },
+    GpuSwitch { env: "RPS5E_GPU_RECORD_THREAD", label: "Separate recording thread (while recording is the bottleneck)", default_on: true },
     GpuSwitch { env: "RPS5E_OCCLUSION_QUERIES", label: "Occlusion queries on the GPU", default_on: false },
 ];
 

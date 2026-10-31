@@ -16,6 +16,14 @@
 //!
 //! When both apply, the fast cores are the performance cores of the
 //! large-cache complex. On symmetric processors nothing is pinned.
+//!
+//! The GPU command recorder of a game (`gpu-cmd`) runs on one CPU of the
+//! fast cores whose physical core no other thread of the process uses
+//! (`reserve_recorder_core` at start, before any thread exists: every later
+//! thread inherits the mask without that core). The recorder waits for the
+//! GPU many times a frame; free to move, it wakes on another core with
+//! cold private caches, and a guest thread on its SMT sibling halves its
+//! issue rate (`RPS5E_RECORDER_CORE=0`: the whole fast set, shared).
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -79,6 +87,15 @@ pub fn highest_capacity(capacities: &[(usize, u64)]) -> Option<Vec<usize>> {
     Some(cpus)
 }
 
+/// The recorder's CPU among `fast` and the CPUs of its physical core (see
+/// [`Topology::recorder_core`]), from `(cpu, siblings)` pairs.
+pub fn recorder_core_of(fast: &[usize], siblings: &[(usize, Vec<usize>)]) -> Option<(usize, Vec<usize>)> {
+    let core_of = |c: usize| siblings.iter().find(|s| s.0 == c).map(|s| s.1.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| vec![c]);
+    // First hardware threads of their cores, highest core first.
+    let cpu = fast.iter().copied().filter(|&c| core_of(c).iter().min() == Some(&c)).max().or_else(|| fast.iter().copied().max())?;
+    Some((cpu, core_of(cpu)))
+}
+
 /// What the host topology says about fast cores.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct Topology {
@@ -88,6 +105,8 @@ pub struct Topology {
     pub capacities: Vec<(usize, u64)>,
     /// `(size, shared cpu list)` per L3 instance.
     pub l3: Vec<(u64, Vec<usize>)>,
+    /// `(cpu, SMT siblings including itself)`, where the kernel lists them.
+    pub siblings: Vec<(usize, Vec<usize>)>,
 }
 
 impl Topology {
@@ -110,6 +129,14 @@ impl Topology {
         }
     }
 
+    /// The CPU the recorder runs on and the CPUs of its physical core: the
+    /// highest-numbered core of the fast set (CPU 0 takes more of the
+    /// host's interrupts), its first hardware thread.
+    pub fn recorder_core(&self) -> Option<(usize, Vec<usize>)> {
+        let (fast, _) = self.fast_cpus()?;
+        recorder_core_of(&fast, &self.siblings)
+    }
+
     /// Read the topology under a sysfs root (`/sys` on the host).
     pub fn read(sys: &Path) -> Topology {
         let read = |p: &Path| std::fs::read_to_string(p).ok();
@@ -119,12 +146,16 @@ impl Topology {
         let hybrid_core = if atom.is_empty() { None } else { read(&sys.join("devices/cpu_core/cpus")).map(|s| parse_cpu_list(&s)) };
         let mut capacities = Vec::new();
         let mut l3: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut siblings = Vec::new();
         if let Ok(dir) = std::fs::read_dir(sys.join("devices/system/cpu")) {
             for e in dir.flatten() {
                 let name = e.file_name();
                 let Some(n) = name.to_str().and_then(|n| n.strip_prefix("cpu")).and_then(|n| n.parse::<usize>().ok()) else { continue };
                 if let Some(c) = read(&e.path().join("cpu_capacity")).and_then(|s| s.trim().parse::<u64>().ok()) {
                     capacities.push((n, c));
+                }
+                if let Some(list) = read(&e.path().join("topology/thread_siblings_list")) {
+                    siblings.push((n, parse_cpu_list(&list)));
                 }
                 let base = e.path().join("cache/index3");
                 let (Some(size), Some(list)) = (read(&base.join("size")), read(&base.join("shared_cpu_list"))) else { continue };
@@ -135,7 +166,8 @@ impl Topology {
             }
         }
         capacities.sort_unstable();
-        Topology { hybrid_core, capacities, l3 }
+        siblings.sort_unstable();
+        Topology { hybrid_core, capacities, l3, siblings }
     }
 }
 
@@ -150,6 +182,75 @@ pub fn fast_cpus() -> Option<(&'static [usize], &'static str)> {
     CPUS.get_or_init(|| Topology::read(Path::new("/sys")).fast_cpus()).as_ref().map(|(c, why)| (c.as_slice(), *why))
 }
 
+/// `RPS5E_RECORDER_CORE=0` (or `off`): the recorder runs on the whole fast
+/// set, which other threads share.
+fn recorder_core_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| pinning_enabled() && !std::env::var("RPS5E_RECORDER_CORE").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
+/// The recorder's CPU and the CPUs of its physical core.
+pub fn recorder_core() -> Option<&'static (usize, Vec<usize>)> {
+    static CORE: OnceLock<Option<(usize, Vec<usize>)>> = OnceLock::new();
+    CORE.get_or_init(|| if recorder_core_enabled() { Topology::read(Path::new("/sys")).recorder_core() } else { None }).as_ref()
+}
+
+/// Keep the recorder's physical core for the recorder: the calling thread
+/// (the process's first, before any other thread is created) leaves it,
+/// and every thread created later inherits that. Call once at start.
+pub fn reserve_recorder_core() {
+    let Some((cpu, core)) = recorder_core() else { return };
+    let Some(all) = current_cpus() else { return };
+    let rest: Vec<usize> = all.iter().copied().filter(|c| !core.contains(c)).collect();
+    if rest.is_empty() || !pin_current_thread(&rest) {
+        return;
+    }
+    log::info!("CPU {cpu} (core {core:?}) kept for the GPU command recorder; other threads on {rest:?} (RPS5E_RECORDER_CORE=0: shared)");
+}
+
+/// Pin the calling thread, the GPU command recorder, to its own CPU (see
+/// [`reserve_recorder_core`]); without one, to the fast cores. True when
+/// pinned.
+pub fn pin_current_thread_to_recorder_core(what: &str) -> bool {
+    match recorder_core() {
+        Some((cpu, _)) if pin_current_thread(&[*cpu]) => {
+            log::info!("{what}: pinned to CPU {cpu}");
+            true
+        }
+        _ => pin_current_thread_to_fast_cores(what),
+    }
+}
+
+/// Let the calling thread run on every online CPU except the recorder's
+/// physical core (a helper started by the recorder would otherwise inherit
+/// its single CPU). False when nothing changed (no recorder core, or not
+/// Linux).
+pub fn unpin_current_thread_from_recorder_core(what: &str) -> bool {
+    let Some((_, core)) = recorder_core() else { return false };
+    let Ok(online) = std::fs::read_to_string("/sys/devices/system/cpu/online") else { return false };
+    let rest: Vec<usize> = parse_cpu_list(&online).into_iter().filter(|c| !core.contains(c)).collect();
+    let ok = !rest.is_empty() && pin_current_thread(&rest);
+    if ok {
+        log::debug!("{what}: on every CPU but the recorder's core {core:?}");
+    }
+    ok
+}
+
+/// The CPUs the calling thread may run on.
+fn current_cpus() -> Option<Vec<usize>> {
+    #[cfg(unix)]
+    // SAFETY: plain cpu_set_t query of the calling thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        Some((0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect())
+    }
+    #[cfg(not(unix))]
+    None
+}
+
 /// Pin the calling thread to the fast cores: the P-cores of a hybrid
 /// processor, the largest-L3 complex of an asymmetric one
 /// (`RPS5E_PIN_RECORDER=0` disables). True when pinned.
@@ -158,6 +259,31 @@ pub fn pin_current_thread_to_fast_cores(what: &str) -> bool {
         return false;
     }
     let Some((cpus, why)) = fast_cpus() else { return false };
+    let ok = pin_current_thread(cpus);
+    if ok {
+        log::info!("{what}: pinned to the {why} CPUs {cpus:?}");
+    }
+    ok
+}
+
+/// Pin the calling thread to the fast cores without the recorder's
+/// physical core (the PM4 interpreter while a separate thread records,
+/// `RPS5E_GPU_RECORD_THREAD`: the recorder keeps its core). Falls back to
+/// [`pin_current_thread_to_fast_cores`] without a reserved core. True when
+/// pinned.
+pub fn pin_current_thread_to_fast_cores_except_recorder(what: &str) -> bool {
+    let Some((_, core)) = recorder_core() else { return pin_current_thread_to_fast_cores(what) };
+    let Some((cpus, why)) = fast_cpus() else { return false };
+    let rest: Vec<usize> = cpus.iter().copied().filter(|c| !core.contains(c)).collect();
+    let ok = !rest.is_empty() && pin_current_thread(&rest);
+    if ok {
+        log::info!("{what}: pinned to the {why} CPUs {rest:?} (the recorder's core {core:?} left out)");
+    }
+    ok
+}
+
+/// Restrict the calling thread to `cpus`.
+fn pin_current_thread(cpus: &[usize]) -> bool {
     #[cfg(windows)]
     // SAFETY: affinity of the calling thread.
     let ok = unsafe {
@@ -175,9 +301,6 @@ pub fn pin_current_thread_to_fast_cores(what: &str) -> bool {
         }
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
     };
-    if ok {
-        log::info!("{what}: pinned to the {why} CPUs {cpus:?}");
-    }
     ok
 }
 
@@ -199,6 +322,21 @@ mod tests {
         let even = [(32 << 20, vec![0, 1]), (32 << 20, vec![2, 3])];
         assert_eq!(largest_of(&even), None);
         assert_eq!(largest_of(&[]), None);
+    }
+
+    #[test]
+    fn the_recorder_takes_the_highest_core_of_the_fast_set() {
+        // 9950X3D: core k is CPUs k and k + 16; the fast set is CCD0.
+        let fast: Vec<usize> = (0..8).chain(16..24).collect();
+        let siblings: Vec<(usize, Vec<usize>)> = (0..32).map(|c| (c, vec![c % 16, c % 16 + 16])).collect();
+        assert_eq!(recorder_core_of(&fast, &siblings), Some((7, vec![7, 23])));
+        // Siblings numbered next to each other (0-1, 2-3, ...).
+        let fast: Vec<usize> = (0..8).collect();
+        let siblings: Vec<(usize, Vec<usize>)> = (0..8).map(|c| (c, vec![c & !1, c | 1])).collect();
+        assert_eq!(recorder_core_of(&fast, &siblings), Some((6, vec![6, 7])));
+        // No SMT.
+        assert_eq!(recorder_core_of(&[4, 5], &[(4, vec![4]), (5, vec![5])]), Some((5, vec![5])));
+        assert_eq!(recorder_core_of(&[], &[]), None);
     }
 
     #[test]
@@ -255,13 +393,15 @@ mod tests {
         let t = sysfs("x3d", &files);
         let ccd0: Vec<usize> = (0..8).chain(16..24).collect();
         assert_eq!(t.fast_cpus(), Some((ccd0, "large-cache")));
+        // Without sibling lists every CPU is its own core.
+        assert_eq!(t.recorder_core(), Some((23, vec![23])));
     }
 
     #[test]
     fn capacity_and_cache_combine() {
-        let t = Topology { hybrid_core: None, capacities: vec![(0, 1024), (1, 1024), (2, 512), (3, 512)], l3: vec![(32 << 20, vec![0, 2]), (16 << 20, vec![1, 3])] };
+        let t = Topology { hybrid_core: None, capacities: vec![(0, 1024), (1, 1024), (2, 512), (3, 512)], l3: vec![(32 << 20, vec![0, 2]), (16 << 20, vec![1, 3])], siblings: vec![] };
         assert_eq!(t.fast_cpus(), Some((vec![0], "performance large-cache")));
-        let t = Topology { hybrid_core: Some(vec![0, 1]), capacities: vec![], l3: vec![(32 << 20, vec![2, 3]), (16 << 20, vec![0, 1])] };
+        let t = Topology { hybrid_core: Some(vec![0, 1]), capacities: vec![], l3: vec![(32 << 20, vec![2, 3]), (16 << 20, vec![0, 1])], siblings: vec![] };
         assert_eq!(t.fast_cpus(), Some((vec![0, 1], "performance")));
     }
 }

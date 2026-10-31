@@ -391,3 +391,157 @@ fn dispatch_over_the_device_group_limit_is_split() {
     let missing: Vec<usize> = (0..groups as usize).filter(|&k| w[k * 64] != 1).take(8).collect();
     assert!(missing.is_empty(), "groups that did not run: {missing:?}");
 }
+
+/// An indirect dispatch with thread dimensions whose GPU-written record is
+/// already ordered (a barrier after its writer) runs its record kernel
+/// before its own barrier (`RPS5E_EARLY_LAUNCH`): one barrier orders the
+/// kernel's results, and the stores match the direct dispatch.
+#[test]
+#[ignore]
+fn thread_dims_early_launch_matches_the_direct_dispatch() {
+    let mut g = Guest::new(32 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(crate::shader::SpirvCompiler::for_device(&dev, g.mem));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    let cs = region_store_program(&mut g);
+    let copy = copy_program(&mut g);
+    let system = (1 << 7) | (1 << 8) | (1 << 9) | (2 << 11);
+    for threads in [[13u32, 5, 3], [27, 13, 7], [16, 8, 4]] {
+        let record = g.alloc(&asm::bytes(&REGION));
+        let src = g.alloc(&asm::bytes(&threads));
+        let out_indirect = g.alloc(&asm::bytes(&vec![POISON; REGION_WORDS]));
+        let out_direct = g.alloc(&asm::bytes(&vec![POISON; REGION_WORDS]));
+        let mut user = buffer_descriptor(src, 4, 3, 0x0101_6FAC).to_vec();
+        user.extend(buffer_descriptor(record, 4, 3, 0x0101_6FAC));
+        let writer = ResolvedDispatch {
+            packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() },
+            shader: stage(copy, &user),
+            rsrc3: 0,
+            threads: [3, 1, 1],
+            start: [0; 3],
+        };
+        let dispatch = |out: u64, indirect: bool| {
+            let mut shader = stage(cs, &buffer_descriptor(out, 4, REGION_WORDS as u32, 0x0101_6FAC));
+            shader.rsrc2 |= system;
+            let packet = if indirect {
+                DispatchPacket { indirect_address: record, dispatch_initiator: 0x21, ..DispatchPacket::default() }
+            } else {
+                DispatchPacket { groups: threads, dispatch_initiator: 0x21, ..DispatchPacket::default() }
+            };
+            ResolvedDispatch { packet, shader, rsrc3: 0, threads: GROUP, start: [0; 3] }
+        };
+        b.dispatch(&writer);
+        b.sched.full_barrier();
+        b.dispatch(&dispatch(out_indirect, true));
+        b.dispatch(&dispatch(out_direct, false));
+        let indirect = words_at(&mut b, g.mem, out_indirect, REGION_WORDS);
+        let direct = words_at(&mut b, g.mem, out_direct, REGION_WORDS);
+        assert!(direct == region_expected(threads), "{threads:?}: direct dispatch");
+        assert!(indirect == direct, "{threads:?}: indirect dispatch differs from the direct one");
+    }
+    let summary = b.pipelines.summary().unwrap_or_default();
+    assert!(summary.contains("cs-thread-dims=3gpu/3early"), "{summary}");
+    drop(b);
+    dev.wait_idle();
+}
+
+/// A dispatch the guest put right after another with nothing between them
+/// (`DispatchPacket::unsynced`) gets no compute barrier for what the first
+/// one wrote (the console runs both at once, `RPS5E_GUEST_COMPUTE_ORDER`);
+/// the next synchronised dispatch sees the run's results.
+#[test]
+#[ignore]
+fn unsynced_dispatches_are_not_ordered_after_their_run() {
+    let mut g = Guest::new(32 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(crate::shader::SpirvCompiler::for_device(&dev, g.mem));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    let copy = copy_program(&mut g);
+    let n = 64u32;
+    let values: Vec<u32> = (0..n).map(|i| 0x100 + i).collect();
+    let src = g.alloc(&asm::bytes(&values));
+    let mid = g.alloc(&asm::bytes(&vec![POISON; n as usize]));
+    let other = g.alloc(&asm::bytes(&vec![POISON; n as usize]));
+    let out = g.alloc(&asm::bytes(&vec![POISON; n as usize]));
+    let copy_dispatch = |from: u64, to: u64, unsynced: bool| {
+        let mut user = buffer_descriptor(from, 4, n, 0x0101_6FAC).to_vec();
+        user.extend(buffer_descriptor(to, 4, n, 0x0101_6FAC));
+        ResolvedDispatch {
+            packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, unsynced, ..DispatchPacket::default() },
+            shader: stage(copy, &user),
+            rsrc3: 0,
+            threads: [n, 1, 1],
+            start: [0; 3],
+        }
+    };
+    let barriers = |b: &Backend| b.sched.stats().compute_barriers;
+    // src -> mid, then (same run) mid -> other: no barrier between them.
+    b.dispatch(&copy_dispatch(src, mid, false));
+    let before = barriers(&b);
+    b.dispatch(&copy_dispatch(mid, other, true));
+    assert_eq!(barriers(&b), before, "a member of the run is not ordered after the run");
+    // After a synchronisation point: ordered after the run, reads `mid`.
+    b.dispatch(&copy_dispatch(mid, out, false));
+    assert_eq!(words_at(&mut b, g.mem, out, n as usize), values);
+    let summary = b.pipelines.summary().unwrap_or_default();
+    assert!(summary.contains("cs-unsynced=1 "), "{summary}");
+    drop(b);
+    dev.wait_idle();
+}
+
+/// A run of indirect dispatches with thread dimensions the guest put back
+/// to back (`DispatchPacket::unsynced`) has its record kernels recorded
+/// into a launch batch that runs before the run (`RPS5E_LAUNCH_BATCH`):
+/// every dispatch stores what the direct dispatch of its counts stores.
+#[test]
+#[ignore]
+fn launch_batch_runs_the_record_kernels_before_the_run() {
+    let mut g = Guest::new(32 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(crate::shader::SpirvCompiler::for_device(&dev, g.mem));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    let cs = region_store_program(&mut g);
+    let copy = copy_program(&mut g);
+    let system = (1 << 7) | (1 << 8) | (1 << 9) | (2 << 11);
+    let counts: [[u32; 3]; 4] = [[13, 5, 3], [27, 13, 7], [16, 8, 4], [1, 1, 1]];
+    // The records, written on the GPU (stale counts in guest memory).
+    let src = g.alloc(&asm::bytes(&counts.concat()));
+    let records = g.alloc(&asm::bytes(&[REGION; 4].concat()));
+    let mut user = buffer_descriptor(src, 4, 12, 0x0101_6FAC).to_vec();
+    user.extend(buffer_descriptor(records, 4, 12, 0x0101_6FAC));
+    b.dispatch(&ResolvedDispatch {
+        packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() },
+        shader: stage(copy, &user),
+        rsrc3: 0,
+        threads: [12, 1, 1],
+        start: [0; 3],
+    });
+    let outs: Vec<u64> = counts.iter().map(|_| g.alloc(&asm::bytes(&vec![POISON; REGION_WORDS]))).collect();
+    for (i, &out) in outs.iter().enumerate() {
+        let mut shader = stage(cs, &buffer_descriptor(out, 4, REGION_WORDS as u32, 0x0101_6FAC));
+        shader.rsrc2 |= system;
+        // The first one follows the records' writer after a partial flush.
+        let packet = DispatchPacket { indirect_address: records + 12 * i as u64, dispatch_initiator: 0x21, unsynced: i > 0, ..DispatchPacket::default() };
+        b.dispatch(&ResolvedDispatch { packet, shader, rsrc3: 0, threads: GROUP, start: [0; 3] });
+    }
+    for (i, &out) in outs.iter().enumerate() {
+        let got = words_at(&mut b, g.mem, out, REGION_WORDS);
+        assert!(got == region_expected(counts[i]), "dispatch {i} {:?}", counts[i]);
+    }
+    // (A barrier recorded between two of them, such as the full barriers
+    // around write-throughs, starts a new batch.)
+    let summary = b.pipelines.summary().unwrap_or_default();
+    let batched: u32 = summary.split("early/").nth(1).and_then(|r| r.split("batched").next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    assert!(batched >= 2, "the dispatches after the first one batched their kernels: {summary}");
+    drop(b);
+    dev.wait_idle();
+}

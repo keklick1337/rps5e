@@ -4,10 +4,11 @@
 
 //! libSceAcm (audio coprocessor DSP batches: FFT, panner, convolution reverb).
 //!
-//! No DSP job is executed. Job builders advance the batch buffer cursor by
-//! the job size and write nothing else, batch submissions complete
-//! immediately with a cleared error block and a fresh batch id, and waits
-//! succeed.
+//! No DSP job is executed. The notification and priority jobs are encoded
+//! as the console's library encodes them; the DSP job builders (FFT,
+//! panner, reverb) advance the batch buffer cursor by the job size and
+//! write nothing else. Batch submissions complete immediately with a
+//! cleared error block and a fresh batch id, and waits succeed.
 
 use super::Export;
 use crate::context::CpuContext;
@@ -16,6 +17,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const ERR_BAD_CONTEXT: HleResult = 0x8194_0002u32 as i32 as i64;
 const ERR_BAD_POINTER: HleResult = 0x8194_0006u32 as i32 as i64;
+/// The job does not fit between the batch cursor and the buffer size.
+const ERR_BATCH_FULL: HleResult = 0x8194_0009u32 as i32 as i64;
+/// A notification block that is not 128-byte aligned.
+const ERR_BAD_ALIGNMENT: HleResult = 0x8194_000Au32 as i32 as i64;
+/// Bytes of the notification block a notification job clears.
+const NOTIFICATION_BYTES: usize = 128;
 const ERR_MEMORY_FAULT: HleResult = 0x8002_000Eu32 as i32 as i64;
 const ACM_BATCH_ERROR_BYTES: usize = 32;
 
@@ -110,9 +117,61 @@ pub(crate) fn advance_batch_info(ctx: &CpuContext, bytes: u64) -> HleResult {
     0
 }
 
-fn cb_job_notification(ctx: &mut CpuContext) -> HleResult {
-    advance_batch_info(ctx, 32)
+/// Appends one job of `words` to the batch info {buffer, offset, size} at
+/// `info`: BATCH_FULL when `offset + len` passes `size`, otherwise the
+/// words are written at `buffer + offset` and the offset advances.
+fn append_job(ctx: &CpuContext, info: u64, words: &[u64]) -> HleResult {
+    let (Some(buffer), Some(offset), Some(size)) = (ctx.read_u64(info), ctx.read_u64(info + 8), ctx.read_u64(info + 16))
+    else {
+        return ERR_MEMORY_FAULT;
+    };
+    let end = offset.wrapping_add(8 * words.len() as u64);
+    if end > size {
+        return ERR_BATCH_FULL;
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if !ctx.write_bytes(buffer.wrapping_add(offset), &bytes) || !ctx.write_u64(info + 8, end) {
+        return ERR_MEMORY_FAULT;
+    }
+    0
 }
+
+/// sceAcmBatchJobNotification(batch, value, notification): a zero value,
+/// batch or block is BAD_POINTER, a block not aligned to 128 bytes
+/// BAD_ALIGNMENT. The 128-byte block is cleared and a 16-byte job (kind
+/// 0x0e, the value's low byte in byte 3, then the block address) appended.
+fn cb_job_notification(ctx: &mut CpuContext) -> HleResult {
+    let (info, value, block) = (ctx.rdi(), ctx.rsi() as u32, ctx.rdx());
+    if value == 0 || info == 0 || block == 0 {
+        return ERR_BAD_POINTER;
+    }
+    if block & 0x7F != 0 {
+        return ERR_BAD_ALIGNMENT;
+    }
+    let Some(offset) = ctx.read_u64(info + 8) else {
+        return ERR_MEMORY_FAULT;
+    };
+    match ctx.read_u64(info + 16) {
+        None => return ERR_MEMORY_FAULT,
+        Some(size) if offset.wrapping_add(16) > size => return ERR_BATCH_FULL,
+        Some(_) => {}
+    }
+    if !ctx.write_bytes(block, &[0u8; NOTIFICATION_BYTES]) {
+        return ERR_MEMORY_FAULT;
+    }
+    append_job(ctx, info, &[0x0E | ((value as u64 & 0xFF) << 24), block])
+}
+
+/// sceAcmBatchJobPriority(batch, priority): priorities 0..=3; an 8-byte
+/// job (kind 0x10, the priority in byte 1).
+fn cb_job_priority(ctx: &mut CpuContext) -> HleResult {
+    let (info, priority) = (ctx.rdi(), ctx.rsi() as u32);
+    if info == 0 || priority > 3 {
+        return ERR_BAD_POINTER;
+    }
+    append_job(ctx, info, &[0x10 | (priority as u64) << 8])
+}
+
 fn cb_conv_reverb(ctx: &mut CpuContext) -> HleResult {
     advance_batch_info(ctx, 1024)
 }
@@ -148,6 +207,7 @@ pub(crate) static EXPORTS: &[Export] = &[
     ("uqDIauipRbo", "sceAcmBatchProcess", LIB, cb_ok),
     ("RLN3gRlXJLE", "sceAcmBatchWait", LIB, cb_batch_wait),
     ("r7z5YQFZo+U", "sceAcmBatchJobNotification", LIB, cb_job_notification),
+    ("GTfJ64qFCPw", "sceAcmBatchJobPriority", LIB, cb_job_priority),
     ("u70oWo92SYQ", "sceAcm_ConvReverb_SharedInput", LIB, cb_conv_reverb_shared_input),
     ("9nLbWmRDpa8", "sceAcm_ConvReverb_SharedIr", LIB, cb_conv_reverb),
     ("KovqaFbmtsM", "sceAcm_FFT", LIB, cb_fft),
@@ -200,6 +260,56 @@ mod tests {
         ctx.set(CpuRegister::Rdi, 0);
         assert_eq!(cb_context_create(&mut ctx), ERR_BAD_POINTER);
         assert_eq!(cb_context_destroy(&mut ctx), ERR_BAD_CONTEXT);
+    }
+
+    /// The notification and priority jobs as the console's libSceAcm
+    /// encodes them: argument checks first, then room in the batch, then
+    /// the job words at the cursor.
+    #[test]
+    fn notification_and_priority_jobs() {
+        const BASE: u64 = 0x5CE0_7200_0000;
+        let base = BASE;
+        let vm = crate::sync::test_util::vm_arena(base);
+        let mut ctx = CpuContext::new(vm);
+        let (info, buf, block) = (base, base + 0x1000, base + 0x2000);
+        ctx.write_u64(info, buf);
+        ctx.write_u64(info + 8, 0);
+        ctx.write_u64(info + 16, 32);
+        ctx.write_bytes(block, &[0x5A; 160]);
+        ctx.set(CpuRegister::Rdi, info);
+        ctx.set(CpuRegister::Rsi, 0x1234);
+        ctx.set(CpuRegister::Rdx, block);
+        assert_eq!(cb_job_notification(&mut ctx), 0);
+        assert_eq!(ctx.read_u64(buf), Some(0x3400_000E));
+        assert_eq!(ctx.read_u64(buf + 8), Some(block));
+        assert_eq!(ctx.read_u64(info + 8), Some(16));
+        assert!(ctx.read_bytes(block, 128).unwrap().iter().all(|&b| b == 0));
+        assert_eq!(ctx.read_bytes(block + 128, 32).unwrap(), vec![0x5A; 32], "only 128 bytes are cleared");
+        // Errors leave the batch and the block as they are.
+        ctx.set(CpuRegister::Rdx, block + 0x40);
+        assert_eq!(cb_job_notification(&mut ctx), ERR_BAD_ALIGNMENT);
+        ctx.set(CpuRegister::Rsi, 0);
+        assert_eq!(cb_job_notification(&mut ctx), ERR_BAD_POINTER);
+        ctx.set(CpuRegister::Rsi, 1);
+        ctx.set(CpuRegister::Rdx, 0);
+        assert_eq!(cb_job_notification(&mut ctx), ERR_BAD_POINTER);
+        ctx.write_u64(info + 8, 24);
+        ctx.write_bytes(block, &[0x5A; 8]);
+        ctx.set(CpuRegister::Rdx, block);
+        assert_eq!(cb_job_notification(&mut ctx), ERR_BATCH_FULL);
+        assert_eq!(ctx.read_bytes(block, 8).unwrap(), vec![0x5A; 8]);
+        // Priority: an 8-byte job; 24 + 8 fits exactly.
+        ctx.set(CpuRegister::Rsi, 2);
+        assert_eq!(cb_job_priority(&mut ctx), 0);
+        assert_eq!(ctx.read_u64(buf + 24), Some(0x210));
+        assert_eq!(ctx.read_u64(info + 8), Some(32));
+        assert_eq!(cb_job_priority(&mut ctx), ERR_BATCH_FULL);
+        assert_eq!(ctx.read_u64(info + 8), Some(32));
+        ctx.set(CpuRegister::Rsi, 4);
+        assert_eq!(cb_job_priority(&mut ctx), ERR_BAD_POINTER);
+        ctx.set(CpuRegister::Rdi, 0);
+        ctx.set(CpuRegister::Rsi, 0);
+        assert_eq!(cb_job_priority(&mut ctx), ERR_BAD_POINTER);
     }
 
     /// A shared-input reverb job only advances the batch cursor: buffers

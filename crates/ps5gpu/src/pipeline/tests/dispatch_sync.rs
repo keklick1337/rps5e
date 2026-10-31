@@ -348,3 +348,59 @@ fn dispatch_sync_labels_next_to_gpu_results_are_written_on_the_gpu() {
     b.flush();
     b.sched.finish();
 }
+
+/// `out[tid] = in[tid] + s2`: `in` through the V# the program loads from
+/// the table at s0..s1 (`s_load_dwordx4 s[8:11]`), `out` through the V# in
+/// s4..s7.
+fn table_read_program(g: &mut Guest) -> u64 {
+    let load = buffer_load_dword(2, 1, 8);
+    let store = asm::buffer_store_dword(2, 1, 4);
+    g.program(&[0xF408_0000 | (8 << 6), 0x7D << 25, 0xBF8C_C07F, vop2(0x1A, 1, 0x82, 0), load[0], load[1], S_WAITCNT_0, vop2(0x25, 2, 2, 2), store[0], store[1], asm::S_ENDPGM])
+}
+
+/// A dispatch reading through a V# GPU work just wrote into its table: the
+/// first one waits for the word (the CPU binds the buffer); from then on
+/// the program reads through the V# in its registers and nothing waits
+/// (`RPS5E_DEVICE_READS`). Both read the right data.
+#[test]
+#[ignore]
+fn dispatch_sync_reads_through_a_gpu_written_vsharp_on_the_device() {
+    let mut g = Guest::new(16 << 20);
+    let mut rig = Rig::with_compiler(&g, |dev| Arc::new(crate::shader::SpirvCompiler::for_device(dev, g.mem)), None, None);
+    let (ad, tr) = (add_program(&mut g), table_read_program(&mut g));
+    let inputs: Vec<u64> = (0..2u32).map(|r| g.alloc(&asm::bytes(&(0..WORDS as u32).map(|i| r * 1000 + i).collect::<Vec<u32>>()))).collect();
+    let sources: Vec<u64> = inputs
+        .iter()
+        .map(|&i| {
+            let mut w = raw_buffer_descriptor(i, (WORDS * 4) as u32).to_vec();
+            w.resize(WORDS as usize, 0);
+            g.alloc(&asm::bytes(&w))
+        })
+        .collect();
+    let (table, outs) = (g.zeroed(4096), [g.zeroed(4096), g.zeroed(4096)]);
+    let frontend = |rig: &Rig| rig.provider.frontend.lock().unwrap_or_else(|e| e.into_inner()).stats.device_reads;
+    let mut waits = Vec::new();
+    for round in 0..2 {
+        // The GPU copies the V# of this round's input into the table.
+        let mut user = raw_buffer_descriptor(sources[round], (WORDS * 4) as u32).to_vec();
+        user.extend_from_slice(&raw_buffer_descriptor(table, (WORDS * 4) as u32));
+        user.push(0);
+        assert_eq!(rig.dispatch(&one_wave(ad, &user)), DrawOutcome::Recorded);
+        assert!(rig.buffers.has_gpu_dirty(table, 16), "the table holds GPU-written words");
+        let before = rig.buffers.stats();
+        let mut user = vec![table as u32, (table >> 32) as u32, 5, 0];
+        user.extend_from_slice(&raw_buffer_descriptor(outs[round], (WORDS * 4) as u32));
+        assert_eq!(rig.dispatch(&one_wave(tr, &user)), DrawOutcome::Recorded);
+        let after = rig.buffers.stats();
+        let n = |s: &crate::buffers::BufferStats| s.downloads + s.word_landings + s.written_through_waits;
+        waits.push(n(&after) - n(&before));
+    }
+    let mem = g.mem;
+    assert_eq!(words(&mut rig.buffers, &mut rig.sched, mem, outs[0]), expect(5), "the first read (bound) saw the first input");
+    assert_eq!(words(&mut rig.buffers, &mut rig.sched, mem, outs[1]), expect(1005), "the second read (device) saw the second input");
+    if super::frontend::device_reads_enabled() {
+        assert!(waits[0] > 0, "the first preparation waited for the table: {waits:?}");
+        assert_eq!(waits[1], 0, "the second one took the V# on the device: {waits:?}");
+        assert!(frontend(&rig) > 0);
+    }
+}

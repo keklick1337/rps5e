@@ -405,6 +405,90 @@ fn pipeline_compiled_on_workers_is_waited_for_by_default() {
     assert_eq!(px(&p, 32, 31, 31), [0, 255, 0, 255], "drawn by the first draw");
 }
 
+/// A missing pipeline is linked from stage libraries and draws at once;
+/// the monolithic build replaces it later. Both draw the same pixels.
+#[test]
+#[ignore]
+fn linked_pipeline_draws_then_gives_way_to_the_monolithic_one() {
+    let mut g = Guest::new(16 << 20);
+    let vs = g.program(&[asm::S_ENDPGM]);
+    let ps = solid_program(&mut g);
+    let verts = g.alloc(&floats(&[-1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0]));
+    let target = rgba8_target(g.zeroed(32 * 32 * 4), 32, 32);
+    let compiler = Arc::new(TestCompiler::new().with(vs, TestProgram::PassthroughVertex { inputs: 1 }).with(ps, TestProgram::SolidPixel));
+    let inputs = vec4_attrs(&[(verts, 48, 16, false)], &[(0, 0, 0)]);
+    let mut rig = Rig::new(&g, compiler, Some(inputs), None);
+    if !rig.dev.caps.graphics_pipeline_library {
+        eprintln!("skipped: no graphics pipeline libraries with fast linking");
+        return;
+    }
+    rig.provider.set_async_compile(true);
+    rig.provider.set_linking(true, true);
+    rig.provider.set_compile_wait(std::time::Duration::MAX);
+    let d = draw_into(target, stage(vs, &[]), stage(ps, &color_words([0.0, 1.0, 0.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    assert_eq!(rig.draw(&d), DrawOutcome::Recorded);
+    assert_eq!(px(&rig.pixels(&target), 32, 31, 31), [0, 255, 0, 255], "drawn with the linked pipeline");
+    let t = rig.provider.compile_times();
+    assert_eq!((t.library.count, t.interface.count, t.link.count), (2, 2, 1), "{t:?}");
+    assert_eq!(t.graphics.count, 0, "nothing built whole yet: {t:?}");
+    rig.provider.settle_rebuilds();
+    let t = rig.provider.compile_times();
+    assert_eq!(t.swaps, 1, "the monolithic build replaced the linked one: {t:?}");
+    let d2 = draw_into(target, stage(vs, &[]), stage(ps, &color_words([1.0, 0.0, 0.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    assert_eq!(rig.draw(&d2), DrawOutcome::Recorded);
+    assert_eq!(px(&rig.pixels(&target), 32, 31, 31), [255, 0, 0, 255], "drawn with the monolithic pipeline");
+    assert_eq!(rig.provider.compile_times().link.count, 1, "no second link");
+}
+
+/// By default a linked pipeline stays: nothing is built whole in this run.
+#[test]
+#[ignore]
+fn linked_pipeline_stays_without_rebuilds() {
+    let mut g = Guest::new(16 << 20);
+    let vs = g.program(&[asm::S_ENDPGM]);
+    let ps = solid_program(&mut g);
+    let verts = g.alloc(&floats(&[-1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0]));
+    let target = rgba8_target(g.zeroed(32 * 32 * 4), 32, 32);
+    let compiler = Arc::new(TestCompiler::new().with(vs, TestProgram::PassthroughVertex { inputs: 1 }).with(ps, TestProgram::SolidPixel));
+    let inputs = vec4_attrs(&[(verts, 48, 16, false)], &[(0, 0, 0)]);
+    let mut rig = Rig::new(&g, compiler, Some(inputs), None);
+    if !rig.dev.caps.graphics_pipeline_library {
+        eprintln!("skipped: no graphics pipeline libraries with fast linking");
+        return;
+    }
+    rig.provider.set_async_compile(true);
+    rig.provider.set_linking(true, false);
+    rig.provider.set_compile_wait(std::time::Duration::MAX);
+    let d = draw_into(target, stage(vs, &[]), stage(ps, &color_words([1.0, 1.0, 0.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    assert_eq!(rig.draw(&d), DrawOutcome::Recorded);
+    assert_eq!(px(&rig.pixels(&target), 32, 0, 0), [255, 255, 0, 255]);
+    rig.provider.settle_rebuilds();
+    let t = rig.provider.compile_times();
+    assert_eq!((t.link.count, t.swaps, t.graphics.count, t.optimised.count), (1, 0, 0, 0), "{t:?}");
+}
+
+/// With linking off every missing pipeline is built whole.
+#[test]
+#[ignore]
+fn linking_off_builds_pipelines_whole() {
+    let mut g = Guest::new(16 << 20);
+    let vs = g.program(&[asm::S_ENDPGM]);
+    let ps = solid_program(&mut g);
+    let verts = g.alloc(&floats(&[-1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0]));
+    let target = rgba8_target(g.zeroed(32 * 32 * 4), 32, 32);
+    let compiler = Arc::new(TestCompiler::new().with(vs, TestProgram::PassthroughVertex { inputs: 1 }).with(ps, TestProgram::SolidPixel));
+    let inputs = vec4_attrs(&[(verts, 48, 16, false)], &[(0, 0, 0)]);
+    let mut rig = Rig::new(&g, compiler, Some(inputs), None);
+    rig.provider.set_async_compile(true);
+    rig.provider.set_linking(false, false);
+    rig.provider.set_compile_wait(std::time::Duration::MAX);
+    let d = draw_into(target, stage(vs, &[]), stage(ps, &color_words([0.0, 0.0, 1.0, 1.0])), primitive::TRI_LIST, auto(3, 1), None);
+    assert_eq!(rig.draw(&d), DrawOutcome::Recorded);
+    assert_eq!(px(&rig.pixels(&target), 32, 31, 31), [0, 0, 255, 255]);
+    let t = rig.provider.compile_times();
+    assert_eq!((t.library.count, t.link.count, t.graphics.count), (0, 0, 1), "{t:?}");
+}
+
 #[test]
 #[ignore]
 fn fast_pipeline_is_used_then_replaced_by_its_optimised_build() {

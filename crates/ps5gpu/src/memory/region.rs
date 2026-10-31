@@ -174,6 +174,34 @@ pub const HOT_UPLOADS: u8 = 4;
 /// Uses finding a hot page unchanged after which it is watched again.
 pub const HOT_IDLE_USES: u8 = 64;
 
+/// `RPS5E_FAULT_RUNS=1` (opt-in; A/B name `RPS5E_FAULT_RUNS` in scope
+/// `release`): a CPU write fault on a page the CPU has rewritten
+/// between uploads at least [`HOT_UPLOADS`] times makes the run of such
+/// pages around it CPU-dirty and writable in one protection change
+/// ([`RegionState::fault_run`]), so a constant or vertex ring the guest
+/// rewrites every frame costs one fault per run instead of one per page,
+/// in whatever order its pages are written. Exact: an opened page is
+/// CPU-dirty, so its next use uploads it and watches it again, as for a
+/// page the guest wrote; one the guest did not write costs one upload of
+/// unchanged bytes. GPU-dirty pages end a run. Opt-in: measured slower in
+/// SILENT HILL 2 and GTA V (write faults -40..-75 %, but the per-draw
+/// memos over opened pages the guest did not write miss ~10x as often,
+/// and the command thread pays more than the faults saved).
+pub fn fault_runs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::backend::ab::safe() && std::env::var("RPS5E_FAULT_RUNS").is_ok_and(|v| v == "1"))
+}
+
+/// Pages a fault run spans at most (the faulting page included).
+pub const FAULT_RUN_PAGES: usize = 32;
+
+/// Diagnostics: write faults on pages rewritten at least [`HOT_UPLOADS`]
+/// times (the faults a run could have saved), faults that opened a run,
+/// and pages the runs opened.
+pub static HEATED_WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
+pub static FAULT_RUNS: AtomicU64 = AtomicU64::new(0);
+pub static FAULT_RUN_OPENED: AtomicU64 = AtomicU64::new(0);
+
 /// Diagnostics: hot pages now, and hot page uses that compared / found
 /// changed bytes.
 pub static HOT_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -193,8 +221,12 @@ pub struct RegionState {
     readable: PageMask,
     /// Hot pages (always CPU-dirty and writable).
     hot: PageMask,
-    /// Uploads of CPU-written contents per page (saturating).
+    /// Uploads of CPU-written contents per page (saturating). A GPU write
+    /// of the page resets it.
     heat: [u8; PAGES_PER_BLOCK],
+    /// Pages a fault run made CPU-dirty that were not uploaded since: their
+    /// next upload does not count as a rewrite.
+    opened: PageMask,
     /// Consecutive uses that found a hot page unchanged.
     idle: [u8; PAGES_PER_BLOCK],
     shadows: std::collections::HashMap<u16, Shadow>,
@@ -262,6 +294,7 @@ impl TrackedRegion {
                 readable: PageMask::full(),
                 hot: PageMask::empty(),
                 heat: [0; PAGES_PER_BLOCK],
+                opened: PageMask::empty(),
                 idle: [0; PAGES_PER_BLOCK],
                 shadows: std::collections::HashMap::new(),
                 checked: PageMask::empty(),
@@ -320,6 +353,45 @@ impl RegionState {
         self.change_state(ctx, WriteOrigin::Cpu, true, addr, size)
     }
 
+    /// The range a CPU write fault at `[addr, +size)` (one block) makes
+    /// CPU-dirty with [`fault_runs_enabled`]: the range itself, grown over
+    /// the following pages the CPU rewrote between uploads at least
+    /// [`HOT_UPLOADS`] times that are not GPU-dirty, up to
+    /// [`FAULT_RUN_PAGES`] pages, when the faulting page is such a page.
+    /// Only forward: the pages before it in a ring were written and
+    /// uploaded already in this pass, and each opened page that is not
+    /// written makes the per-draw memos over it miss.
+    /// Allocation-free (fault handler). The pages it adds that were clean
+    /// are remembered as opened.
+    pub fn fault_run(&mut self, addr: u64, size: u64) -> (u64, u64) {
+        let (s, e) = self.pages(addr, size);
+        if s >= e {
+            return (addr, size);
+        }
+        let heated = |st: &Self, p: usize| st.heat[p] >= HOT_UPLOADS && !st.gpu_dirty.get(p);
+        if self.heat[s] < HOT_UPLOADS {
+            return (addr, size);
+        }
+        HEATED_WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
+        let (rs, mut re) = (s, e);
+        while re < PAGES_PER_BLOCK && re - rs < FAULT_RUN_PAGES && heated(self, re) {
+            re += 1;
+        }
+        if (rs, re) == (s, e) {
+            return (addr, size);
+        }
+        let mut added = PageMask::empty();
+        added.set_range(rs, s);
+        added.set_range(e, re);
+        let added = added.and(&self.cpu_dirty.not());
+        if added.any() {
+            FAULT_RUNS.fetch_add(1, Ordering::Relaxed);
+            FAULT_RUN_OPENED.fetch_add(added.count() as u64, Ordering::Relaxed);
+            self.opened = self.opened.or(&added);
+        }
+        (self.base + rs as u64 * PAGE_BYTES, (re - rs) as u64 * PAGE_BYTES)
+    }
+
     /// Set or clear `side`'s dirty bits over the range and update the page
     /// protection. Pages dirty on the other side are left alone (counted in
     /// [`STATE_CONFLICTS`]). Returns false when the fault-path protection
@@ -340,6 +412,9 @@ impl RegionState {
             }
         }
         if side == WriteOrigin::Gpu {
+            if enable {
+                self.cool_written(&range);
+            }
             // New GPU contents (or none): earlier copies do not describe them.
             self.clear_landing(s, e);
             // Written by the GPU now, or holding its contents in guest
@@ -389,9 +464,19 @@ impl RegionState {
         }
         self.clear_landing(s, e);
         self.bump(&range);
+        self.cool_written(&range);
         self.gpu_dirty = self.gpu_dirty.or(&range);
         self.read_through = self.read_through.and(&range.not()).or(&keep);
         self.update_gpu_protection(ctx)
+    }
+
+    /// GPU-written pages are not CPU rings: their rewrite count restarts
+    /// (hot pages cool through [`Self::cool`]).
+    fn cool_written(&mut self, range: &PageMask) {
+        for (rs, re) in range.and(&self.hot.not()).runs() {
+            self.heat[rs..re].fill(0);
+        }
+        self.opened = self.opened.and(&range.not());
     }
 
     fn clear_landing(&mut self, s: usize, e: usize) {
@@ -553,10 +638,17 @@ impl RegionState {
             }
         }
         let cold = dirty.and(&hot.not());
+        // A page a fault run opened was not necessarily rewritten: its
+        // upload leaves its count alone.
+        let opened = cold.and(&self.opened);
+        self.opened = self.opened.and(&dirty.not());
         let mut newly_hot = PageMask::empty();
         if cold.any() {
             for (rs, re) in cold.runs() {
                 for i in rs..re {
+                    if opened.get(i) {
+                        continue;
+                    }
                     let h = self.heat[i].saturating_add(1);
                     self.heat[i] = h;
                     if h >= HOT_UPLOADS {

@@ -1357,10 +1357,11 @@ fn compare_emulated(e: &mut Emitter, image: Word, b: &Binding, coord: Word, dref
     let height = if line { e.ci(1) } else { e.extract(ti, size, 1) };
     let layer = if layered {
         let layers = e.extract(ti, size, spatial_n);
+        // The layer is the slice coordinate rounded half to even, as the
+        // host sampler selects it: floor(z + 0.5) picks layer 1 for
+        // 0.49999997 (the sum rounds to 1.0) and rounds exact halves up.
         let z = e.extract(tf, coord, spatial_n);
-        let half = e.cf(0.5);
-        let zh = e.ins(S::FAdd, tf, &[z, half]);
-        let zf = e.gl(tf, GLOp::Floor, &[zh]);
+        let zf = e.gl(tf, GLOp::RoundEven, &[z]);
         let zi = e.ins(S::ConvertFToS, ti, &[zf]);
         let one = e.ci(1);
         let last = e.ins(S::ISub, ti, &[layers, one]);
@@ -1435,7 +1436,8 @@ fn compare_emulated(e: &mut Emitter, image: Word, b: &Binding, coord: Word, dref
             2 => S::FOrdEqual,
             3 => S::FOrdLessThanEqual,
             4 => S::FOrdGreaterThan,
-            5 => S::FOrdNotEqual,
+            // NOT_EQUAL passes when either side is NaN (IEEE `!=`).
+            5 => S::FUnordNotEqual,
             6 => S::FOrdGreaterThanEqual,
             _ => return one_f,
         };

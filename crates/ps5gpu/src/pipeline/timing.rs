@@ -77,12 +77,18 @@ pub struct CompileTimes {
     pub swaps: u64,
     /// The command thread blocked on a module or pipeline.
     pub waits: Times,
+    /// Graphics pipeline libraries with shader code (pre-rasterization,
+    /// fragment), interface libraries, and the fast links of pipelines
+    /// from them (`RPS5E_GPL`).
+    pub library: Times,
+    pub interface: Times,
+    pub link: Times,
 }
 
 impl CompileTimes {
     pub fn format(&self) -> String {
         format!(
-            "create=[translate {} module {} gfx {} cs {} fast {} opt {} probe-hits {} swaps {} waits {}]",
+            "create=[translate {} module {} gfx {} cs {} fast {} opt {} probe-hits {} swaps {} waits {} lib {} iface {} link {}]",
             self.translate.format(),
             self.module.format(),
             self.graphics.format(),
@@ -91,7 +97,10 @@ impl CompileTimes {
             self.optimised.format(),
             self.probe_hits,
             self.swaps,
-            self.waits.format()
+            self.waits.format(),
+            self.library.format(),
+            self.interface.format(),
+            self.link.format()
         )
     }
 }

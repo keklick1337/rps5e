@@ -100,6 +100,10 @@ fn pieces(addr: u64, size: u64) -> impl Iterator<Item = (usize, u64, u64)> {
 
 impl GuestPageTracker {
     pub fn new(pages: Arc<PageGuard>) -> Self {
+        // Read the switches the fault handler asks outside of it.
+        if super::region::fault_runs_enabled() {
+            crate::backend::ab::release_fast("RPS5E_FAULT_RUNS");
+        }
         Self {
             pages,
             dirty_log: DirtyLog::new(),
@@ -454,8 +458,20 @@ impl GuestPageTracker {
             let s = unsafe { r.state() };
             if s.is_modified(WriteOrigin::Gpu, off, bytes) {
                 flush = true;
-            } else if !s.mark_cpu_write(&ctx, r.base + off, bytes) {
+                continue;
+            }
+            let (run, run_bytes) = if fault && super::region::fault_runs_enabled() && crate::backend::ab::release_fast("RPS5E_FAULT_RUNS") {
+                s.fault_run(r.base + off, bytes)
+            } else {
+                (r.base + off, bytes)
+            };
+            if !s.mark_cpu_write(&ctx, run, run_bytes) {
                 return None;
+            }
+            if run_bytes != bytes {
+                // The opened pages may change without a fault from now on.
+                self.dirty_log.push(run, run_bytes);
+                super::note_fault_run(run, run_bytes);
             }
         }
         if tracked && !flush {

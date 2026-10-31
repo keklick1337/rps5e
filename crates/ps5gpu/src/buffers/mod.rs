@@ -23,6 +23,7 @@
 //! address of the buffer byte that mirrors it (0 when unmapped); shaders
 //! translate guest pointers through it.
 
+pub mod async_copy;
 pub mod guest;
 mod through;
 mod written_words;
@@ -103,7 +104,31 @@ enum HostView {
     /// The import and the backing-alias pointer it imports (the guest
     /// range's bytes when it was made).
     Imported(Buffer, u64),
+    /// A slice of a guest-memory chunk import ([`guest::GuestImports`]):
+    /// its buffer, the offset of the buffer's first byte in it, and the
+    /// backing-alias pointer the slice stands for.
+    Chunk(vk::Buffer, u64, u64),
     Unavailable,
+}
+
+/// `RPS5E_CHUNK_HOST_VIEWS=0`: every mirror whose GPU results are copied
+/// into guest memory imports its own guest range. By default a mirror
+/// whose range lies in one chunk the guest-memory import table already
+/// imported (unranged reads, `RPS5E_BDA`) copies into that import: no
+/// import (pinning pages) per mirror and none to release when the mirror
+/// goes (mirrors come and go by the hundred per frame in GTA V).
+fn chunk_host_views_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_CHUNK_HOST_VIEWS")) && crate::backend::ab::release_fast("chunk-host-views")
+}
+
+/// Where a mirror's bytes go in guest memory: the import buffer and the
+/// offset there of the mirror's first byte (`g - addr + base` for guest
+/// address `g`).
+#[derive(Clone, Copy)]
+struct HostDst {
+    buffer: vk::Buffer,
+    base: u64,
 }
 
 impl GpuBuffer {
@@ -165,6 +190,8 @@ pub struct BufferStats {
     /// Ranges copied out to guest memory to release their mirrors
     /// ([`BufferCache::settle`]), and buffers / bytes collected.
     pub settled: u64,
+    /// Mirrors whose guest-memory copies go into a chunk import.
+    pub chunk_host_views: u64,
     pub settled_bytes: u64,
     pub collected_bytes: u64,
     /// Buffers released by memory-pressure collections.
@@ -251,6 +278,10 @@ pub struct BufferCache {
     /// GPU-written ranges to write through at the next submit (or CPU
     /// access), after the work writing them.
     pending_through: Vec<(u64, u64)>,
+    /// A command-processor copy, fill or write is obtaining its
+    /// destination: it is written through right after the operation, so
+    /// its pages stay readable whatever `RPS5E_READ_THROUGHS` decides.
+    cp_write: bool,
     /// Write-throughs recorded since the last publish point, as (start,
     /// end, tick): their read-through pages show the guest the bytes of an
     /// earlier GPU write until the copy lands ([`Self::publish_point`]).
@@ -530,6 +561,28 @@ const READBACK_BYTES_MAX: u64 = 64 << 20;
 /// ones only from CPU accesses ([`readback_any_size_enabled`]).
 const READBACK_SMALL_PAGES: u64 = 16;
 
+/// Written ranges up to this size stay written through whole with
+/// `RPS5E_READ_THROUGHS` (GTA V: copying every small record out keeps the
+/// CPU's reads of them from faulting; the ranges this skips are the large
+/// vertex and BVH buffers its refit writes).
+const READ_THROUGHS_MIN_BYTES: u64 = 16 << 10;
+
+/// `RPS5E_READ_THROUGHS=1` (opt-in): by default every GPU-written range
+/// of up to 1 MiB is copied out to guest memory after the work writing it
+/// (the CPU may poll it). With it, of such a range over [`READ_THROUGHS_MIN_BYTES`], only
+/// the pages the CPU read back (or faulted on) before are, as for larger
+/// ranges: the other pages stay GPU-dirty and protected, and the first CPU
+/// access downloads them and adds them to the read-back set. Smaller
+/// ranges (job records, counters, descriptor words the CPU polls) and
+/// ranges whose pages cannot be watched are always written through. A/B
+/// scope release `read-throughs`. Opt-in: GTA V's GPU time drops ~10 %
+/// with it, but ASTRO BOT stalls for 1-3 s several times a run (its CPU
+/// reads of the skipped pages fault and wait).
+pub(crate) fn read_throughs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::backend::ab::safe() && std::env::var("RPS5E_READ_THROUGHS").is_ok_and(|v| v == "1")) && crate::backend::ab::release_fast("read-throughs")
+}
+
 /// `RPS5E_READBACK_ANY_SIZE=0`: only read-back runs of up to 16 pages are
 /// remembered, so a large GPU-written range the CPU copies out every frame
 /// faults (and waits for the GPU) again every frame. Otherwise every run a
@@ -570,6 +623,21 @@ fn known_fills_enabled() -> bool {
 fn written_words_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_WRITTEN_WORDS")) && crate::backend::ab::release_fast("RPS5E_WRITTEN_WORDS")
+}
+
+/// `RPS5E_WORD_LANDED_ALONE=0`: a descriptor word whose last GPU write
+/// landed with a direct write-through is read after that write-through
+/// only while its page's write-through spans are still remembered; when
+/// they were dropped (GTA V records ~3000 write-throughs per frame, the
+/// list keeps 1024) the page is downloaded again, a submit and a GPU wait
+/// for every such word. On, the exact write record decides alone: every
+/// GPU write of a buffer range is recorded there before its pages turn
+/// GPU-dirty, so a word covered by landed ranges only is in guest memory
+/// once the newest of their ticks completed. A/B scope `release`
+/// (`word-landed-alone`).
+fn word_landed_alone_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_WORD_LANDED_ALONE")) && crate::backend::ab::release_fast("word-landed-alone")
 }
 
 /// `RPS5E_DESC_WINDOW_TICKS=0`: a descriptor read downloads the whole
@@ -696,6 +764,7 @@ impl BufferCache {
             known_fills: BTreeMap::new(),
             last_through_tick: 0,
             pending_through: Vec::new(),
+            cp_write: false,
             unpublished_through: Vec::new(),
             readback: Default::default(),
             settling: Vec::new(),
@@ -911,6 +980,9 @@ impl BufferCache {
         let fresh = created >= tick;
         let touched = &self.touched;
         let in_order = std::cell::Cell::new(false);
+        // Copies from the backing alias into coherent staging may run on
+        // the upload helpers (see `async_copy`).
+        let helpers = async_copy::enabled() && self.staging.buffer.coherent && !sched.is_slice() && !crate::capture::active();
         let staging = &mut self.staging;
         let stats = &mut self.stats;
         let read = |page: u64| memory.backing_ptr(page, crate::memory::PAGE_BYTES).map(|p| p as *const u8);
@@ -959,7 +1031,18 @@ impl BufferCache {
                                 }
                             }
                         };
-                        if !memory.read_committed(src, staging.bytes(off, chunk)) {
+                        let queued = helpers && chunk >= async_copy::MIN_BYTES && {
+                            match memory.backing_ptr(src, chunk) {
+                                Some(p) => {
+                                    // SAFETY: the alias stays mapped; the ring region
+                                    // belongs to the open tick, submitted only after a drain.
+                                    unsafe { async_copy::queue(p, staging.bytes(off, chunk).as_mut_ptr(), chunk as usize) };
+                                    true
+                                }
+                                None => false,
+                            }
+                        };
+                        if !queued && !memory.read_committed(src, staging.bytes(off, chunk)) {
                             return false;
                         }
                         staging.buffer.flush(off, chunk);
@@ -1141,7 +1224,10 @@ impl BufferCache {
         // Stages reading through the import table get larger GPU-written
         // ranges written through when they read them (`bda_make_current`);
         // with residency they read the mirror, except unwatchable ranges.
-        let through_whole = written && (size <= WRITE_THROUGH_MAX_BYTES || (self.guest.is_some() && self.residency && !self.memory.is_watchable(addr, size)));
+        // With `RPS5E_READ_THROUGHS` a small watchable range over 16 KiB is
+        // treated as a large one: only its pages the CPU read back before.
+        let small = size <= WRITE_THROUGH_MAX_BYTES && !(size > READ_THROUGHS_MIN_BYTES && read_throughs_enabled() && !self.cp_write && self.memory.is_watchable(addr, size));
+        let through_whole = written && (small || (self.guest.is_some() && self.residency && !self.memory.is_watchable(addr, size)));
         let first_page = addr & !(page - 1);
         let hot: Vec<(u64, u64)> = if written && !through_whole { self.readback.clipped(first_page, addr + size - first_page).collect() } else { Vec::new() };
         let can_through = written && (through_whole || !hot.is_empty()) && (self.guest.is_some() || (self.zero_copy && self.host_view(sched, key).is_some()));
@@ -1309,7 +1395,10 @@ impl BufferCache {
         if size == 0 || (src < dst + size && dst < src + size) {
             return Ok(false);
         }
-        let (d, s) = self.obtain_pair(sched, (dst, size, true), (src, size, false))?;
+        self.cp_write = true;
+        let pair = self.obtain_pair(sched, (dst, size, true), (src, size, false));
+        self.cp_write = false;
+        let (d, s) = pair?;
         sched.full_barrier();
         let region = vk::BufferCopy { src_offset: s.offset, dst_offset: d.offset, size };
         let cb = sched.cmd();
@@ -1334,7 +1423,10 @@ impl BufferCache {
         if size == 0 || dst % 4 != 0 || size % 4 != 0 {
             return Ok(false);
         }
-        let d = self.obtain(sched, dst, size, true)?;
+        self.cp_write = true;
+        let d = self.obtain(sched, dst, size, true);
+        self.cp_write = false;
+        let d = d?;
         sched.full_barrier();
         let cb = sched.cmd();
         // SAFETY: recording buffer; offset and size are multiples of 4.
@@ -1392,7 +1484,10 @@ impl BufferCache {
         if size == 0 || size > 65536 || dst % 4 != 0 || size % 4 != 0 {
             return Ok(false);
         }
-        let d = self.obtain(sched, dst, size, true)?;
+        self.cp_write = true;
+        let d = self.obtain(sched, dst, size, true);
+        self.cp_write = false;
+        let d = d?;
         sched.full_barrier();
         let cb = sched.cmd();
         // SAFETY: recording buffer; aligned, at most 64 KiB.
@@ -1554,7 +1649,8 @@ impl BufferCache {
         };
         let (key, host) = host;
         let b = &self.buffers[&key];
-        let region = vk::BufferCopy { src_offset: start - b.addr, dst_offset: start - b.addr, size: end - start };
+        let region = vk::BufferCopy { src_offset: start - b.addr, dst_offset: start - b.addr + host.base, size: end - start };
+        let host = host.buffer;
         if crate::scheduler::hazard::range_barriers_enabled() {
             // The copy only reads the mirror (nothing on the GPU reads the
             // import): it waits for the compute writes of the range, later
@@ -1645,6 +1741,14 @@ impl BufferCache {
     /// recorded meanwhile that writes the pages again cancels their copies
     /// (the call records new ones). Pages stay protected until done.
     pub fn download_async(&mut self, sched: &mut Scheduler, addr: u64, size: u64) -> DownloadStep {
+        self.download_async_as(sched, addr, size, true)
+    }
+
+    /// [`Self::download_async`]; `cpu`: the CPU itself reads the pages
+    /// (remembered as read back at any size with
+    /// `RPS5E_READBACK_ANY_SIZE`), false: on behalf of an image read-back
+    /// ([`Self::download`]'s bookkeeping).
+    pub fn download_async_as(&mut self, sched: &mut Scheduler, addr: u64, size: u64, cpu: bool) -> DownloadStep {
         let mut runs: Vec<(u64, u64)> = Vec::new();
         self.tracker.for_each_download_range(addr, size, false, &mut |a, n| runs.push((a, n)));
         if runs.is_empty() {
@@ -1653,7 +1757,7 @@ impl BufferCache {
         crate::slice_shadow::hole(crate::slice_shadow::Hole::Download);
         crate::slice_shadow::changed(addr, size);
         let t0 = std::time::Instant::now();
-        self.remember_readback(&runs, true);
+        self.remember_readback(&runs, cpu);
         self.flush_write_through(sched);
         let done = sched.timeline.refresh();
         let (mut wait, mut ok) = (0u64, true);
@@ -1699,8 +1803,8 @@ impl BufferCache {
 
     fn record_download_timed(&mut self, sched: &mut Scheduler, runs: &[(u64, u64)]) -> Option<u64> {
         let page = crate::memory::PAGE_BYTES;
-        // (guest, size, buffer key, direct)
-        let mut pieces: Vec<(u64, u64, u64, bool)> = Vec::new();
+        // (guest, size, buffer key, direct destination)
+        let mut pieces: Vec<(u64, u64, u64, Option<HostDst>)> = Vec::new();
         let mut staged_bytes = 0u64;
         for &(a, n) in runs {
             let mut cur = a;
@@ -1713,8 +1817,8 @@ impl BufferCache {
                     continue;
                 }
                 let run_end = (a + n).min(b.addr + b.size);
-                let direct = self.host_view(sched, key).is_some();
-                if !direct {
+                let direct = self.host_view(sched, key);
+                if direct.is_none() {
                     staged_bytes += run_end - cur;
                 }
                 pieces.push((cur, run_end - cur, key, direct));
@@ -1738,12 +1842,12 @@ impl BufferCache {
             // Only the pages still GPU-dirty, landing with this copy (or,
             // staged, when the back-end resolves the span).
             let mut claimed: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
-            self.tracker.claim_landing(piece, len, if direct { tick } else { 0 }, &mut |a, n| claimed.push((a, n)));
+            self.tracker.claim_landing(piece, len, if direct.is_some() { tick } else { 0 }, &mut |a, n| claimed.push((a, n)));
             for (g, n) in claimed {
                 let b = &self.buffers[&key];
                 let (src, base) = (b.buf.buffer, b.addr);
-                let (dst, dst_offset, staged) = match (&b.host, &staging) {
-                    (HostView::Imported(h, _), _) if direct => (h.buffer, g - base, None),
+                let (dst, dst_offset, staged) = match (direct, &staging) {
+                    (Some(h), _) => (h.buffer, g - base + h.base, None),
                     (_, Some(s)) => {
                         let o = off;
                         off += n;
@@ -1754,8 +1858,8 @@ impl BufferCache {
                 let region = vk::BufferCopy { src_offset: g - base, dst_offset, size: n };
                 // SAFETY: recording buffer; source, import and staging buffer stay alive until the tick completes.
                 unsafe { self.dev.device.cmd_copy_buffer(sched.cmd(), src, dst, &[region]) };
-                crate::memory::history::note(if direct { crate::memory::history::Event::DownloadDirect } else { crate::memory::history::Event::DownloadStaged }, g, n, tick);
-                if direct {
+                crate::memory::history::note(if direct.is_some() { crate::memory::history::Event::DownloadDirect } else { crate::memory::history::Event::DownloadStaged }, g, n, tick);
+                if direct.is_some() {
                     self.stats.direct_downloads += 1;
                 }
                 self.written_through.push(ThroughSpan { start: g, end: g + n, tick, staged });
@@ -1763,7 +1867,8 @@ impl BufferCache {
         }
         host_read_barrier(&self.dev, sched);
         if let Some(s) = staging {
-            sched.retire(s);
+            // Back to the download pool as soon as the copies completed.
+            sched.retire_local(s);
         }
         Some(sched.flush())
     }
@@ -1826,8 +1931,9 @@ impl BufferCache {
         if written_words_enabled() {
             // The word itself landed with an older write-through than its
             // page's newest: wait for that one only, and leave the page.
-            if let (Some(page_tick), Some(word_tick)) = (self.written_through_tick(first, page), self.written_words.landed(addr & !3, 4)) {
-                if word_tick <= page_tick {
+            if let Some(word_tick) = self.written_words.landed(addr & !3, 4) {
+                let page_tick = self.written_through_tick(first, page);
+                if page_tick.map_or(word_landed_alone_enabled(), |p| word_tick <= p) {
                     let t0 = std::time::Instant::now();
                     sched.wait(word_tick);
                     self.stats.word_landings += 1;
@@ -1864,6 +1970,25 @@ impl BufferCache {
             }
         }
         ok
+    }
+
+    /// The guest memory the cache mirrors.
+    pub fn memory(&self) -> &'static GuestGpuMemory {
+        self.memory
+    }
+
+    /// Diagnostics (`RPS5E_WORD_WAIT_LOG`): what the exact write record
+    /// and the page's write-throughs say about the word at `addr`.
+    pub fn describe_word(&self, addr: u64, current: u64) -> String {
+        let page = crate::memory::PAGE_BYTES;
+        let first = addr & !(page - 1);
+        let ranges: Vec<String> = self.written_words.describe(first, first + page);
+        format!(
+            "word {:?} page-through {:?} now {current} ranges [{}]",
+            self.written_words.landed(addr & !3, 4),
+            self.written_through_tick(first, page),
+            ranges.join(" ")
+        )
     }
 
     /// The tick after which guest memory holds the GPU data of every page
@@ -1915,8 +2040,26 @@ impl BufferCache {
     /// backing alias of the range, when it is one contiguous memfd range,
     /// imported with VK_EXT_external_memory_host. GPU copies into it land
     /// in guest memory without a staging copy.
-    fn host_view(&mut self, sched: &mut Scheduler, key: u64) -> Option<vk::Buffer> {
+    ///
+    /// None while a frame capture records: GPU copies into guest memory
+    /// would change pages behind the capture's back (it learns of GPU
+    /// results the back-end writes on the CPU, not of copies the GPU makes
+    /// into the import), and the next read of such a page would record the
+    /// GPU's bytes as a CPU write. The replay then wrote this run's GPU
+    /// results over its own, which differ wherever GPU work orders atomics
+    /// differently (GTA V's BVH build: a parent walk looped forever).
+    /// Downloads are staged and nothing is written through meanwhile.
+    fn host_view(&mut self, sched: &mut Scheduler, key: u64) -> Option<HostDst> {
+        if crate::capture::recording(self.memory) {
+            return None;
+        }
         let b = self.buffers.get_mut(&key)?;
+        if let HostView::Chunk(_, _, ptr) = b.host {
+            // The range may map other backing bytes by now: look again.
+            if self.memory.backing_ptr(b.addr, b.size).map(|p| p as u64) != Some(ptr) {
+                b.host = HostView::Unknown;
+            }
+        }
         if let HostView::Imported(_, ptr) = b.host {
             // The guest range may map other backing bytes since the import
             // was made (a view replaced in place): copies into the import
@@ -1933,23 +2076,41 @@ impl BufferCache {
         }
         if let HostView::Unknown = b.host {
             b.host = HostView::Unavailable;
-            if self.zero_copy {
-                if let Some(ptr) = self.memory.backing_ptr(b.addr, b.size) {
-                    // SAFETY: the backing alias stays mapped for the whole
-                    // process; the import is retired with the buffer.
-                    match unsafe { Buffer::import_host(&self.dev, ptr, b.size, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC) } {
-                        Ok(h) if h.coherent => {
-                            self.stats.host_imports += 1;
-                            b.host = HostView::Imported(h, ptr as u64);
-                        }
-                        Ok(h) => drop(h),
-                        Err(e) => crate::log_once(&format!("ps5gpu: guest memory import failed ({e:?}); downloads are staged")),
-                    }
+            let (addr, size) = (b.addr, b.size);
+            let ptr = self.memory.backing_ptr(addr, size);
+            let chunk = match ptr {
+                Some(p) if self.zero_copy && chunk_host_views_enabled() => self.unranged.as_mut().or(self.guest.as_mut()).and_then(|g| g.imported_slice(addr, size)).map(|(buffer, base)| HostView::Chunk(buffer, base, p as u64)),
+                _ => None,
+            };
+            let view = match (chunk, ptr) {
+                (Some(c), _) => {
+                    self.stats.chunk_host_views += 1;
+                    c
                 }
-            }
+                // SAFETY: the backing alias stays mapped for the whole
+                // process; the import is retired with the buffer.
+                (None, Some(ptr)) if self.zero_copy => match unsafe { Buffer::import_host(&self.dev, ptr, size, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC) } {
+                    Ok(h) if h.coherent => {
+                        self.stats.host_imports += 1;
+                        HostView::Imported(h, ptr as u64)
+                    }
+                    Ok(h) => {
+                        drop(h);
+                        HostView::Unavailable
+                    }
+                    Err(e) => {
+                        crate::log_once(&format!("ps5gpu: guest memory import failed ({e:?}); downloads are staged"));
+                        HostView::Unavailable
+                    }
+                },
+                _ => HostView::Unavailable,
+            };
+            self.buffers.get_mut(&key)?.host = view;
         }
+        let b = self.buffers.get(&key)?;
         match &b.host {
-            HostView::Imported(h, _) => Some(h.buffer),
+            HostView::Imported(h, _) => Some(HostDst { buffer: h.buffer, base: 0 }),
+            &HostView::Chunk(buffer, base, _) => Some(HostDst { buffer, base }),
             _ => None,
         }
     }
@@ -2008,9 +2169,9 @@ impl BufferCache {
                 cur = run_end;
                 for (g, len) in claimed {
                     if let Some(host) = host {
-                        let region = vk::BufferCopy { src_offset: g - base, dst_offset: g - base, size: len };
+                        let region = vk::BufferCopy { src_offset: g - base, dst_offset: g - base + host.base, size: len };
                         // SAFETY: recording buffer; the device buffer and the import are alive until the tick completes.
-                        unsafe { self.dev.device.cmd_copy_buffer(sched.cmd(), src, host, &[region]) };
+                        unsafe { self.dev.device.cmd_copy_buffer(sched.cmd(), src, host.buffer, &[region]) };
                         crate::memory::history::note(crate::memory::history::Event::DownloadDirect, g, len, tick);
                         rec.direct.push((g, len));
                         continue;
@@ -2171,9 +2332,9 @@ impl BufferCache {
                     barrier = true;
                 }
                 let b = &self.buffers[&key];
-                let region = vk::BufferCopy { src_offset: g - b.addr, dst_offset: g - b.addr, size: n };
+                let region = vk::BufferCopy { src_offset: g - b.addr, dst_offset: g - b.addr + host.base, size: n };
                 // SAFETY: recording buffer; the device buffer and its import are alive until the tick completes.
-                unsafe { self.dev.device.cmd_copy_buffer(sched.cmd(), b.buf.buffer, host, &[region]) };
+                unsafe { self.dev.device.cmd_copy_buffer(sched.cmd(), b.buf.buffer, host.buffer, &[region]) };
                 crate::memory::history::note(crate::memory::history::Event::Settle, g, n, tick);
                 self.written_through.push(ThroughSpan { start: g, end: g + n, tick, staged: None });
                 self.settling.push((g, g + n, tick));

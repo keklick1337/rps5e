@@ -56,6 +56,14 @@ impl Default for Options {
     }
 }
 
+/// `RPS5E_REPLAY_SETTLE_PATCHES=1` (diagnostic): every recorded CPU write
+/// waits for all GPU work replayed before it, so GPU work never reads a
+/// later CPU write.
+fn settle_patches() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_REPLAY_SETTLE_PATCHES").is_ok_and(|v| v == "1"))
+}
+
 /// Where the replayed items go: the process-wide back-end through the
 /// executor the PM4 interpreter uses ([`GlobalSink`]), or a back-end value
 /// ([`BackendSink`], tests).
@@ -668,6 +676,9 @@ fn run_loop<'a>(
             };
         }
         let t = cpu();
+        if settle_patches() && matches!(r, Record::Patch { .. } | Record::Zero { .. }) {
+            sink.settle();
+        }
         match r {
             Record::Patch { addr, data } => {
                 let written = shadow::item(Kind::Patch, 0, || {
@@ -1203,7 +1214,13 @@ extern "C" fn replay_segv(sig: libc::c_int, info: *mut libc::siginfo_t, uc: *mut
         let uc = uc as *mut libc::ucontext_t;
         let err = (*uc).uc_mcontext.gregs[libc::REG_ERR as usize] as u64;
         let addr = (*info).si_addr() as u64;
-        if (*info).si_code == 2 && crate::memory::handle_fault(addr, err & 2 != 0) {
+        // SIGSEGV_ACCERR: a protected page; SIGBUS BUS_ADRERR: a page's
+        // userfaultfd write protection.
+        let resolved = match sig {
+            libc::SIGBUS => (*info).si_code == 2 && crate::memory::handle_wp_fault(addr),
+            _ => (*info).si_code == 2 && crate::memory::handle_fault(addr, err & 2 != 0),
+        };
+        if resolved {
             return;
         }
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -1593,6 +1610,7 @@ fn install_fault_handler() {
         sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
     }
 }
 

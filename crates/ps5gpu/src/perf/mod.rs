@@ -20,9 +20,11 @@
 
 pub mod frames;
 pub mod gpu;
+pub mod items;
 pub mod panel;
 pub mod proc;
 pub mod shaders;
+pub mod sys;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};

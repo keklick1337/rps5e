@@ -133,6 +133,15 @@ pub struct ProviderStats {
     /// Indirect group dispatches launched through a clamped record copy
     /// (`RPS5E_INDIRECT_GROUP_CLAMP=1`).
     pub gpu_group_clamps: u64,
+    /// Dispatches not ordered after the run of guest dispatches they
+    /// continue (`RPS5E_GUEST_COMPUTE_ORDER`).
+    pub unsynced_dispatches: u64,
+    /// Of `gpu_thread_dispatches`, those whose record kernel ran before
+    /// the dispatch's barrier (`RPS5E_EARLY_LAUNCH`).
+    pub early_launches: u64,
+    /// Of `gpu_thread_dispatches`, those whose record kernel ran in a launch
+    /// batch (`RPS5E_LAUNCH_BATCH`).
+    pub batched_launches: u64,
     /// Indirect dispatches skipped for a zero count in a record no GPU work
     /// was writing.
     pub empty_indirect_dispatches: u64,
@@ -149,6 +158,9 @@ pub struct ProviderStats {
     /// Upcoming dispatches whose module and pipeline the compile lookahead
     /// queued while a draw or dispatch waited.
     pub lookahead_queued: u64,
+    /// Compute modules and pipelines first asked for by the dispatch that
+    /// needs them (the lookahead had not queued them).
+    pub ahead_misses: u64,
     /// Compile jobs the command thread ran itself: it blocked on them and
     /// no worker had started them.
     pub inline_compiles: u64,
@@ -316,6 +328,9 @@ enum Compiled {
     },
     Graphics { key: GraphicsKey, result: Result<vk::Pipeline, vk::Result>, record: Option<super::prewarm::GraphicsRecord>, built: Built, rebuild: Option<Rebuild> },
     Compute { key: ComputeKey, result: Result<vk::Pipeline, vk::Result>, record: Option<super::prewarm::ComputeRecord>, built: Built, rebuild: Option<Rebuild> },
+    /// A graphics pipeline library ([`super::library`]) and how long the
+    /// driver took.
+    Library { key: super::library::LibKey, result: Result<vk::Pipeline, vk::Result>, ns: u64 },
 }
 
 /// How a pipeline was built.
@@ -1626,6 +1641,12 @@ pub struct ShaderPipelines {
     writes: SetWrites,
     /// Guest ranges of the dispatch being recorded (reused buffer).
     touched_ranges: Vec<(u64, u64)>,
+    /// The queue of the last dispatch noted as a member of a run of guest
+    /// dispatches ([`guest_compute_order_enabled`]).
+    guest_run_queue: Option<usize>,
+    /// Barriers recorded when the open launch batch began (a later barrier
+    /// ends the batch: the kernels run before it).
+    batch_barriers: u64,
     /// The bytes the dispatch being recorded stores to through written
     /// buffers whose stores are bounded: (buffer, guest address, bytes).
     write_limits: smallvec::SmallVec<[(u32, u64, u64); 4]>,
@@ -1676,6 +1697,18 @@ pub(crate) struct PipelineTables {
     relocating: Shared<HashMap<u64, u64>>,
     not_relocatable: Shared<crate::fxhash::HashSet<u64>>,
     pending_graphics: Shared<crate::fxhash::HashSet<GraphicsKey>>,
+    /// Graphics pipeline libraries made, queued, and failed
+    /// ([`super::library`]).
+    libraries: Shared<HashMap<super::library::LibKey, vk::Pipeline>>,
+    pending_libraries: Shared<crate::fxhash::HashSet<super::library::LibKey>>,
+    failed_libraries: Shared<crate::fxhash::HashSet<super::library::LibKey>>,
+    /// Pipelines whose link failed (built whole).
+    unlinkable: Shared<crate::fxhash::HashSet<GraphicsKey>>,
+    /// Missing graphics pipelines are linked from libraries (the device
+    /// can and `RPS5E_GPL` asks for it; tests set it), and the whole
+    /// pipelines are built in the background to replace them.
+    link_libraries: Shared<bool>,
+    rebuild_linked: Shared<bool>,
     pending_compute: Shared<crate::fxhash::HashSet<ComputeKey>>,
     /// Build and wait times (`create=` in the summary).
     compile_times: Shared<super::timing::CompileTimes>,
@@ -1735,6 +1768,67 @@ fn depth_read_only_enabled() -> bool {
 fn depth_split_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_DEPTH_STENCIL_SPLIT"))
+}
+
+/// `RPS5E_EARLY_LAUNCH=0`: the record kernel of an indirect dispatch with
+/// thread dimensions runs after the dispatch's barrier and is followed by a
+/// barrier of its own. Otherwise, when no unordered GPU work writes the
+/// record, it runs before the dispatch's barrier (alongside earlier work)
+/// and that barrier, at least a compute one, also orders its results
+/// before the dispatch: one barrier per dispatch instead of two. A/B scope
+/// release `early-launch`.
+fn early_launch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_EARLY_LAUNCH")) && crate::backend::ab::release_fast("early-launch")
+}
+
+/// `RPS5E_NARROW_TABLE_COPY=0`: the copies of GPU-written words into an
+/// uploaded table (`fill_deferred_table_words`) have a full barrier on
+/// each side. Otherwise they wait only for earlier compute writes of those
+/// words and are followed by a barrier from the copies to shader reads
+/// (the table is a staging slot of its own nothing else writes or reads).
+/// A/B scope release `narrow-table-copy`.
+fn narrow_table_copy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_NARROW_TABLE_COPY")) && crate::backend::ab::release_fast("narrow-table-copy")
+}
+
+/// Where the record kernel of an indirect dispatch with thread dimensions
+/// is recorded and what orders it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    /// After the dispatch's barrier, followed by a barrier of its own.
+    Ordered,
+    /// Before the dispatch's barrier, which orders its results.
+    Early,
+    /// Into the open launch batch, which runs before the batch's dispatches.
+    Batched,
+}
+
+/// `RPS5E_LAUNCH_BATCH=0`: every indirect dispatch with thread dimensions
+/// has its record kernel recorded next to it, with a barrier between them.
+/// Otherwise, in a run of such dispatches the console may run at the same
+/// time ([`guest_compute_order_enabled`]), the kernels go to a launch batch
+/// (a command buffer submitted after the work before the run and before the
+/// run, behind a full barrier on each side) and the dispatches follow one
+/// another without barriers, as long as none of them needs a barrier and
+/// no work since the batch began writes a later member's record. A/B scope
+/// release `launch-batch`.
+fn launch_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LAUNCH_BATCH")) && crate::backend::ab::release_fast("launch-batch")
+}
+
+/// `RPS5E_GUEST_COMPUTE_ORDER=0`: every dispatch is ordered after the
+/// earlier dispatches whose ranges it touches. Otherwise a dispatch the
+/// guest put right after another of the same queue, with no partial flush,
+/// cache action, wait or command-processor write between them
+/// ([`crate::render::DispatchPacket::unsynced`]), is not ordered after the
+/// dispatches of that run: the console runs them at the same time. A/B
+/// scope release `guest-compute-order`.
+fn guest_compute_order_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_GUEST_COMPUTE_ORDER")) && crate::backend::ab::release_fast("guest-compute-order")
 }
 
 /// `RPS5E_PRECISE_BARRIERS=0`: a full barrier before and after every
@@ -2110,6 +2204,17 @@ fn vertex_guest_wave_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("RPS5E_VERTEX_GUEST_WAVE").is_ok_and(|v| v == "0"))
 }
 
+/// The wave size a draw's plain vertex program (outside geometry
+/// subgroups) is prepared and translated with: the recorder and the
+/// interpreter thread's prefetch must agree on it.
+pub(crate) fn plain_vertex_wave(stages: u32) -> u32 {
+    if vertex_guest_wave_enabled() && stages & STAGES_GS_W32_EN == 0 {
+        64
+    } else {
+        32
+    }
+}
+
 /// Primitive subgroups without a geometry stage that use LDS run as mesh
 /// workgroups unless `RPS5E_NGG_MESH=0`.
 fn primitive_subgroups_enabled() -> bool {
@@ -2239,6 +2344,12 @@ impl ShaderPipelines {
             relocating: Shared::new(Default::default()),
             not_relocatable: Shared::new(Default::default()),
             pending_graphics: Shared::new(Default::default()),
+            libraries: Shared::new(Default::default()),
+            pending_libraries: Shared::new(Default::default()),
+            failed_libraries: Shared::new(Default::default()),
+            unlinkable: Shared::new(Default::default()),
+            link_libraries: Shared::new(dev.caps.graphics_pipeline_library && super::library::mode() != super::library::Mode::Off),
+            rebuild_linked: Shared::new(super::library::mode() == super::library::Mode::Rebuild),
             pending_compute: Shared::new(Default::default()),
             compile_times: Shared::new(Default::default()),
             swapped_out: Shared::new(Vec::new()),
@@ -2349,6 +2460,8 @@ impl ShaderPipelines {
             stream_memo_tick: 0,
             writes: SetWrites::default(),
             touched_ranges: Vec::new(),
+            guest_run_queue: None,
+            batch_barriers: 0,
             write_limits: smallvec::SmallVec::new(),
             store_bounds: Default::default(),
             image_barriers: Vec::new(),
@@ -2629,6 +2742,9 @@ impl ShaderPipelines {
             return self.module_ready(key);
         };
         if self.t.pending_modules.w().insert(key) {
+            if stage == ShaderStage::Compute && !self.ahead.queue_only {
+                self.stats.ahead_misses += 1;
+            }
             pool.submit_urgent(job, key);
         } else {
             // Queued by the prewarm list: needed now.
@@ -2871,13 +2987,31 @@ impl ShaderPipelines {
                         }
                         self.queue_rebuild(rebuild);
                         if let Some(old) = self.t.graphics.w().insert(key, p) {
-                            // SAFETY: created twice (prewarm and a draw); the older one was never bound.
-                            unsafe { self.dev.device.destroy_pipeline(old, None) };
+                            // Created twice (the prewarm list and a draw, or
+                            // a linked pipeline draws may have recorded):
+                            // retired like a swapped one.
+                            self.t.swapped_out.w().push(old);
+                            self.recipes = Default::default();
+                            *self.t.swaps.w() += 1;
+                            self.swaps_seen = *self.t.swaps;
                         }
                     }
                     Err(e) => {
                         crate::log_once(&format!("ps5gpu: graphics pipeline creation failed: {e:?}"));
                         self.t.failed_graphics.w().insert(key);
+                    }
+                }
+            }
+            Compiled::Library { key, result, ns } => {
+                self.t.compile_times.w().library.add(ns);
+                self.t.pending_libraries.w().remove(&key);
+                match result {
+                    Ok(p) => {
+                        self.t.libraries.w().insert(key, p);
+                    }
+                    Err(e) => {
+                        crate::log_once(&format!("ps5gpu: graphics pipeline library ({:?}) creation failed: {e:?}; its pipelines are built whole", key.part));
+                        self.t.failed_libraries.w().insert(key);
                     }
                 }
             }
@@ -3339,13 +3473,23 @@ impl ShaderPipelines {
             let src = ctx.buffers.obtain(ctx.sched, address, 4, false)?;
             regions.push((src.buffer, vk::BufferCopy { src_offset: src.offset, dst_offset: table.offset + slot as u64 * 4, size: 4 }));
         }
-        let cb = ctx.sched.cmd();
+        let narrow = narrow_table_copy_enabled();
+        let cb = if narrow {
+            let reads: smallvec::SmallVec<[(u64, u64); 8]> = deferred.iter().map(|&(_, address)| (address, 4)).collect();
+            ctx.sched.transfer_read_cmd(&reads)
+        } else {
+            ctx.sched.cmd()
+        };
         for (buffer, region) in &regions {
             // SAFETY: recording buffer outside any rendering scope; the
             // mirror and the staging ring stay alive for the tick.
             unsafe { self.dev.device.cmd_copy_buffer(cb, *buffer, table.buffer, std::slice::from_ref(region)) };
         }
-        ctx.sched.full_barrier();
+        if narrow {
+            ctx.sched.staging_read_barrier();
+        } else {
+            ctx.sched.full_barrier();
+        }
         self.stats.deferred_table_words += deferred.len() as u64;
         Ok(())
     }
@@ -4762,6 +4906,11 @@ impl ShaderPipelines {
             ff: key.ff.clone(),
             mesh,
         });
+        if self.linking() && !self.t.unlinkable.contains(&key) && !self.t.pending_graphics.contains(&key) {
+            if let Some(r) = self.linked_pipeline(&key, vs, ps, tess, mesh, wait, &record) {
+                return r;
+            }
+        }
         let job = graphics_job(self.dev.clone(), self.t.disk.cache, key.clone(), vs.clone(), ps.cloned(), tess, mesh, record, self.fast_builds());
         let Some(pool) = &*self.t.pool else {
             self.finish(job());
@@ -4800,6 +4949,126 @@ impl ShaderPipelines {
         }
     }
 
+    /// Graphics pipelines are linked from libraries ([`super::library`]):
+    /// the device can, the mode is on, and there are compile workers.
+    fn linking(&self) -> bool {
+        *self.t.link_libraries && self.t.pool.is_some() && !*self.t.fast_pipelines
+    }
+
+    /// Link missing graphics pipelines from libraries (`on`, where the
+    /// device can) or build them whole, and with `rebuild` replace linked
+    /// pipelines by whole builds in the background (tests; the default is
+    /// `RPS5E_GPL`).
+    pub fn set_linking(&mut self, on: bool, rebuild: bool) {
+        *self.t.link_libraries.w() = on && self.dev.caps.graphics_pipeline_library;
+        *self.t.rebuild_linked.w() = rebuild;
+    }
+
+    /// The pipeline of `key` linked from its libraries, building the
+    /// missing ones (the shader parts on compile workers, waited for as
+    /// [`Self::graphics_pipeline`] waits for a whole pipeline). With
+    /// `RPS5E_GPL=rebuild` the whole build is then queued behind every
+    /// other compile job and replaces it. None: a library or the link
+    /// failed; the caller builds the pipeline whole.
+    #[allow(clippy::too_many_arguments)]
+    fn linked_pipeline(
+        &mut self,
+        key: &GraphicsKey,
+        vs: &Arc<Module>,
+        ps: Option<&Arc<Module>>,
+        tess: Option<(vk::ShaderModule, vk::ShaderModule)>,
+        mesh: bool,
+        wait: bool,
+        record: &Option<super::prewarm::GraphicsRecord>,
+    ) -> Option<Result<vk::Pipeline, Failure>> {
+        use super::library::{LibKey, Part};
+        let keys: smallvec::SmallVec<[LibKey; 4]> = super::library::parts(mesh).iter().map(|&p| LibKey::of(p, key.vs, key.ps, key.layout, tess, mesh, &key.ff)).collect();
+        for k in &keys {
+            if self.t.failed_libraries.contains(k) {
+                return None;
+            }
+            if self.t.libraries.contains_key(k) {
+                continue;
+            }
+            let module = match k.part {
+                Part::PreRaster => Some(vs),
+                Part::Fragment => ps,
+                _ => None,
+            };
+            let Some(module) = module else {
+                // No shader code: made here in well under a millisecond.
+                let t = std::time::Instant::now();
+                let r = create_graphics_library(&self.dev, k, None, None);
+                self.t.compile_times.w().interface.add(t.elapsed().as_nanos() as u64);
+                match r {
+                    Ok(p) => {
+                        self.t.libraries.w().insert(k.clone(), p);
+                    }
+                    Err(e) => {
+                        crate::log_once(&format!("ps5gpu: graphics pipeline library ({:?}) creation failed: {e:?}; its pipelines are built whole", k.part));
+                        self.t.failed_libraries.w().insert(k.clone());
+                        return None;
+                    }
+                }
+                continue;
+            };
+            let Some(pool) = &*self.t.pool else { return None };
+            if self.t.pending_libraries.w().insert(k.clone()) {
+                pool.submit_urgent(library_job(self.dev.clone(), k.clone(), module.clone()), hash_of(k));
+            } else {
+                pool.hurry(hash_of(k));
+            }
+        }
+        let ready = |s: &Self| keys.iter().all(|k| s.t.libraries.contains_key(k) || s.t.failed_libraries.contains(k));
+        if !ready(self) {
+            if !wait {
+                match self.wait_within_budget(ready) {
+                    Err(e) => return Some(Err(e)),
+                    Ok(false) => return Some(Err(Failure::Compiling)),
+                    Ok(true) => {}
+                }
+            } else {
+                self.stats.compile_waits += 1;
+                let t = std::time::Instant::now();
+                for k in &keys {
+                    if !ready(self) && !self.t.libraries.contains_key(k) {
+                        self.run_queued(hash_of(k));
+                    }
+                }
+                while !ready(self) {
+                    if let Err(e) = self.wait_compile_step(t) {
+                        return Some(Err(e));
+                    }
+                }
+                self.note_blocking_wait(t, || format!("graphics pipeline libraries of vs {:016x} ps {:016x}", key.vs, key.ps));
+            }
+        }
+        let libs: Option<smallvec::SmallVec<[vk::Pipeline; 4]>> = keys.iter().map(|k| self.t.libraries.get(k).copied()).collect();
+        let libs = libs?;
+        let t = std::time::Instant::now();
+        match super::library::link(&self.dev.device, key.layout, &libs) {
+            Ok(p) => {
+                self.t.compile_times.w().link.add(t.elapsed().as_nanos() as u64);
+                crate::perf::PIPELINE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(r) = record {
+                    self.t.prewarm.w().add_graphics(r.clone());
+                }
+                self.t.graphics.w().insert(key.clone(), p);
+                if *self.t.rebuild_linked {
+                    if let Some(pool) = &*self.t.pool {
+                        pool.submit_background(optimised_graphics_job(self.dev.clone(), self.t.disk.cache, key.clone(), vs.clone(), ps.cloned(), tess, mesh));
+                    }
+                }
+                Some(Ok(p))
+            }
+            Err(e) => {
+                crate::log_once(&format!("ps5gpu: linking a graphics pipeline from libraries failed: {e:?}; built whole"));
+                self.t.unlinkable.w().insert(key.clone());
+                None
+            }
+        }
+    }
+
     /// The compute pipeline of `key` (dispatches wait for it: later work
     /// may depend on them).
     fn compute_pipeline(&mut self, key: ComputeKey, cs: &Arc<Module>) -> Result<vk::Pipeline, Failure> {
@@ -4818,6 +5087,9 @@ impl ShaderPipelines {
             None => self.finish(job()),
             Some(pool) => {
                 if self.t.pending_compute.w().insert(key) {
+                    if !self.ahead.queue_only {
+                        self.stats.ahead_misses += 1;
+                    }
                     pool.submit_urgent(job, hash_of(&key));
                 } else {
                     pool.hurry(hash_of(&key));
@@ -5146,7 +5418,8 @@ impl ShaderPipelines {
             p
         } else {
             let vs_base = if merged { 8 } else { 0 };
-            let vs_wave = if vertex_guest_wave_enabled() { wave } else { 32 };
+            let vs_wave = plain_vertex_wave(d.shaders.stages);
+            debug_assert_eq!(vs_wave, if vertex_guest_wave_enabled() { wave } else { 32 });
             let p = self.prepare_stage(ctx, ShaderStage::Vertex, vs_stage.address, vs_base, &vs_stage.user_data, vs_count, vs_wave, 0, Prefetched::Draw(&mut pre))?;
             if let Some(g) = host_indirect {
                 let user = &vs_stage.user_data[..vs_stage.user_data.len().min(32)];
@@ -6662,6 +6935,7 @@ impl ShaderPipelines {
         writes: &mut SetWrites,
         ranges: &[(u64, u64, bool, bool)],
     ) -> Result<DrawOutcome, Failure> {
+        dispatch_hash_log(ctx, bound[0].prepared.program.address, d, direct, threads, ranges);
         // An indirect dispatch with thread dimensions gets its thread limits
         // on the GPU, in a shader-data copy of its own.
         let thread_dims = indirect_thread_dimensions(d);
@@ -6694,12 +6968,60 @@ impl ShaderPipelines {
         let mut touched = std::mem::take(&mut self.touched_ranges);
         touched.clear();
         touched.extend(ranges.iter().map(|r| (r.0, r.1)));
-        if precise && crate::scheduler::hazard::range_barriers_enabled() {
+        // A guest dispatch the console may run alongside the previous one
+        // of its queue is not ordered after it (nor after the rest of their
+        // run): the title made them independent.
+        let guest_run = precise && crate::scheduler::hazard::range_barriers_enabled() && guest_compute_order_enabled();
+        let follow = guest_run && d.packet.unsynced && self.guest_run_queue == Some(d.packet.queue);
+        self.guest_run_queue = guest_run.then_some(d.packet.queue);
+        let barrier_count = |ctx: &DrawContext| ctx.sched.stats().full_barriers + ctx.sched.stats().compute_barriers;
+        let record_clean = |ctx: &DrawContext| !ctx.sched.has_unordered_work() && !ctx.sched.compute_write_pending(d.packet.indirect_address, indirect_threads::RECORD_BYTES);
+        // A run of indirect dispatches with thread dimensions: their record
+        // kernels go to the launch batch, which runs before the run, and the
+        // dispatches need no barrier of their own (see `launch_batch_enabled`).
+        let mut barrier: Option<crate::scheduler::hazard::DispatchBarrier> = None;
+        let mut launch = None;
+        if let Some(record) = args.filter(|_| thread_dims && follow && launch_batch_enabled()) {
+            if ctx.sched.launch_cmd().is_some() {
+                let b = ctx.sched.guest_dispatch_barrier(&touched, &writes.written_ranges, reads_unranged, true);
+                barrier = Some(b);
+                if b == crate::scheduler::hazard::DispatchBarrier::None && barrier_count(ctx) == self.batch_barriers && record_clean(ctx) {
+                    launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record, Launch::Batched)?);
+                } else {
+                    ctx.sched.close_launch_batch();
+                }
+            } else if ctx.sched.begin_launch_batch() {
+                // The batch's barriers order everything before the dispatch.
+                self.batch_barriers = barrier_count(ctx);
+                barrier = Some(crate::scheduler::hazard::DispatchBarrier::None);
+                launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record, Launch::Batched)?);
+            }
+            if launch.is_some() {
+                self.stats.unsynced_dispatches += 1;
+            }
+        }
+        // A record no unordered GPU work writes: its kernel runs before the
+        // dispatch's own barrier (alongside the work before it), and that
+        // one barrier orders the kernel's results before the dispatch.
+        let early_launch = launch.is_none() && thread_dims && early_launch_enabled() && args.is_some() && record_clean(ctx);
+        if early_launch {
+            launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, args.unwrap(), Launch::Early)?);
+        }
+        let barriers_before = barrier_count(ctx);
+        if launch.is_some() && !early_launch {
+            // A member of the launch batch: ordered by the batch.
+        } else if precise && crate::scheduler::hazard::range_barriers_enabled() {
             // Ordered only against the earlier work whose ranges overlap:
             // read or write after a dispatch's write (memory dependency),
             // write after a read (the readers' stages finish first).
             if ctx.sched.has_unordered_work() {
                 ctx.sched.full_barrier();
+            } else if guest_run {
+                let b = barrier.unwrap_or_else(|| ctx.sched.guest_dispatch_barrier(&touched, &writes.written_ranges, reads_unranged, follow));
+                if follow {
+                    self.stats.unsynced_dispatches += 1;
+                }
+                ctx.sched.dispatch_barrier_record(b);
             } else {
                 let b = ctx.sched.dispatch_barrier(&touched, &writes.written_ranges, reads_unranged);
                 ctx.sched.dispatch_barrier_record(b);
@@ -6712,6 +7034,9 @@ impl ShaderPipelines {
         {
             ctx.sched.full_barrier();
         }
+        if early_launch && barrier_count(ctx) == barriers_before {
+            ctx.sched.dispatch_barrier_record(crate::scheduler::hazard::DispatchBarrier::Compute { graphics: false, transfer: false });
+        }
         let mut barriers = std::mem::take(&mut self.image_barriers);
         barriers.clear();
         Self::image_layouts(&mut ctx.images, writes, &[], false, false, &mut barriers);
@@ -6720,7 +7045,8 @@ impl ShaderPipelines {
         // The groups the record's thread counts launch, resolved on the GPU
         // (the barrier above ordered the record's writers before it).
         let args = match args {
-            Some(record) if thread_dims => Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record)?),
+            _ if launch.is_some() => launch,
+            Some(record) if thread_dims => Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record, Launch::Ordered)?),
             Some(record) if indirect_group_clamp_enabled() && self.t.indirect_threads.is_some() => Some(self.record_group_clamp(ctx, record)?),
             Some(record) => Some((record.buffer, record.offset)),
             None => None,
@@ -6771,7 +7097,11 @@ impl ShaderPipelines {
                 }
             }
         }
-        if precise {
+        if guest_run {
+            // Later work that reads what this dispatch wrote, or writes
+            // what it read, waits for it; later members of its run do not.
+            ctx.sched.note_guest_dispatch(&touched, &writes.written_ranges, reads_unranged);
+        } else if precise {
             // Later work that reads what this dispatch wrote, or writes
             // what it read, waits for it.
             ctx.sched.note_dispatch(&touched, &writes.written_ranges, reads_unranged);
@@ -6825,7 +7155,8 @@ impl ShaderPipelines {
         Ok((command.buffer, command.offset))
     }
 
-    fn record_thread_launch(&mut self, ctx: &mut DrawContext, d: &ResolvedDispatch, threads: [u32; 3], cs: &PreparedStage, record: crate::buffers::BufferSlice) -> Result<(vk::Buffer, u64), Failure> {
+    /// `how` says where the kernel goes and what orders it (see [`Launch`]).
+    fn record_thread_launch(&mut self, ctx: &mut DrawContext, d: &ResolvedDispatch, threads: [u32; 3], cs: &PreparedStage, record: crate::buffers::BufferSlice, how: Launch) -> Result<(vk::Buffer, u64), Failure> {
         let data = self.patched_shader_data.take().ok_or_else(|| Failure::Error("thread-dimension dispatch without shader data".into()))?;
         if !cs.layout.uses_dispatch_thread_limits || cs.layout.uses_push_data() {
             return Err(Failure::Error(format!("thread-dimension dispatch of cs={:#x} without thread limits in its shader-data buffer", d.shader.address)));
@@ -6839,10 +7170,24 @@ impl ShaderPipelines {
         let record = crate::tiler::TilerBuffer { buffer: record.buffer, offset: record.offset, size: indirect_threads::RECORD_BYTES };
         let command_slot = crate::tiler::TilerBuffer { buffer: command.buffer, offset: command.offset, size: indirect_threads::COMMAND_BYTES };
         let data_slot = crate::tiler::TilerBuffer { buffer: data.buffer, offset: data.offset, size: data.range };
-        let narrow = narrow_launch_barrier();
-        let cb = if narrow { ctx.sched.ordered_cmd() } else { ctx.sched.cmd() };
-        kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
-        launch_barrier(ctx, narrow);
+        match how {
+            Launch::Ordered => {
+                let narrow = narrow_launch_barrier();
+                let cb = if narrow { ctx.sched.ordered_cmd() } else { ctx.sched.cmd() };
+                kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
+                launch_barrier(ctx, narrow);
+            }
+            Launch::Early => {
+                let cb = ctx.sched.ordered_cmd();
+                kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
+                self.stats.early_launches += 1;
+            }
+            Launch::Batched => {
+                let cb = ctx.sched.launch_cmd().ok_or_else(|| Failure::Error("no launch batch".into()))?;
+                kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
+                self.stats.batched_launches += 1;
+            }
+        }
         self.stats.gpu_thread_dispatches += 1;
         if trace::active() {
             self.trace_notes.push(format!("    gpu-indirect threads {rules:?} limits at dword {}", cs.layout.dispatch_thread_limits_dword()));
@@ -7041,6 +7386,42 @@ fn graphics_job(
     }
 }
 
+/// The monolithic build of the graphics pipeline of `key` replacing the
+/// one linked from libraries (a background job).
+fn optimised_graphics_job(
+    dev: Arc<GpuDevice>,
+    cache: vk::PipelineCache,
+    key: GraphicsKey,
+    vs: Arc<Module>,
+    ps: Option<Arc<Module>>,
+    tess: Option<(vk::ShaderModule, vk::ShaderModule)>,
+    mesh: bool,
+) -> impl FnOnce() -> Compiled + Send + 'static {
+    move || {
+        let what = || format!("graphics vs {:#x} ps {:#x} (replacing the linked one)", vs.address, ps.as_ref().map_or(0, |p| p.address));
+        let (result, built) = build_pipeline(cache, false, true, &what, &|cache, flags| create_graphics_pipeline(&dev, cache, &key, &vs, ps.as_deref(), tess, mesh, flags));
+        Compiled::Graphics { key, result, record: None, built, rebuild: None }
+    }
+}
+
+/// The compile job of the library `key` holding the shader `module`.
+fn library_job(dev: Arc<GpuDevice>, key: super::library::LibKey, module: Arc<Module>) -> impl FnOnce() -> Compiled + Send + 'static {
+    move || {
+        let _watch = super::watch::start(format!("{:?} library of program {:#x} ({} words)", key.part, module.address, module.words));
+        let t = std::time::Instant::now();
+        let (vs, ps) = match key.part {
+            super::library::Part::Fragment => (None, Some(&*module)),
+            _ => (Some(&*module), None),
+        };
+        let result = create_graphics_library(&dev, &key, vs, ps);
+        let ns = t.elapsed().as_nanos() as u64;
+        if ns >= super::timing::SLOW_MS * 1_000_000 {
+            log::info!("ps5gpu: {:?} library of program {:#x} ({} SPIR-V words) built in {} ms", key.part, module.address, module.words, ns / 1_000_000);
+        }
+        Compiled::Library { key, result, ns }
+    }
+}
+
 /// The job translating module `key` of the prewarm list again from its
 /// guest inputs.
 fn translate_job(dev: Arc<GpuDevice>, compiler: Arc<dyn ShaderCompiler>, key: u64, source: Arc<super::sources::ModuleSource>) -> impl FnOnce() -> Compiled + Send + 'static {
@@ -7106,6 +7487,7 @@ fn compute_job(dev: Arc<GpuDevice>, cache: vk::PipelineCache, key: ComputeKey, c
 
 /// Create the graphics pipeline of `key` (any thread: the pipeline cache
 /// synchronises itself).
+#[allow(clippy::too_many_arguments)]
 fn create_graphics_pipeline(
     dev: &GpuDevice,
     pipeline_cache: vk::PipelineCache,
@@ -7116,29 +7498,63 @@ fn create_graphics_pipeline(
     mesh: bool,
     flags: vk::PipelineCreateFlags,
 ) -> Result<vk::Pipeline, vk::Result> {
-    let ff = &key.ff;
+    create_graphics(dev, pipeline_cache, key.layout, &key.ff, Some(vs), ps, tess, mesh, flags, None)
+}
+
+/// Create the library of `part` of a graphics pipeline (any thread).
+/// `key.ff` holds only the part's own state ([`super::library::LibKey::of`]):
+/// nothing outside it can reach the library.
+fn create_graphics_library(
+    dev: &GpuDevice,
+    key: &super::library::LibKey,
+    vs: Option<&Module>,
+    ps: Option<&Module>,
+) -> Result<vk::Pipeline, vk::Result> {
+    create_graphics(dev, vk::PipelineCache::null(), key.layout, &key.ff, vs, ps, key.tess, key.mesh, vk::PipelineCreateFlags::empty(), Some(key.part))
+}
+
+/// [`create_graphics_pipeline`], or with `part` the library of that part
+/// (its stages, state and dynamic states only).
+#[allow(clippy::too_many_arguments)]
+fn create_graphics(
+    dev: &GpuDevice,
+    pipeline_cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    ff: &FixedFunctionKey,
+    vs: Option<&Module>,
+    ps: Option<&Module>,
+    tess: Option<(vk::ShaderModule, vk::ShaderModule)>,
+    mesh: bool,
+    flags: vk::PipelineCreateFlags,
+    part: Option<super::library::Part>,
+) -> Result<vk::Pipeline, vk::Result> {
     let caps = &dev.caps;
-    let names: Vec<std::ffi::CString> = [Some(vs.reflection.entry()), ps.map(|p| p.reflection.entry())]
-        .into_iter()
-        .flatten()
-        .map(|n| std::ffi::CString::new(n).unwrap_or_default())
-        .collect();
+    let in_part = |stage: vk::ShaderStageFlags| part.is_none_or(|p| p.owns_stage(stage));
+    let vs_name = vs.map(|m| std::ffi::CString::new(m.reflection.entry()).unwrap_or_default());
+    let ps_name = ps.map(|m| std::ffi::CString::new(m.reflection.entry()).unwrap_or_default());
     let main = c"main";
     let first = if mesh { vk::ShaderStageFlags::MESH_EXT } else { vk::ShaderStageFlags::VERTEX };
     // Mesh workgroups hold 32-lane subgroups where the device could run
     // them narrower.
     let mut mesh32 = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
-    let mut first_stage = vk::PipelineShaderStageCreateInfo::default().stage(first).module(vs.module).name(&names[0]);
-    if mesh && caps.mesh_subgroup32 {
-        first_stage = first_stage.push_next(&mut mesh32);
+    let mut stages = Vec::with_capacity(4);
+    if let (Some(vs), Some(name)) = (vs, &vs_name) {
+        if in_part(first) {
+            let mut first_stage = vk::PipelineShaderStageCreateInfo::default().stage(first).module(vs.module).name(name);
+            if mesh && caps.mesh_subgroup32 {
+                first_stage = first_stage.push_next(&mut mesh32);
+            }
+            stages.push(first_stage);
+        }
     }
-    let mut stages = vec![first_stage];
-    if let Some((tcs, tes)) = tess {
+    if let Some((tcs, tes)) = tess.filter(|_| in_part(vk::ShaderStageFlags::TESSELLATION_CONTROL)) {
         stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::TESSELLATION_CONTROL).module(tcs).name(main));
         stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::TESSELLATION_EVALUATION).module(tes).name(main));
     }
-    if let Some(p) = ps {
-        stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(p.module).name(&names[1]));
+    if let (Some(p), Some(name)) = (ps, &ps_name) {
+        if in_part(vk::ShaderStageFlags::FRAGMENT) {
+            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(p.module).name(name));
+        }
     }
     let bindings: Vec<vk::VertexInputBindingDescription> = ff
         .vertex_input
@@ -7200,27 +7616,9 @@ fn create_graphics_pipeline(
     let blends: Vec<vk::PipelineColorBlendAttachmentState> = ff.blend[..ff.color_count as usize].iter().map(|b| b.attachment()).collect();
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default().max_depth_bounds(1.0);
-    let mut dynamic = vec![
-        vk::DynamicState::VIEWPORT,
-        vk::DynamicState::SCISSOR,
-        vk::DynamicState::LINE_WIDTH,
-        vk::DynamicState::DEPTH_BIAS,
-        vk::DynamicState::BLEND_CONSTANTS,
-        vk::DynamicState::STENCIL_COMPARE_MASK,
-        vk::DynamicState::STENCIL_WRITE_MASK,
-        vk::DynamicState::STENCIL_REFERENCE,
-        vk::DynamicState::CULL_MODE,
-        vk::DynamicState::FRONT_FACE,
-        vk::DynamicState::DEPTH_TEST_ENABLE,
-        vk::DynamicState::DEPTH_WRITE_ENABLE,
-        vk::DynamicState::DEPTH_COMPARE_OP,
-        vk::DynamicState::STENCIL_TEST_ENABLE,
-        vk::DynamicState::STENCIL_OP,
-        vk::DynamicState::DEPTH_BIAS_ENABLE,
-    ];
-    if caps.depth_bounds {
-        dynamic.push(vk::DynamicState::DEPTH_BOUNDS);
-        dynamic.push(vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE);
+    let mut dynamic = super::library::dynamic_states(caps.depth_bounds);
+    if let Some(p) = part {
+        dynamic.retain(|&d| p.owns_dynamic(d));
     }
     let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
     let formats: Vec<vk::Format> = ff.color_formats[..ff.color_count as usize].iter().map(|&f| vk::Format::from_raw(f)).collect();
@@ -7236,9 +7634,18 @@ fn create_graphics_pipeline(
         .multisample_state(&multisample)
         .color_blend_state(&blend)
         .dynamic_state(&dynamic_state)
-        .layout(key.layout)
+        .layout(layout)
         .flags(flags)
         .push_next(&mut rendering);
+    let mut library = vk::GraphicsPipelineLibraryCreateInfoEXT::default();
+    if let Some(p) = part {
+        library = library.flags(p.flag());
+        info = info.flags(flags | vk::PipelineCreateFlags::LIBRARY_KHR).push_next(&mut library);
+        if matches!(p, super::library::Part::VertexInput | super::library::Part::Output) {
+            // Interface libraries hold no shader code and no descriptors.
+            info = info.layout(vk::PipelineLayout::null());
+        }
+    }
     if !mesh {
         info = info.vertex_input_state(&vertex_input).input_assembly_state(&input_assembly);
     }
@@ -7644,7 +8051,7 @@ impl PipelineProvider for ShaderPipelines {
             (g.stats, g.materialization_statistics())
         };
         Some(format!(
-            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu cs-group-clamps={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}inline/{}first recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
+            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu/{}early/{}batched cs-group-clamps={} cs-unsynced={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}miss/{}inline/{}first/{}msunlocked recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={}/{}memo prefetch-miss={:?} revalidated={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
             s.recorded_draws,
             s.recorded_dispatches,
             s.needs_shader,
@@ -7666,7 +8073,10 @@ impl PipelineProvider for ShaderPipelines {
             s.gpu_indirect_draws,
             s.gpu_indirect_mesh_draws,
             s.gpu_thread_dispatches,
+            s.early_launches,
+            s.batched_launches,
             s.gpu_group_clamps,
+            s.unsynced_dispatches,
             s.empty_indirect_dispatches,
             s.heap_sets,
             s.dummy_images,
@@ -7678,8 +8088,10 @@ impl PipelineProvider for ShaderPipelines {
             s.compile_budget_waits,
             self.t.pool.as_ref().map_or(0, |p| p.in_flight()),
             s.lookahead_queued,
+            s.ahead_misses,
             s.inline_compiles,
             s.hastened_compiles,
+            super::unlocked_wait::WAITED_NS.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000,
             s.recipe_hits,
             s.recipe_misses,
             s.stream_memo_hits,
@@ -7701,6 +8113,9 @@ impl PipelineProvider for ShaderPipelines {
             s.ring_candidates,
             f.prepared_reuses,
             s.prefetched_stages,
+            crate::pipeline::frontend::PREFETCH_MEMO_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            crate::pipeline::frontend::PREFETCH_MISSES.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
+            crate::pipeline::frontend::CONTENT_REVALIDATED.load(std::sync::atomic::Ordering::Relaxed),
             s.deferred_table_words,
             s.table_compares,
             s.table_reuses,
@@ -7747,7 +8162,7 @@ impl Drop for ShaderPipelines {
         let d = &self.dev.device;
         // SAFETY: device idle; every handle below belongs to this provider.
         unsafe {
-            for &p in self.t.graphics.values().chain(self.t.compute.values()).chain(self.t.swapped_out.iter()) {
+            for &p in self.t.graphics.values().chain(self.t.compute.values()).chain(self.t.swapped_out.iter()).chain(self.t.libraries.values()) {
                 d.destroy_pipeline(p, None);
             }
             for m in self.t.modules.values().flatten() {
@@ -7973,4 +8388,47 @@ mod compile_mode_tests {
         assert_eq!(pool_size(32, Some(8)), (8, 8));
         assert_eq!(pool_size(32, Some(1)), (1, 1));
     }
+}
+
+/// `RPS5E_DISPATCH_HASH=<cs>,<cs>,...` (diagnostics, hex program
+/// addresses): before each dispatch of those programs its buffer ranges
+/// (and an indirect dispatch's arguments) are downloaded into guest memory
+/// and their bytes hashed, logged as `dhash` lines. The same lines from a
+/// live run that captured (only the captured frames are logged) and from
+/// the capture's replay show the first dispatch whose inputs differ.
+fn dispatch_hash_log(ctx: &mut DrawContext, program: u64, d: &ResolvedDispatch, direct: bool, threads: [u32; 3], ranges: &[(u64, u64, bool, bool)]) {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("RPS5E_DISPATCH_HASH")
+            .map(|v| v.split(',').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_default()
+    });
+    if list.is_empty() || !list.contains(&program) {
+        return;
+    }
+    // A run that captures logs the captured frames only.
+    static CAPTURING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *CAPTURING.get_or_init(|| std::env::var_os("RPS5E_CAPTURE_FRAMES").is_some()) && !crate::capture::active() {
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 20_000 {
+        return;
+    }
+    let hash = |ctx: &mut DrawContext, a: u64, len: u64| -> u64 {
+        ctx.buffers.download(ctx.sched, a, len);
+        let mut bytes = vec![0u8; len.min(64 << 20) as usize];
+        if !ctx.buffers.cache().memory().read_backing(a, &mut bytes) {
+            return 0;
+        }
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    };
+    let mut parts = Vec::new();
+    for &(a, len, r, w) in ranges {
+        let h = hash(ctx, a, len);
+        parts.push(format!("{a:#x}+{len:#x}{}{}:{h:016x}", if r { "r" } else { "" }, if w { "w" } else { "" }));
+    }
+    let args = if direct { String::from("direct") } else { format!("{:016x}", hash(ctx, d.packet.indirect_address, 12)) };
+    log::info!("ps5gpu: dhash #{n} p{program:#x} q{} threads {threads:?} args {args} [{}]", d.packet.queue, parts.join(" "));
 }

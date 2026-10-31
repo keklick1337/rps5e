@@ -35,6 +35,9 @@ const WAIT_SLICE: Duration = Duration::from_millis(10);
 /// Tries of draws and dispatches given up for a pending compile.
 pub static PENDING_TRIES: AtomicU64 = AtomicU64::new(0);
 
+/// Time spent waiting for compiles with nothing locked (ns).
+pub static WAITED_NS: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
     /// The caller of the provider can wait for compiles unlocked.
     static ALLOWED: Cell<bool> = const { Cell::new(false) };
@@ -79,6 +82,8 @@ pub fn record<R>(allow: bool, mut attempt: impl FnMut() -> (R, bool)) -> R {
             return r;
         }
         PENDING_TRIES.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::Instant::now();
         super::pool::wait_foreground_progress(seen, WAIT_SLICE);
+        WAITED_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }

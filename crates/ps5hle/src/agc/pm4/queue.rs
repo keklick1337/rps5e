@@ -330,16 +330,31 @@ impl GpuQueue {
     }
 
     fn run(&self) {
-        // The recorder's working set wants the large L3 (asymmetric CPUs).
-        ps5vm::topology::pin_current_thread_to_fast_cores("gpu-cmd");
+        // The recorder's working set wants the large L3 (asymmetric CPUs),
+        // and one core of its own (see `ps5vm::topology`).
+        ps5vm::topology::pin_current_thread_to_recorder_core("gpu-cmd");
+        ps5gpu::perf::sys::mark_recorder_thread();
         let mut last_report = Instant::now();
+        // While a separate thread records, this one only interprets and
+        // gives the recorder's core to it (re-pinned when that changes).
+        let mut on_recorder_core = true;
         loop {
+            if ps5gpu::backend::records_on_own_thread() == on_recorder_core {
+                on_recorder_core = !on_recorder_core;
+                if on_recorder_core {
+                    ps5vm::topology::pin_current_thread_to_recorder_core("gpu-cmd");
+                } else {
+                    ps5vm::topology::pin_current_thread_to_fast_cores_except_recorder("gpu-cmd");
+                }
+            }
             if ps5vm::shutdown::requested() {
                 self.lock().stopped = true;
                 self.cv.notify_all();
                 return;
             }
-            match self.process_one() {
+            let result = self.process_one();
+            ps5gpu::perf::sys::account_ab_mode();
+            match result {
                 SliceResult::NoWork => {
                     let t = Instant::now();
                     let st = self.lock();
@@ -392,6 +407,7 @@ impl GpuQueue {
                 );
                 if let Some(s) = ps5gpu::backend::summary() {
                     log::info!("[gpu] {s}");
+                    log::info!("[gpu-sys] {}", ps5gpu::perf::sys::line());
                 }
                 let stuck = Self::stuck_heads(&self.lock(), Duration::from_secs(5));
                 if !stuck.is_empty() {

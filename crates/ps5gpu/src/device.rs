@@ -165,6 +165,10 @@ pub struct DeviceCaps {
     /// VK_EXT_pipeline_robustness: per-stage buffer robustness (stages
     /// that check their own buffer ranges run without the driver's).
     pub pipeline_robustness: bool,
+    /// VK_EXT_graphics_pipeline_library with fast linking: graphics
+    /// pipelines can be linked from separately compiled stage libraries
+    /// (`RPS5E_GPL=0` leaves it off).
+    pub graphics_pipeline_library: bool,
     /// VK_EXT_sample_locations: the sample counts (2, 4, 8) whose sample
     /// locations a pipeline may program, on a 1x1 grid at least, with at
     /// least 4 sub-pixel bits over [0, 15/16] (the guest's 1/16 pixel
@@ -653,6 +657,8 @@ impl GpuDevice {
         let mut provokingf = vk::PhysicalDeviceProvokingVertexFeaturesEXT::default();
         let mut robustf = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default();
         let mut execf = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
+        let mut gplf = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
+        let want_gpl = has(ash::ext::graphics_pipeline_library::NAME) && has(ash::khr::pipeline_library::NAME) && crate::pipeline::library::requested();
         let want_exec = std::env::var("RPS5E_PIPELINE_STATS").is_ok_and(|v| v == "1") && has(ash::khr::pipeline_executable_properties::NAME);
         let mut maint8 = Maintenance8Features {
             s_type: vk::StructureType::from_raw(STRUCTURE_TYPE_MAINTENANCE8_FEATURES),
@@ -717,6 +723,9 @@ impl GpuDevice {
             }
             if want_exec {
                 q = q.push_next(&mut execf);
+            }
+            if want_gpl {
+                q = q.push_next(&mut gplf);
             }
             if has(MAINTENANCE8_NAME) {
                 maint8.p_next = q.p_next;
@@ -818,6 +827,7 @@ impl GpuDevice {
             subgroup_arithmetic: false,
             bindless_slots: 0,
             pipeline_robustness: robustf.pipeline_robustness != 0 && core.robust_buffer_access != 0,
+            graphics_pipeline_library: gplf.graphics_pipeline_library != 0,
             sample_location_counts: vk::SampleCountFlags::empty(),
             stencil_export: has(ash::ext::shader_stencil_export::NAME),
             depth_range_unrestricted: has(ash::ext::depth_range_unrestricted::NAME) && !std::env::var("RPS5E_DEPTH_UNRESTRICTED").is_ok_and(|v| v == "0"),
@@ -889,6 +899,14 @@ impl GpuDevice {
             unsafe { instance.get_physical_device_properties2(phys, &mut p2) };
             caps.provoking_vertex_per_pipeline = pp.provoking_vertex_mode_per_pipeline != 0;
         }
+        if caps.graphics_pipeline_library {
+            let mut gp = vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut gp);
+            // SAFETY: valid chain on the stack.
+            unsafe { instance.get_physical_device_properties2(phys, &mut p2) };
+            // Without fast linking a link costs as much as a full build.
+            caps.graphics_pipeline_library = gp.graphics_pipeline_library_fast_linking != 0;
+        }
         if caps.external_memory_host {
             let mut hp = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut hp);
@@ -917,7 +935,9 @@ impl GpuDevice {
             caps.swapchain = false;
         }
         crate::pipeline::state::set_depth_range_unrestricted(caps.depth_range_unrestricted);
-        let optional: [(bool, &CStr); 28] = [
+        let optional: [(bool, &CStr); 30] = [
+            (caps.graphics_pipeline_library, ash::khr::pipeline_library::NAME),
+            (caps.graphics_pipeline_library, ash::ext::graphics_pipeline_library::NAME),
             (!caps.sample_location_counts.is_empty(), ash::ext::sample_locations::NAME),
             (caps.depth_range_unrestricted, ash::ext::depth_range_unrestricted::NAME),
             (caps.stencil_export, ash::ext::shader_stencil_export::NAME),
@@ -1028,6 +1048,7 @@ impl GpuDevice {
             .subgroup_broadcast_dynamic_id(caps.subgroup_broadcast_dynamic_id);
         let mut erobust = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default().pipeline_robustness(true);
         let mut eexec = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
+        let mut egpl = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default().graphics_pipeline_library(true);
         let mut er2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
             .robust_buffer_access2(caps.robust_buffer_access2)
             .robust_image_access2(caps.robust_image_access2)
@@ -1115,6 +1136,9 @@ impl GpuDevice {
         }
         if caps.pipeline_executable_info {
             features2 = features2.push_next(&mut eexec);
+        }
+        if caps.graphics_pipeline_library {
+            features2 = features2.push_next(&mut egpl);
         }
         if caps.maintenance8 {
             em8.p_next = features2.p_next;

@@ -217,6 +217,10 @@ pub struct FrontendStats {
     pub revalidations_changed: u64,
     /// Stages prepared again under an unchanged content stamp (no replay).
     pub prepared_reuses: u64,
+    /// Compute stages prepared as their device-reads variant, and programs
+    /// whose variant waited too (`RPS5E_DEVICE_READS`).
+    pub device_reads: u64,
+    pub device_reads_given_up: u64,
 }
 
 /// Identity of a stage preparation: the program (its `Arc`, kept alive by
@@ -241,6 +245,35 @@ pub(crate) fn prepare_pages_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     crate::backend::ab::new_fast() && *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PREPARE_PAGES"))
 }
+
+/// `RPS5E_PREFETCH_MEMO=0`: the interpreter thread's prefetch
+/// (`RPS5E_GPU_RECORD_THREAD=1`) materialises every stage again instead
+/// of reusing a recent one whose pages are unchanged (A/B scope release
+/// `prefetch-memo`). Without it the interpreter paid a full
+/// materialisation for every stage the recorder's memo would have reused,
+/// and became the slower end of the pipeline in light scenes.
+fn prefetch_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PREFETCH_MEMO")) && crate::backend::ab::release_fast("prefetch-memo")
+}
+
+/// `RPS5E_CONTENT_CHECKS=0`: a memoised or prefetched stage whose pages
+/// changed is always materialised again. By default the words its
+/// materialisation read are compared first ([`PageDeps::revalidate`]): the
+/// same words give the same result, so the stage stands (A/B scope
+/// release `content-checks`). The prefetch lags the recorder by up to a
+/// queue of draws; pages it read are often rewritten with the same words
+/// or pass a synchronisation point meanwhile.
+fn content_checks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_CONTENT_CHECKS")) && crate::backend::ab::release_fast("content-checks")
+}
+
+/// Stages whose changed pages still held the words read (reused).
+pub(crate) static CONTENT_REVALIDATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stages the interpreter thread's prefetch took from its memo.
+pub(crate) static PREFETCH_MEMO_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `RPS5E_PREPARE_MEMO=0`: every draw materialises its stages again.
 fn prepare_memo_enabled() -> bool {
@@ -290,6 +323,40 @@ pub(crate) fn defer_records() -> bool {
 }
 
 /// keyed by it miss), and eight layouts are kept per plan.
+/// `RPS5E_DESC_WAIT_WHY=1`: the first waits of 2 ms or more for a
+/// GPU-written word a materialisation reads are logged with the program,
+/// the word's address and value and (with `RPS5E_MEM_HISTORY=1`) the
+/// GPU history of its page.
+fn note_slow_word_wait(program: u64, addr: u64, waited: std::time::Duration) {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if waited.as_micros() < 2000 || !crate::backend::profile::desc_wait_why() || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 400 {
+        return;
+    }
+    log::info!("ps5gpu: desc-wait p{program:#x} word {addr:#x} waited {} us {}", waited.as_micros(), crate::memory::history::describe(addr, 8).unwrap_or_default());
+}
+
+/// `RPS5E_WORD_WAIT_LOG=<seconds>` (diagnostics): the first GPU-written words a
+/// materialisation waits for are logged with the exact write record and
+/// the page's history (`RPS5E_MEM_HISTORY=1`).
+/// `=<seconds>`: from that many seconds after the first wait on.
+fn word_wait_log() -> bool {
+    static ON: std::sync::OnceLock<Option<(std::time::Instant, u64)>> = std::sync::OnceLock::new();
+    ON.get_or_init(|| std::env::var("RPS5E_WORD_WAIT_LOG").ok().and_then(|v| v.parse().ok()).map(|s| (std::time::Instant::now(), s)))
+        .is_some_and(|(t0, s)| t0.elapsed().as_secs() >= s)
+}
+
+/// `RPS5E_DEVICE_READS=1`: a compute program whose materialisation waited
+/// for a GPU-written word reads its buffers through the V#s in its
+/// registers from then on (see [`ShaderFrontend::device_reads_variant`]).
+/// Off by default: in GTA V it removes ~95 waits per frame but each such
+/// dispatch then reads unranged memory (mirror synchronisation, a barrier
+/// against every unordered shader write), which costs as much (A/B in one
+/// run with `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=device-reads`).
+pub(crate) fn device_reads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::backend::ab::safe() && std::env::var("RPS5E_DEVICE_READS").is_ok_and(|v| v == "1")) && crate::backend::ab::release_fast("device-reads")
+}
+
 pub(crate) fn layout_intern_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     crate::backend::ab::new_fast() && *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LAYOUT_INTERN"))
@@ -444,8 +511,23 @@ impl PrefetchedDraw {
             ShaderStage::Pixel => &mut self.ps,
             _ => return None,
         };
-        let s = slot.as_ref()?;
-        (s.matches(program, user, cursor) && s.deps.current(tracker, memory)).then(|| s.stage.clone())
+        let Some(s) = slot.as_ref() else {
+            prefetch_miss(PrefetchMiss::Absent);
+            return None;
+        };
+        if !s.matches(program, user, cursor) {
+            prefetch_miss(PrefetchMiss::Identity);
+            return None;
+        }
+        let s = slot.as_mut()?;
+        if !s.deps.current(tracker, memory) {
+            if !(content_checks_enabled() && s.deps.revalidate(tracker, memory)) {
+                prefetch_miss(PrefetchMiss::Stale);
+                return None;
+            }
+            CONTENT_REVALIDATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(s.stage.clone())
     }
 }
 
@@ -467,7 +549,8 @@ pub(crate) fn prefetch_draw(d: &crate::render::ResolvedDraw) -> Option<Box<Prefe
         }
         let merged = d.shaders.es.bound() || d.shaders.gs.bound();
         let vs_count = vs_stage.user_sgpr_count().min(32);
-        let program = f.program_for(vs_stage.address, ShaderStage::Vertex, if merged { 8 } else { 0 }, vs_count, 32, &vs_stage.user_data).ok()?;
+        let vs_wave = crate::pipeline::provider::plain_vertex_wave(d.shaders.stages);
+        let program = f.program_for(vs_stage.address, ShaderStage::Vertex, if merged { 8 } else { 0 }, vs_count, vs_wave, &vs_stage.user_data).ok()?;
         let (vs, vs_deps) = f.prepare_prefetch(&program, &vs_stage.user_data, 0, None, &tracker)?;
         let vs_identity = (program.address, program.code_hash, program.user_data_base, program.user_data_count, program.wave_size);
         let vs_user: smallvec::SmallVec<[u32; 40]> = vs_stage.user_data[..(vs_count as usize).min(32)].into();
@@ -551,9 +634,23 @@ impl PrefetchedDispatch {
             && self.cursor == cursor
             && self.thread_limits == thread_limits
             && user.len() >= self.user.len()
-            && self.user[..] == user[..self.user.len()]
-            && self.deps.current(tracker, memory);
-        same.then(|| self.stage.take()).flatten()
+            && self.user[..] == user[..self.user.len()];
+        if self.stage.is_none() {
+            prefetch_miss(PrefetchMiss::AbsentDispatch);
+            return None;
+        }
+        if !same {
+            prefetch_miss(PrefetchMiss::Identity);
+            return None;
+        }
+        if !self.deps.current(tracker, memory) {
+            if !(content_checks_enabled() && self.deps.revalidate(tracker, memory)) {
+                prefetch_miss(PrefetchMiss::Stale);
+                return None;
+            }
+            CONTENT_REVALIDATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.stage.take()
     }
 }
 
@@ -582,6 +679,25 @@ pub(crate) fn prefetch_dispatch(d: &crate::render::ResolvedDispatch) -> Option<B
             deps,
         }))
     })
+}
+
+/// Why a stage the recorder prepares was not taken from the prefetch
+/// (diagnostics, the `prefetch-miss` field of the pipelines line): none
+/// was made (the interpreter's prepare aborted on a GPU-written word or
+/// the path does not prefetch), it was made for other inputs, or a page
+/// it read changed since.
+#[derive(Clone, Copy)]
+pub(crate) enum PrefetchMiss {
+    Absent = 0,
+    Identity = 1,
+    Stale = 2,
+    AbsentDispatch = 3,
+}
+
+pub(crate) static PREFETCH_MISSES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn prefetch_miss(why: PrefetchMiss) {
+    PREFETCH_MISSES[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The pre-materialised stage a `prepare_stage` call is about to compute.
@@ -625,6 +741,13 @@ pub struct ShaderFrontend {
     /// Programs planned for reading guest memory (no data reads flattened),
     /// by the address of their ordinary program (kept alive here).
     bda_programs: HashMap<usize, (Arc<StageProgram>, Result<Arc<StageProgram>, FrontendError>)>,
+    /// Compute programs whose materialisation waited for a GPU-written
+    /// word, by the address of their ordinary program (kept alive here),
+    /// with the variant that reads its buffers through the V#s in its
+    /// registers (`RPS5E_DEVICE_READS`): None once the variant waited too.
+    device_reads: HashMap<usize, (Arc<StageProgram>, Option<Result<Arc<StageProgram>, FrontendError>>)>,
+    /// The last materialisation waited for a GPU-written word.
+    waited: bool,
     /// Programs with their callees or continuation linked, by the program
     /// they were linked from and the user-data words naming the code, with
     /// the CPU synchronisation point they were last linked at.
@@ -698,6 +821,8 @@ impl ShaderFrontend {
             bda: false,
             bda_checked: false,
             bda_programs: HashMap::default(),
+            device_reads: HashMap::default(),
+            waited: false,
             linked: HashMap::default(),
         }
     }
@@ -710,10 +835,69 @@ impl ShaderFrontend {
         if let Some((_, p)) = self.bda_programs.get(&me) {
             return p.clone();
         }
-        let options = crate::buffers::guest::guest_plan_options();
+        let planned = Self::plan_variant(program, crate::buffers::guest::guest_plan_options(), 0xB0A5_0000_0000_0001, true);
+        if self.bda_programs.len() > 4096 {
+            self.bda_programs.clear();
+        }
+        self.bda_programs.insert(me, (program.clone(), planned.clone()));
+        planned
+    }
+
+    /// The variant of a compute program whose buffer reads take the V# from
+    /// the program's registers and the data through device addresses (the
+    /// mirrors and guest memory of unranged reads), so that a V# GPU work
+    /// is still writing needs no CPU wait: its words only feed table slots,
+    /// which the GPU fills (`RPS5E_DEVICE_READS`). Writes, atomics and
+    /// formatted loads keep their bound descriptors. Made once the ordinary
+    /// program's materialisation waited for a GPU-written word, and given
+    /// up when the variant's waits too. None: the ordinary program.
+    fn device_reads_variant(&mut self, program: &Arc<StageProgram>) -> Option<Arc<StageProgram>> {
+        if program.stage != ShaderStage::Compute || program.guest_plan || !device_reads_enabled() {
+            return None;
+        }
+        let me = Arc::as_ptr(program) as usize;
+        let entry = self.device_reads.get_mut(&me)?;
+        let planned = entry.1.get_or_insert_with(|| {
+            let options = ps5shader::resources::PlanOptions { flatten_data_reads: true, buffers_on_device: true };
+            Self::plan_variant(program, options, 0xDE71_CE00_0000_0001, false)
+        });
+        planned.as_ref().ok().cloned()
+    }
+
+    /// Note that the last materialisation of `program` (the ordinary
+    /// program or its device-reads variant `used`) waited for a GPU-written
+    /// word.
+    fn note_waited(&mut self, program: &Arc<StageProgram>, used: &Arc<StageProgram>) {
+        if program.stage != ShaderStage::Compute || program.guest_plan {
+            return;
+        }
+        let me = Arc::as_ptr(program) as usize;
+        if !Arc::ptr_eq(program, used) {
+            // The variant waited as well: the ordinary program from now on.
+            if let Some(e) = self.device_reads.get_mut(&me) {
+                if !matches!(e.1, Some(Err(_))) {
+                    log::info!("ps5gpu: cs {:#x}: its device-reads variant waits for GPU-written words too; bound reads again", program.address);
+                    self.stats.device_reads_given_up += 1;
+                }
+                e.1 = Some(Err(FrontendError::Plan("device reads wait too".into())));
+            }
+            return;
+        }
+        if self.device_reads.len() > 4096 {
+            self.device_reads.clear();
+        }
+        if !self.device_reads.contains_key(&me) && device_reads_enabled() {
+            log::info!("ps5gpu: cs {:#x} waited for a GPU-written word: its buffer reads take their V#s on the device from now on", program.address);
+        }
+        self.device_reads.entry(me).or_insert_with(|| (program.clone(), None));
+    }
+
+    /// `program` planned again with `options` (plan hash changed by
+    /// `hash_xor`).
+    fn plan_variant(program: &Arc<StageProgram>, options: ps5shader::resources::PlanOptions, hash_xor: u64, guest_plan: bool) -> Result<Arc<StageProgram>, FrontendError> {
         let p = &program.plan;
-        let hash = p.hash ^ 0xB0A5_0000_0000_0001;
-        let planned = ShaderResourcePlan::extract_with(p.program().clone(), program.stage, hash, program.user_data_base, program.user_data_count, None, program.wave_size, options)
+        let hash = p.hash ^ hash_xor;
+        ShaderResourcePlan::extract_with(p.program().clone(), program.stage, hash, program.user_data_base, program.user_data_count, None, program.wave_size, options)
             .map_err(|e| FrontendError::Plan(e.to_string()))
             .map(|plan| {
                 Arc::new(StageProgram {
@@ -737,14 +921,9 @@ impl ShaderFrontend {
                     link_registers: program.link_registers.clone(),
                     continuation: program.continuation,
                     image: program.image.clone(),
-                    guest_plan: true,
+                    guest_plan,
                 })
-            });
-        if self.bda_programs.len() > 4096 {
-            self.bda_programs.clear();
-        }
-        self.bda_programs.insert(me, (program.clone(), planned.clone()));
-        planned
+            })
     }
 
     /// A stage of `program` reads its buffers in guest memory now.
@@ -1072,12 +1251,40 @@ impl ShaderFrontend {
         }
         // A stage reading guest memory runs the program planned for it.
         let variant;
+        let ordinary = program;
         let program = if self.bda_for(program) && crate::buffers::guest::guest_plan_enabled() {
             variant = self.bda_program(program)?;
+            &variant
+        } else if let Some(v) = self.device_reads_variant(program).filter(|_| buffers.spec().is_none()) {
+            variant = v;
+            self.stats.device_reads += 1;
             &variant
         } else {
             program
         };
+        self.waited = false;
+        let r = self.prepare_program(program, user_data, push_cursor, thread_limits, sched, buffers);
+        if self.waited {
+            self.note_waited(ordinary, program);
+            if !Arc::ptr_eq(ordinary, program) {
+                // The variant waited as well: the ordinary program, whose
+                // words just landed, and no module built for the variant.
+                self.waited = false;
+                return self.prepare_program(ordinary, user_data, push_cursor, thread_limits, sched, buffers);
+            }
+        }
+        r
+    }
+
+    fn prepare_program(
+        &mut self,
+        program: &Arc<StageProgram>,
+        user_data: &[u32],
+        push_cursor: u32,
+        thread_limits: Option<[u32; 3]>,
+        sched: &mut Scheduler,
+        buffers: &mut crate::slices::spec::Buffers,
+    ) -> Result<PreparedStage, FrontendError> {
         let count = (program.user_data_count as usize).min(user_data.len());
         let user = &user_data[..count];
         let speculative = buffers.spec().is_some();
@@ -1098,14 +1305,22 @@ impl ShaderFrontend {
         // must happen again (the capture holds what the reads saw).
         let pages = prepare_pages_enabled() && !crate::capture::active();
         let memory = self.memory;
+        let content = pages && content_checks_enabled() && !speculative;
         let found = crate::backend::profile::dtime(35, || {
-            self.prepared.iter().position(|(k, st, deps, _)| {
+            self.prepared.iter_mut().position(|(k, st, deps, _)| {
                 k.program == me
                     && k.push_cursor == push_cursor
                     && k.thread_limits == thread_limits
                     && k.bda == bda
                     && k.user_data[..] == *user
-                    && if pages { deps.current(buffers.tracker(), memory) } else { *st == stamp }
+                    && if pages {
+                        deps.current(buffers.tracker(), memory) || (content && deps.revalidate(buffers.tracker(), memory) && {
+                            CONTENT_REVALIDATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            true
+                        })
+                    } else {
+                        *st == stamp
+                    }
             })
         });
         if let Some(i) = found {
@@ -1122,6 +1337,9 @@ impl ShaderFrontend {
             return Ok(self.prepared[i].3.clone());
         }
         let deps = RefCell::new(if speculative { PageDeps::begin_with_limit(memory, 4096) } else { PageDeps::begin(memory) });
+        if content_checks_enabled() && !speculative {
+            deps.borrow_mut().record_contents();
+        }
         let tracker = buffers.tracker().clone();
         if speculative {
             let r = self.prepare_uncached(program, user, push_cursor, thread_limits, None, &tracker, Some(&deps));
@@ -1195,9 +1413,44 @@ impl ShaderFrontend {
         };
         let count = (program.user_data_count as usize).min(user_data.len());
         let user = &user_data[..count];
+        // The interpreter's own memo of recent stages, valid while the
+        // pages their materialisation read are (as the recorder's memo with
+        // page checks): a draw repeating its stage costs a lookup here too.
+        let memo = prefetch_memo_enabled() && prepare_memo_enabled() && prepare_pages_enabled();
+        let me = Arc::as_ptr(program) as usize;
+        let bda = self.bda_for(program);
+        if memo {
+            let memory = self.memory;
+            let content = content_checks_enabled();
+            let found = self.prepared.iter_mut().position(|(k, _, deps, _)| {
+                k.program == me
+                    && k.push_cursor == push_cursor
+                    && k.thread_limits == thread_limits
+                    && k.bda == bda
+                    && k.user_data[..] == *user
+                    && (deps.current(tracker, memory) || (content && deps.revalidate(tracker, memory)))
+            });
+            if let Some(i) = found {
+                self.stats.prepared_reuses += 1;
+                PREFETCH_MEMO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (_, _, deps, stage) = &self.prepared[i];
+                return Some((stage.clone(), deps.clone()));
+            }
+        }
         let deps = RefCell::new(PageDeps::begin(self.memory));
+        if content_checks_enabled() {
+            deps.borrow_mut().record_contents();
+        }
         let stage = self.prepare_uncached(program, user, push_cursor, thread_limits, None, tracker, Some(&deps)).ok()?;
-        Some((stage, deps.into_inner()))
+        let deps = deps.into_inner();
+        if memo && !deps.overflowed() {
+            if self.prepared.len() >= RECENT_PREPARED {
+                self.prepared.pop_back();
+            }
+            let key = PreparedKey { program: me, push_cursor, thread_limits, bda, user_data: user.into() };
+            self.prepared.push_front((key, [0; 4], deps.clone(), stage.clone()));
+        }
+        Some((stage, deps))
     }
 
     fn prepare_uncached(
@@ -1220,6 +1473,7 @@ impl ShaderFrontend {
             }
         };
         let page = crate::memory::PAGE_BYTES;
+        let waited = std::cell::Cell::new(false);
         let read = |a: u64| -> Option<u32> {
             if tracker.has_gpu_dirty_pages(a, 4) {
                 // The recording state downloads the current bytes; the
@@ -1229,7 +1483,20 @@ impl ShaderFrontend {
                     let mut g = cell.borrow_mut();
                     let (s, b) = &mut *g;
                     log::trace!("ps5gpu: program {shader_base:#x} reads GPU-written word {a:#x} {}", crate::memory::history::describe(a, 6).unwrap_or_default());
+                    if word_wait_log() {
+                        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3000 {
+                            log::info!(
+                                "ps5gpu: word-wait p{shader_base:#x} {a:#x} {} | {}",
+                                b.cache().describe_word(a, s.current_tick()),
+                                crate::memory::history::describe(a, 8).unwrap_or_default()
+                            );
+                        }
+                    }
+                    let t0 = std::time::Instant::now();
                     crate::backend::profile::preparing(shader_base, || b.download_window(s, a));
+                    note_slow_word_wait(shader_base, a, t0.elapsed());
+                    waited.set(true);
                 } else {
                     return None;
                 }
@@ -1278,21 +1545,51 @@ impl ShaderFrontend {
         // Words GPU work recorded before is still producing: a table slot
         // that only copies one is filled on the GPU instead of waiting.
         let gpu_written = |a: u64| tracker.has_gpu_dirty_pages(a, 4);
+        // What each read gave goes into `deps` too (see
+        // `PageDeps::revalidate`).
+        let got_bytes = |a: u64, b: &[u8]| {
+            if let Some(d) = deps {
+                d.borrow_mut().read(a, b);
+            }
+        };
+        let got_gpu_state = |a: u64, n: u64, dirty: bool| {
+            if let Some(d) = deps {
+                d.borrow_mut().gpu_state(a, n, dirty);
+            }
+        };
         let gpu_written_noted = |a: u64| {
             note(a, 4);
-            gpu_written(a)
+            let dirty = gpu_written(a);
+            got_gpu_state(a, 4, dirty);
+            dirty
         };
         let read_noted = |a: u64| {
             note(a, 4);
-            read(a)
+            let v = read(a);
+            match v {
+                Some(w) => got_bytes(a, &w.to_le_bytes()),
+                None => got_gpu_state(a, 4, true),
+            }
+            v
         };
         let read_clean_noted = |a: u64| {
             note(a, 4);
-            read_clean(a)
+            let v = read_clean(a);
+            match v {
+                Some(w) => got_bytes(a, &w.to_le_bytes()),
+                None => got_gpu_state(a, 4, true),
+            }
+            v
         };
         let resident_noted = |a: u64, out: &mut [u8], clean: bool| {
             note(a, out.len() as u64);
-            resident(a, out, clean)
+            let ok = resident(a, out, clean);
+            if ok {
+                got_bytes(a, out);
+            } else {
+                got_gpu_state(a, out.len() as u64, true);
+            }
+            ok
         };
         // The room of the mirrors from a buffer's base on: a NUM_RECORDS
         // word GPU work still writes is left to the program, and the
@@ -1327,7 +1624,9 @@ impl ShaderFrontend {
         inputs.read_clean_memory = Some(&read_clean_noted);
         inputs.read_resident_memory = Some(&resident_noted);
         let plan = &program.plan;
-        let (snapshot, specialization) = match crate::backend::profile::time(22, || self.materializer.materialize(plan, &inputs, &resident_noted)) {
+        let materialized = crate::backend::profile::time(22, || self.materializer.materialize(plan, &inputs, &resident_noted));
+        self.waited |= waited.get();
+        let (snapshot, specialization) = match materialized {
             Ok(v) => v,
             Err(e) => {
                 self.stats.materialize_failures += 1;

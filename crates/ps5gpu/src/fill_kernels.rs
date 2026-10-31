@@ -559,3 +559,113 @@ mod tests {
         assert_eq!(scalar_buffer_bytes(16 << 16, 1), 16, "a stride-16 constant buffer of one record holds 16 bytes");
     }
 }
+
+/// The detections of [`detect_indexed_pattern_fill`] and
+/// [`detect_constant_fill`] for the program at an address, kept with the
+/// code bytes they were made from (the command thread asks for every
+/// one-dimensional 64-thread dispatch; decoding the program each time cost
+/// ~1 % of it in GTA V's BVH refit chain). A program whose bytes changed is
+/// decoded again. `RPS5E_FILL_DETECT_MEMO=0` decodes every time.
+pub mod memo {
+    use super::{detect_constant_fill, detect_indexed_pattern_fill, ConstantFill, IndexedPatternFill};
+
+    /// Code bytes compared (both detectors read at most this many).
+    pub const CODE_BYTES: usize = 256;
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("RPS5E_FILL_DETECT_MEMO").is_ok_and(|v| v == "0")) && crate::backend::ab::release_fast("fill-detect-memo")
+    }
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        code: [u8; CODE_BYTES],
+        indexed: Option<Option<IndexedPatternFill>>,
+        constant: Option<Option<ConstantFill>>,
+    }
+
+    /// Detections per program address (bounded: cleared when full).
+    #[derive(Default)]
+    pub struct Detections {
+        entries: crate::fxhash::HashMap<u64, Box<Entry>>,
+    }
+
+    const MAX_ENTRIES: usize = 4096;
+
+    impl Detections {
+        fn entry(&mut self, address: u64, code: &[u8; CODE_BYTES]) -> &mut Entry {
+            if self.entries.len() >= MAX_ENTRIES && !self.entries.contains_key(&address) {
+                self.entries.clear();
+            }
+            let e = self.entries.entry(address).or_insert_with(|| Box::new(Entry { code: *code, indexed: None, constant: None }));
+            if e.code != *code {
+                **e = Entry { code: *code, indexed: None, constant: None };
+            }
+            e
+        }
+
+        /// [`detect_indexed_pattern_fill`] of the program `code` at `address`.
+        pub fn indexed(&mut self, address: u64, code: &[u8; CODE_BYTES]) -> Option<IndexedPatternFill> {
+            let e = self.entry(address, code);
+            *e.indexed.get_or_insert_with(|| ps5shader::program::decode_blob(code, address).ok().and_then(|p| detect_indexed_pattern_fill(&p)))
+        }
+
+        /// [`detect_constant_fill`] of the program whose first
+        /// `code.len()` bytes are `code` (the rest of the compared bytes
+        /// are the caller's, read alike).
+        pub fn constant(&mut self, address: u64, code: &[u8; CODE_BYTES], prefix: usize) -> Option<ConstantFill> {
+            let e = self.entry(address, code);
+            *e.constant.get_or_insert_with(|| ps5shader::program::decode_blob(&code[..prefix], address).ok().and_then(|p| detect_constant_fill(&p)))
+        }
+    }
+
+    thread_local! {
+        static DETECTIONS: std::cell::RefCell<Detections> = std::cell::RefCell::new(Detections::default());
+    }
+
+    /// The code bytes at `address` for a memo lookup (None: the memo is
+    /// off or they cannot be read; the caller decodes as before).
+    fn code_at(memory: &crate::memory::GuestGpuMemory, address: u64) -> Option<[u8; CODE_BYTES]> {
+        if !enabled() {
+            return None;
+        }
+        let mut code = [0u8; CODE_BYTES];
+        memory.read_backing(address, &mut code).then_some(code)
+    }
+
+    /// [`detect_indexed_pattern_fill`] of the program at `address` through
+    /// the calling thread's memo (None: not answered here).
+    pub fn indexed_at(memory: &crate::memory::GuestGpuMemory, address: u64) -> Option<Option<IndexedPatternFill>> {
+        let code = code_at(memory, address)?;
+        DETECTIONS.try_with(|d| d.borrow_mut().indexed(address, &code)).ok()
+    }
+
+    /// [`detect_constant_fill`] of the program at `address` (decoded from
+    /// its first `prefix` bytes) through the calling thread's memo.
+    pub fn constant_at(memory: &crate::memory::GuestGpuMemory, address: u64, prefix: usize) -> Option<Option<ConstantFill>> {
+        let code = code_at(memory, address)?;
+        DETECTIONS.try_with(|d| d.borrow_mut().constant(address, &code, prefix)).ok()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn detections_follow_the_code_bytes() {
+            let mut code = [0u8; CODE_BYTES];
+            for (i, w) in super::super::PATTERN_FILL_KERNEL.iter().enumerate() {
+                code[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let mut d = Detections::default();
+            let direct = |c: &[u8]| ps5shader::program::decode_blob(c, 0x1000).ok().and_then(|p| detect_indexed_pattern_fill(&p));
+            assert_eq!(d.indexed(0x1000, &code), direct(&code));
+            // Other code at the same address is decoded again.
+            let mut other = code;
+            other[0..4].copy_from_slice(&0xbf81_0000u32.to_le_bytes());
+            assert_eq!(d.indexed(0x1000, &other), direct(&other));
+            assert_eq!(d.constant(0x1000, &other, 64), ps5shader::program::decode_blob(&other[..64], 0x1000).ok().and_then(|p| detect_constant_fill(&p)));
+            assert_eq!(d.indexed(0x1000, &code), direct(&code));
+        }
+    }
+}

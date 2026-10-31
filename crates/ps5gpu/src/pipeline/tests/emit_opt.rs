@@ -72,6 +72,8 @@ fn with(mut o: EmitOptions, name: &str, dev: &GpuDevice) -> EmitOptions {
         "const_fold" => o.const_fold = true,
         "lazy_select" => o.lazy_select = true,
         "half_fma_fast" => o.half_fma_fast = true,
+        "nan_once" => o.nan_once = true,
+        "zero_max" => o.zero_max = true,
         _ => panic!("no switch {name}"),
     }
     o
@@ -93,6 +95,8 @@ fn without(mut o: EmitOptions, name: &str) -> EmitOptions {
         "const_fold" => o.const_fold = false,
         "lazy_select" => o.lazy_select = false,
         "half_fma_fast" => o.half_fma_fast = false,
+        "nan_once" => o.nan_once = false,
+        "zero_max" => o.zero_max = false,
         _ => panic!("no switch {name}"),
     }
     o
@@ -823,8 +827,17 @@ fn emit_opt_wrapping_dword_offsets_match_the_interpreter() {
     report(fails);
 }
 
+/// v1 = tid*16, v3 = tid*64; buffer_load_dwordx4 v[4:7], v1 offen;
+/// v_max_f32 v10, 0, v4; v_max_f32 v11, 0, v5; v_max_f32 v12, v6, 0
+/// (VOP3); v_max_f32 v13, 0, v7; buffer_store_dwordx4 v[10:13], v3 offen
+/// (s[4:7]): max with a constant +0 (`RPS5E_ZERO_MAX`) on both sides.
+const ZERO_MAX_W32: [u32; 13] = [
+    0x34020084, 0x34060086, 0xe0381000, 0x80000401, 0xbf8c3f70, 0x20140880, 0x20160a80, 0xd510000c, 0x00010106, 0x201a0e80, 0xe0781000, 0x80010a03,
+    0xbf810000,
+];
+
 /// The f32 switches (`RPS5E_FLUSH_ELISION`, `RPS5E_FLOAT_CLASS_COMPARE`,
-/// `RPS5E_EMIT_FOLD`), each alone and all together, give the device
+/// `RPS5E_EMIT_FOLD`; `RPS5E_NAN_ONCE`, `RPS5E_ZERO_MAX` off), each alone and all together, give the device
 /// words bit for bit equal to the code without them (NaN payloads and
 /// signed zeros included), on special-value rows in every f32 denormal
 /// mode, round modes and IEEE_MODE.
@@ -832,7 +845,7 @@ fn emit_opt_wrapping_dword_offsets_match_the_interpreter() {
 #[ignore]
 fn emit_opt_float_switches_are_exact() {
     let _devices = DevicesScope;
-    let mut programs: Vec<(&str, &[u32])> = vec![("chain", &CHAIN_W32[..])];
+    let mut programs: Vec<(&str, &[u32])> = vec![("chain", &CHAIN_W32[..]), ("zero max", &ZERO_MAX_W32[..])];
     programs.extend(float_programs());
     let mut fails = Vec::new();
     for (name, code) in programs {
@@ -847,7 +860,7 @@ fn emit_opt_float_switches_are_exact() {
                 // a few ULP, and with f32 denormals kept it flushes them
                 // (float_ref checks the interpreter agreement).
                 let (base, _) = r.device(Emit::Default);
-                for emit in [Emit::Plus("flush_elision"), Emit::Plus("float_class_compare"), Emit::Plus("const_fold"), Emit::New] {
+                for emit in [Emit::Plus("flush_elision"), Emit::Plus("float_class_compare"), Emit::Plus("const_fold"), Emit::New, Emit::Without("nan_once"), Emit::Without("zero_max")] {
                     let (got, _) = r.device(emit);
                     for (i, (a, b)) in got.iter().zip(&base).enumerate() {
                         if a != b {

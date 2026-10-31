@@ -31,6 +31,7 @@ use std::time::Duration;
 pub mod occlusion;
 pub mod gpu_timer;
 pub mod hazard;
+pub mod reaper;
 
 /// A journal entry of the work recorded in a tick (formatted only when a
 /// tick hangs: draws are journaled thousands of times per frame).
@@ -126,10 +127,18 @@ impl Timeline {
     #[track_caller]
     pub fn wait(&self, tick: u64) {
         let at = std::panic::Location::caller();
-        if crate::backend::profile::wait_sites() && !self.is_complete(tick) {
+        let sites = crate::backend::profile::wait_sites();
+        let ab = crate::backend::ab::enabled() && crate::perf::sys::is_recorder();
+        if (sites || ab) && !self.is_complete(tick) {
             let t = std::time::Instant::now();
             self.wait_inner(tick);
-            crate::backend::profile::note_wait(at, t.elapsed().as_nanos() as u64);
+            let ns = t.elapsed().as_nanos() as u64;
+            if sites {
+                crate::backend::profile::note_wait(at, ns);
+            }
+            if ab {
+                crate::backend::note_pipeline_ab(3, ns / 1000);
+            }
             return;
         }
         self.wait_inner(tick);
@@ -370,6 +379,9 @@ pub struct SchedulerStats {
     /// barriers ordering transfer reads after compute writes.
     pub compute_barriers: u64,
     pub transfer_read_barriers: u64,
+    /// Barriers from transfers into staging memory to shader reads
+    /// ([`Scheduler::staging_read_barrier`]).
+    pub staging_read_barriers: u64,
     pub image_barriers: u64,
     /// Why rendering scopes ended: other attachments, image barriers,
     /// `cmd` work, ordered work, a full barrier, a submit.
@@ -426,7 +438,18 @@ pub struct Scheduler {
     current: Option<vk::CommandBuffer>,
     /// The upload prologue of the open tick (see [`Self::prologue_cmd`]).
     prologue: Option<vk::CommandBuffer>,
+    /// The open launch batch ([`Self::begin_launch_batch`]): a buffer
+    /// submitted after the work recorded before the batch began and before
+    /// the recording buffer.
+    launch: Option<vk::CommandBuffer>,
     retired: VecDeque<(u64, Box<dyn Any + Send>)>,
+    /// Retired objects whose drop is cheap and must happen on this thread
+    /// as soon as their tick completed (pooled buffers going back to their
+    /// pool, [`Self::retire_local`]).
+    retired_local: VecDeque<(u64, Box<dyn Any + Send>)>,
+    /// Drops completed retired objects on a helper thread
+    /// ([`reaper`]; started on first use).
+    reaper: Option<reaper::Reaper>,
     /// Bytes retired with [`Self::retire_sized`] into the open tick.
     open_retired_bytes: u64,
     pending: VecDeque<(u64, Callback)>,
@@ -530,7 +553,10 @@ impl Scheduler {
             hint: 0,
             current: None,
             prologue: None,
+            launch: None,
             retired: VecDeque::new(),
+            retired_local: VecDeque::new(),
+            reaper: None,
             open_retired_bytes: 0,
             pending: VecDeque::new(),
             worker,
@@ -550,7 +576,7 @@ impl Scheduler {
             occlusion: None,
             // Spliced segments split a tick into several buffers the timer
             // does not follow: no GPU timing with parallel slices.
-            gpu_timer: if crate::backend::profile::on() && crate::slices::configured() <= 1 { gpu_timer::GpuTimer::new(dev).map(Box::new) } else { None },
+            gpu_timer: if crate::backend::profile::on() && crate::slices::configured() <= 1 && gpu_timer::wanted() { gpu_timer::GpuTimer::new(dev).map(Box::new) } else { None },
             chain: Vec::new(),
             seam: false,
             slice: None,
@@ -584,7 +610,10 @@ impl Scheduler {
             hint: 0,
             current: None,
             prologue: None,
+            launch: None,
             retired: VecDeque::new(),
+            retired_local: VecDeque::new(),
+            reaper: None,
             open_retired_bytes: 0,
             pending: VecDeque::new(),
             worker: main.worker.clone(),
@@ -684,7 +713,9 @@ impl Scheduler {
     /// committing thread from the tick its segments were submitted in).
     pub fn take_retired(&mut self) -> Vec<Box<dyn Any + Send>> {
         self.open_retired_bytes = 0;
-        self.retired.drain(..).map(|(_, o)| o).collect()
+        let mut all: Vec<Box<dyn Any + Send>> = self.retired.drain(..).map(|(_, o)| o).collect();
+        all.extend(self.retired_local.drain(..).map(|(_, o)| o));
+        all
     }
 
     /// Splice ended command buffers recorded elsewhere (a slice segment:
@@ -694,6 +725,7 @@ impl Scheduler {
     /// and the next recording buffer begins with a full barrier.
     pub fn splice(&mut self, barriers: &[vk::ImageMemoryBarrier2], cbs: &[vk::CommandBuffer]) {
         debug_assert!(self.slice.is_none());
+        self.close_launch_batch();
         self.end_rendering_plain(5);
         let cb = self.raw_cmd();
         self.barrier_raw(cb);
@@ -716,6 +748,75 @@ impl Scheduler {
         self.chain.push((cb, true));
         self.chain.extend(cbs.iter().map(|&c| (c, false)));
         self.seam = true;
+    }
+
+    /// Open a launch batch: the recording buffer ends (submitted in order,
+    /// as a spliced one), a launch buffer begins with a full barrier, and a
+    /// new recording buffer begins with another. Commands recorded into the
+    /// launch buffer ([`Self::launch_cmd`]) run after everything recorded
+    /// before this call and before everything recorded after it, whenever
+    /// they are recorded, until [`Self::close_launch_batch`] (at the latest
+    /// the next submit or splice). False (nothing changed) in slice mode or
+    /// when no buffer is free; true when a batch is open.
+    pub fn begin_launch_batch(&mut self) -> bool {
+        if self.launch.is_some() {
+            return true;
+        }
+        if self.slice.is_some() {
+            return false;
+        }
+        let Ok(k) = self.acquire_buffer() else { return false };
+        // SAFETY: the buffer is not in use (its tick completed).
+        let begun = unsafe {
+            self.dev.device.reset_command_buffer(k, vk::CommandBufferResetFlags::empty()).and_then(|_| {
+                self.dev.device.begin_command_buffer(k, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+            })
+        };
+        if begun.is_err() {
+            // Returned to the ring unused.
+            if let Some(slot) = self.ring.iter_mut().find(|(r, _)| *r == k) {
+                slot.1 = 0;
+            }
+            return false;
+        }
+        Self::record_full_barrier(&self.dev, k);
+        self.end_rendering_plain(5);
+        if let Some(cb) = self.current.take() {
+            if std::mem::take(&mut self.host_reads) {
+                Self::record_host_read_barrier(&self.dev, cb);
+            }
+            if let Some(t) = &mut self.gpu_timer {
+                t.end(cb);
+            }
+            // SAFETY: recording buffer owned by this scheduler.
+            if let Err(e) = unsafe { self.dev.device.end_command_buffer(cb) } {
+                log::error!("ps5gpu: vkEndCommandBuffer failed: {e:?} ({})", self.debug_label);
+            }
+            self.chain.push((cb, true));
+        }
+        self.launch = Some(k);
+        // The new recording buffer begins with a full barrier: the launch
+        // buffer's work comes first.
+        self.seam = true;
+        self.raw_cmd();
+        true
+    }
+
+    /// The open launch batch's buffer (see [`Self::begin_launch_batch`]).
+    pub fn launch_cmd(&self) -> Option<vk::CommandBuffer> {
+        self.launch
+    }
+
+    /// End the open launch batch: its buffer is submitted before the
+    /// recording buffer.
+    pub fn close_launch_batch(&mut self) {
+        if let Some(k) = self.launch.take() {
+            // SAFETY: recording buffer owned by this scheduler.
+            if let Err(e) = unsafe { self.dev.device.end_command_buffer(k) } {
+                log::error!("ps5gpu: vkEndCommandBuffer (launch batch) failed: {e:?}");
+            }
+            self.chain.push((k, true));
+        }
     }
 
     /// Time the GPU work recorded until [`Self::time_item_end`] under
@@ -767,7 +868,7 @@ impl Scheduler {
     pub fn stats(&self) -> SchedulerStats {
         SchedulerStats {
             command_buffers: self.ring.len(),
-            retired_pending: self.retired.len(),
+            retired_pending: self.retired.len() + self.retired_local.len(),
             gpu: self.gpu_timer.as_ref().map(|t| t.time).unwrap_or_default(),
             ..self.stats
         }
@@ -897,6 +998,29 @@ impl Scheduler {
         self.hazards.dispatch_barrier(reads, written, unknown_reads)
     }
 
+    /// A compute shader write recorded since the last barrier that made
+    /// such writes visible to compute work overlaps `[addr, addr + size)`.
+    pub fn compute_write_pending(&self, addr: u64, size: u64) -> bool {
+        self.hazards.compute_write_pending(addr, size)
+    }
+
+    /// [`Self::dispatch_barrier`] of a guest dispatch that continues the
+    /// current run of guest dispatches when `follow` ([`hazard`]).
+    pub fn guest_dispatch_barrier(&mut self, reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool, follow: bool) -> hazard::DispatchBarrier {
+        self.hazards.guest_dispatch_barrier(reads, written, unknown_reads, follow)
+    }
+
+    /// [`Self::note_dispatch`] of a guest dispatch ordered by
+    /// [`Self::guest_dispatch_barrier`]: it joins the current run.
+    pub fn note_guest_dispatch(&mut self, reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool) {
+        self.shader_work = true;
+        self.unfenced = true;
+        self.hazards.note_guest_dispatch(reads, written, unknown_reads);
+        if self.hazards.spans_exceed(MAX_HAZARD_SPANS) {
+            self.dirty = true;
+        }
+    }
+
     /// Record `b` (outside any rendering scope; an open one ends without a
     /// barrier): earlier compute writes become visible to compute shaders
     /// and indirect reads, and later compute work waits for the readers.
@@ -956,6 +1080,23 @@ impl Scheduler {
         // wait for the copies.
         self.unfenced = true;
         cb
+    }
+
+    /// Transfers recorded so far into staging memory (fresh slots of the
+    /// upload ring) are visible to the shader reads of later work: a
+    /// barrier from the transfer stage to every shader stage, outside any
+    /// rendering scope.
+    pub fn staging_read_barrier(&mut self) {
+        self.end_rendering_plain(2);
+        let cb = self.raw_cmd();
+        let mb = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::UNIFORM_READ);
+        // SAFETY: recording buffer outside any rendering scope.
+        unsafe { self.dev.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&mb))) };
+        self.stats.staging_read_barriers += 1;
     }
 
     /// Transfer writes recorded so far become visible to host reads once
@@ -1202,6 +1343,9 @@ impl Scheduler {
             crate::device::stop_if_lost_or_shutting_down();
         }
         self.end_rendering_scope_for(5);
+        self.close_launch_batch();
+        // Staging bytes the submitted commands read are complete.
+        crate::buffers::async_copy::drain();
         self.open_retired_bytes = 0;
         if std::mem::take(&mut self.host_reads) {
             if let Some(c) = self.current {
@@ -1247,7 +1391,7 @@ impl Scheduler {
             .collect();
         let submit = vk::SubmitInfo2::default().wait_semaphore_infos(waits).command_buffer_infos(&cbis).signal_semaphore_infos(&sigs);
         // SAFETY: queue access is serialised by `queue`; all handles valid.
-        let r = unsafe { self.dev.device.queue_submit2(*queue, &[submit], vk::Fence::null()) };
+        let r = crate::perf::sys::timed(crate::perf::sys::Call::Submit, || unsafe { self.dev.device.queue_submit2(*queue, &[submit], vk::Fence::null()) });
         drop(queue);
         if let Err(e) = r {
             log::error!("ps5gpu: vkQueueSubmit2 (tick {tick}, {}) failed: {e:?}", self.debug_label);
@@ -1346,6 +1490,14 @@ impl Scheduler {
         self.retired.push_back((t, Box::new(obj)));
     }
 
+    /// [`Self::retire`] of an object dropped on this thread once the tick
+    /// completed (never handed to the reaper): a pooled buffer that goes
+    /// back to its pool, so the next user finds it there.
+    pub fn retire_local<T: Send + 'static>(&mut self, obj: T) {
+        let t = self.current_tick();
+        self.retired_local.push_back((t, Box::new(obj)));
+    }
+
     /// [`Self::retire`] of an object holding `bytes` of memory (a temporary
     /// upload buffer, a mirror replaced by a merge): counted until the open
     /// tick is submitted ([`Self::open_retired_bytes`]).
@@ -1409,8 +1561,28 @@ impl Scheduler {
         if let Some(t) = &mut self.gpu_timer {
             t.collect(done);
         }
-        while self.retired.front().is_some_and(|(t, _)| *t <= done) {
-            self.retired.pop_front();
+        while self.retired_local.front().is_some_and(|(t, _)| *t <= done) {
+            self.retired_local.pop_front();
+        }
+        if self.retired.front().is_some_and(|(t, _)| *t <= done) {
+            if reaper::enabled() && self.reaper.is_none() {
+                self.reaper = reaper::Reaper::start();
+            }
+            match self.reaper.as_ref().filter(|_| reaper::enabled()) {
+                Some(r) => {
+                    let mut batch = Vec::new();
+                    while self.retired.front().is_some_and(|(t, _)| *t <= done) {
+                        batch.push(self.retired.pop_front().unwrap().1);
+                    }
+                    // A reaper that is gone returns the batch: dropped here.
+                    let _ = r.send(batch);
+                }
+                None => {
+                    while self.retired.front().is_some_and(|(t, _)| *t <= done) {
+                        self.retired.pop_front();
+                    }
+                }
+            }
         }
         while self.pending.front().is_some_and(|(t, _)| *t <= done) {
             let (t, f) = self.pending.pop_front().unwrap();
@@ -1457,6 +1629,7 @@ impl Drop for Scheduler {
             // The worker and the timeline belong to the main scheduler.
             self.dev.wait_idle();
             self.retired.clear();
+            self.retired_local.clear();
             // SAFETY: device idle; buffers belong to the pool.
             unsafe { self.dev.device.destroy_command_pool(self.pool, None) };
             return;
@@ -1472,6 +1645,9 @@ impl Drop for Scheduler {
         }
         self.dev.wait_idle();
         self.retired.clear();
+        self.retired_local.clear();
+        // Joins the reaper after the objects handed to it.
+        self.reaper.take();
         // SAFETY: device idle; buffers belong to the pool.
         unsafe { self.dev.device.destroy_command_pool(self.pool, None) };
     }

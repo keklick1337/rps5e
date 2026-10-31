@@ -10,9 +10,9 @@ Read this file completely before you start. User documentation: `README.md`, `BU
 
 - **One emulator at a time.** Only one `rps5e-cli run` (or `rps5e run`) may run on the machine; two at once can freeze the user's computer.
   - `rps5e-cli run` holds a flock on `$XDG_RUNTIME_DIR/rps5e-run.lock`; a second run waits.
-  - Before `timeout N rps5e-cli run …`, wait for the lock first: `flock "$XDG_RUNTIME_DIR/rps5e-run.lock" true` (as `scripts/input-test.sh` does), then check that `pgrep -f "cli run"` is empty. Never wrap the run itself in `flock`: the binary takes the same lock and would deadlock.
+  - Before `timeout N rps5e-cli run …`, wait for the lock first: `flock "$XDG_RUNTIME_DIR/rps5e-run.lock" true` (as `scripts/input-test.sh` does), then check that `pgrep -x rps5e-cli` is empty (never `pgrep -f`/`pkill -f` with a pattern: it matches the waiting shell itself). Never wrap the run itself in `flock`: the binary takes the same lock and would deadlock.
   - Do not run copies of old binaries: they may not take the lock.
-  - Builds and game runs never overlap: run every cargo command as `flock -s "$XDG_RUNTIME_DIR/rps5e-run.lock" nice -n 19 ionice -c3 cargo …` (shared lock; the emulator takes it exclusively). Parallel builds under a running game distort fps and expose timing bugs that are not there on a quiet machine.
+  - Builds do not take the run lock. Run cargo as `nice -n 19 ionice -c3 cargo …`; an agent that works next to other agents builds into its own `CARGO_TARGET_DIR=local/tmp/<task>/target` and runs its own binary from there (the shared `target/` belongs to the maintainer). Builds running beside a game distort fps, so compare speed only inside one run (`RPS5E_AB_PERIOD`, `RPS5E_AB_SCOPE`, `RPS5E_AB_ONLY`), and check that no `rustc` and no other emulator ran during the measured window.
   - Agents that only port or refactor code do not run games: `cargo build` and unit tests only.
 - **No sudo.**
 - **No hacks.** No per-game workarounds, no faked success codes. Fix the root cause; a system function behaves like the console's or returns the console's error.
@@ -38,15 +38,15 @@ Read this file completely before you start. User documentation: `README.md`, `BU
 | Path | What |
 |---|---|
 | `crates/ps5elf` | SELF/ELF: segments, PT_LOAD, dynamic section |
-| `crates/ps5vm` | guest virtual memory, range registry (`ranges`, HLE checks access through it), `shutdown`, `appenv` (app folders) |
+| `crates/ps5vm` | guest virtual memory, range registry (`ranges`, HLE checks access through it), `shutdown`, `appenv` (app folders), `topology` (CPU cores, recorder core) |
 | `crates/ps5cpu` | native x86-64 execution: `exec.rs` (guest entry, direct import entry), signals, FS→GS patch, Windows exception handling |
 | `crates/ps5nid` | NID database (SHA1 + salt) |
 | `crates/ps5hle` | HLE libraries: kernel, libc, memory, pthread, signals, filesystem, audio, AvPlayer, network, services, `agc/` (libSceAgc + PM4 queue) |
 | `crates/ps5core` | load → map → relocate → link imports (`linker.rs`), runtime |
 | `crates/ps5shader` | shader recompiler: RDNA decoder, CFG/structurizer, SSA IR, optimisations, interpreter (reference for tests), resource planning; test vectors in `tests/vectors/` |
-| `crates/ps5gpu` | Vulkan back-end: `shader/` (SPIR-V), `pipeline/`, `images/`, `buffers/`, `memory/` (write tracking), `scheduler/`, presenter, capture/replay |
+| `crates/ps5gpu` | Vulkan back-end: `shader/` (SPIR-V), `pipeline/`, `images/`, `buffers/`, `memory/` (write tracking), `scheduler/`, `slices/` (multi-thread recording), `perf/` (`[gpu-sys]` counters), `menu/`, capture/replay; the presenter is in `lib.rs`/`vulkan.rs` |
 | `crates/ps5input` | SDL3 controllers, keyboard and mouse → ScePad/SceMouse |
-| `crates/ps5pkg` | fake PKG / PFS / PFSC / FFPKG |
+| `crates/ps5pkg` | fake PKG (PS4 and PS5 `\x7FFIH` plain-text), PFS / PFSC / NAPS, Kraken decoder, exFAT / UFS2 disk images |
 | `crates/rps5e-cli` | binaries `rps5e-cli` and `rps5e` (no arguments: the launcher); Windows icon resource in `build.rs` |
 | `crates/rps5e-gui` | launcher and in-game menu (egui); issue reports (`report.rs`) |
 | `scripts/` | `run-game.sh`, `input-test.sh`, `package.sh`, `frame_stats.py`, `glitch_scan.py`, `perf/` (profiling without root), `games.conf.example` |
@@ -59,7 +59,7 @@ Read this file completely before you start. User documentation: `README.md`, `BU
 Everything that is not public lives in `local/`:
 
 - `local/games.conf` — `GAMES_DIR` (template `scripts/games.conf.example`), read by `make test` and `progress/progress.py`; the maintainer's copy may hold more per-game variables for local scripts. Game paths never go into tracked code or scripts: tests find a game by title ID under `GAMES_DIR` with `ps5vm::test_games::game_dir("PPSA…")` and skip without it.
-- `local/docs/` — working notes (plans, GPU notes, port notes, history); `local/PLAN.md`, `local/PROGRESS.md`, `local/MEMORY.md` if present.
+- `local/docs/` — working notes (plans, GPU notes, port notes, history); `local/docs/AI_GUIDE.md` is the full handbook for agents (architecture, methods, state of each game, what was tried) and `local/docs/AGENTS_LOG.md` the shared journal every agent appends to; `local/PLAN.md`, `local/PROGRESS.md`, `local/MEMORY.md` are history.
 - `local/other_emus/` — reference projects and firmware dumps.
 - `local/scripts/` — local tools: `smoke-test.sh` and the game-keyed `input-test.sh` (per-game scenarios), reference coverage, NID audit, ….
 - `local/recordings/` — input recordings with save snapshots.
@@ -72,14 +72,14 @@ Games live outside the repository (`~/Downloads/ps5games/`); never move or copy 
 - **Guest entry** only through `enter_guest`: sigsetjmp, return address `HOST_RETURN_SENTINEL`, exit through siglongjmp. Never keep the host rsp in a register across a guest call.
 - **Imports**: stub `lea r11,[rip-7]; jmp [entry]` → `ps5cpu_import_entry` (host stack, gregs + FXSAVE frame) → HLE callback → RAX, plus RDX/XMM0 through `ctx.set_return_*`. ~40–75 ns. `RPS5E_IMPORT_TRAP=1` uses the old INT3 path.
 - **Linking** (`ps5core/linker.rs`): kernel → always HLE; the libc allocator (when `libc.prx` exports all 7 functions), `sprintf`, `memmove`/`memcmp` → native `libc.prx`; `memset`/`memcpy`/`fputs` → HLE; an import without a real HLE implementation → the module's native export; `register_fallback_fn` → HLE only when no module exports it.
-- **NIDs**: every `register_fn(nid, name)` must match SHA1(name + salt). Both `scePthread*` and `pthread_*` sets are registered.
+- **NIDs**: every `register_fn(nid, name, library, cb)` must match SHA1(name + salt). Both `scePthread*` and `pthread_*` sets are registered.
 - An unimplemented import returns `0x80020002`; kernel errors are `0x80020000 | errno`.
 - **TLS**: every `fs:` access is patched to `gs:`; each host thread has `ARCH_SET_GS` = TCB (Windows: trampolines reading a TEB slot). Static TLS variant II. TCB: +0 self, +8 DTV, +0x10 handle, +0x28 canary, +0x40 errno, +0x60 self.
 - **Threads 1:1**; a thread's identity is its pthread structure address.
 - **Blocking waits in HLE** only through `signals::wait_cv` / `wait_while` / `sleep` (slices ≤ 10 ms). Never call guest code while holding a lock.
 - **DT_INIT** of every PRX is called (DT_INIT_ARRAY is not called separately). eboot loads at 0x800000000, libc.prx at 0x100000000, other modules after the eboot image with a 2 MiB gap.
 - **No NULL-page emulation.** A guest SIGSEGV prints diagnostics (module + offset, registers, rbp walk) and exits.
-- **Memory** (`ps5hle/memory.rs`): memfd of 13 376 MiB direct + 448 MiB flexible, aliasing. Every mapping is registered in `ps5vm::ranges` and in `ps5gpu::memory` (`note_mapped`). PRT aperture: unmapped pages read zeros.
+- **Memory** (`ps5hle/memory.rs`): memfd of 13 824 MiB (`TOTAL_BYTES`; flexible memory 1 GiB by default, `param.json` can change it) plus a 4 MiB system tail, aliasing. Every mapping is registered in `ps5vm::ranges` and in `ps5gpu::memory` (`note_mapped`). PRT aperture: unmapped pages read zeros.
 - **Process exit** (`ps5vm::shutdown`): never `std::process::exit` with live guest threads; use `shutdown::request` / `exit`; a new host thread with resources registers `shutdown::on_shutdown`.
 - **Input** works on physical keys (winit `PhysicalKey`); the keyboard layout does not matter.
 - **Graphics**: CPU write tracking per page (protection + fault); image cache with aliasing and page merging, write-back only into memory the CPU did not touch; shaders RDNA → SSA → SPIR-V, one wave = one host subgroup; every acceleration has its own `RPS5E_*` switch (`grep -rn RPS5E_ crates/ps5gpu`).

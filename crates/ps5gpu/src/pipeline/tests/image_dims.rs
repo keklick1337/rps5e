@@ -1092,6 +1092,57 @@ fn image_dims_plane_compare_on_line() {
     }
 }
 
+// ---- ImageArrayCompareOnColour ----
+
+/// image_sample_c_lz (DIM 2D_ARRAY): v20 reference, v21 u, v22 v, v23
+/// slice, read from the lane's words 6, 0, 1 and 2; the result to word 8.
+const ARRAY_COMPARE_LZ_CODE: [u32; 20] = [
+    0x34020087, 0xe0301000, 0x80000201, 0xe0301004, 0x80000301, 0xe0301008, 0x80000401, 0xe0301018, 0x80000801, 0xbf8c3f70, 0x7e280308, 0x7e2a0302,
+    0x7e2c0303, 0x7e2e0304, 0xf0bc0128, 0x00610c14, 0xbf8c3f70, 0xe0701020, 0x80000c01, 0xbf810000,
+];
+
+/// Depth-compare samples of colour array textures (compared in the
+/// shader): the layer is the slice coordinate rounded half to even, as the
+/// host sampler selects it (0.49999997 and 0.5 are layer 0, 2.5 is layer
+/// 2), and NOT_EQUAL passes against a NaN reference.
+#[test]
+#[ignore]
+fn image_dims_array_compare_on_colour() {
+    const SIZE: u32 = 8;
+    const LAYERS: u32 = 4;
+    const RESULT: usize = 8;
+    const COMPARE_LESS: u32 = 1;
+    const COMPARE_NOT_EQUAL: u32 = 5;
+    // 16_FLOAT has no depth view: its compares are evaluated in the shader.
+    const FORMAT_16_FLOAT: u32 = 13;
+    const HALF: [u16; 4] = [0x3C00, 0x4000, 0x4200, 0x4400];
+    let slices: [(f32, u32); 8] = [(0.49999997, 0), (0.5, 0), (1.5, 2), (2.5, 2), (0.0, 0), (1.4, 1), (2.6, 3), (3.5, 3)];
+    let mut g = Guest::new(16 << 20);
+    let mut rig = rig(&g);
+    let shape = Shape { format: FORMAT_16_FLOAT, bpe: 2, ..Shape::new(sharps::image_type::TYPE_2D_ARRAY, SIZE, SIZE, LAYERS, 1) };
+    // Layer n holds n + 1.
+    let layered = texture(&mut g, shape, |_, layer, _, _| Some(HALF[layer as usize].to_le_bytes().to_vec()));
+    // LESS against the selected layer's value plus 0.5: 0 on that layer,
+    // 1 on the next one.
+    let input = lanes(|tid| {
+        let (slice, layer) = slices[tid as usize % 8];
+        vec![bits(0.5), bits(0.5), bits(slice), POISON, POISON, POISON, bits(layer as f32 + 1.5)]
+    });
+    let b = run(&mut g, &mut rig, &ARRAY_COMPARE_LZ_CODE, &input, &layered, [COMPARE_LESS << 12, 0xFFF << 12, 1 << 26, 0]);
+    for tid in 0..THREADS {
+        let (slice, layer) = slices[tid as usize % 8];
+        let v = f32::from_bits(b[tid as usize * WORDS + RESULT]);
+        assert_eq!(v, 0.0, "slice {slice} selects layer {layer}: thread {tid} is {v}");
+    }
+    let input = lanes(|tid| vec![bits(0.5), bits(0.5), bits(0.0), POISON, POISON, POISON, if tid % 2 == 0 { bits(f32::NAN) } else { bits(1.0) }]);
+    let b = run(&mut g, &mut rig, &ARRAY_COMPARE_LZ_CODE, &input, &layered, [COMPARE_NOT_EQUAL << 12, 0xFFF << 12, 1 << 26, 0]);
+    for tid in 0..THREADS {
+        let v = f32::from_bits(b[tid as usize * WORDS + RESULT]);
+        let expected = if tid % 2 == 0 { 1.0 } else { 0.0 };
+        assert_eq!(v, expected, "NOT_EQUAL with reference {}: thread {tid} is {v}", if tid % 2 == 0 { "NaN" } else { "equal" });
+    }
+}
+
 // ---- ImageStoreArrayThroughVolume, ImageStoreLineThroughPlane ----
 
 /// The bytes of a storage texture after the dispatch wrote it.

@@ -67,6 +67,11 @@ pub fn active() -> bool {
     STATE.load(Ordering::Relaxed) == ACTIVE
 }
 
+/// A capture is recording `mem`'s reads.
+pub(crate) fn recording(mem: &GuestGpuMemory) -> bool {
+    active() && captured(mem)
+}
+
 fn captured(mem: &GuestGpuMemory) -> bool {
     MEMORY.load(Ordering::Acquire) == mem as *const GuestGpuMemory as usize
 }

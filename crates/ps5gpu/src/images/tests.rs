@@ -1904,3 +1904,54 @@ fn small_gpu_written_targets_reach_guest_memory() {
     assert!(mem.read_backing(tiny, &mut out));
     assert_eq!(out, [2.0f32.to_le_bytes(), (-3.0f32).to_le_bytes()].concat().as_slice(), "tiled target written back");
 }
+
+/// A tiny tiled target the GPU wrote is written back at the next submit
+/// (`process_downloads`): the CPU access after that takes the bytes on the
+/// way without recording a write-back of its own (and so without waiting
+/// for later work). Written again after that, the access writes back the
+/// new contents itself.
+#[test]
+#[ignore]
+fn tiny_tiled_targets_are_written_back_at_the_submit() {
+    let mem = test_memory();
+    let dev = GpuDevice::create(false).expect("device");
+    let mut sched = Scheduler::new(&dev).unwrap();
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let mut buffers = BufferCache::new(&dev, mem, tracker.clone()).unwrap();
+    let mut images = ImageCache::new(&dev, mem).unwrap();
+    mem.attach(Arc::new(NoBuffers), Arc::new(Images(images.table.clone())), Arc::new(NoUnmap));
+    images.readback_linear = LinearReadback::Eager;
+    let (view, _) = guest_mapping(mem, 8 << 20);
+    let tiny = view + (4 << 20);
+    assert!(mem.write_backing(tiny, &[0x55u8; 8]));
+    let tkey = key2d(vk::Format::R32G32_SFLOAT, 8, tiling::SWIZZLE_64KB_R_X, 1, 1, tiny);
+    let t = images.find_or_create(&mut sched, &mut buffers, &tkey).unwrap();
+    assert!(images.prepare(&mut sched, &mut buffers, t, true));
+    let value = |a: f32, b: f32| [a.to_le_bytes(), b.to_le_bytes()].concat();
+
+    images.clear_color(&mut sched, t, vk::ClearColorValue { float32: [2.0, -3.0, 0.0, 0.0] }, None);
+    images.mark_gpu_written(t, 2);
+    let before = images.stats.writebacks;
+    images.process_downloads(&mut sched, &mut buffers);
+    if !eager_target_readback_enabled() {
+        assert_eq!(images.stats.writebacks, before, "RPS5E_EAGER_TARGET_READBACK=0: written back on access only");
+        return;
+    }
+    assert_eq!(images.stats.writebacks, before + 1, "written back at the submit");
+    let hits = images.table.take_read_backs(tiny).expect("the tiny target is read-watched");
+    images.resolve_read_backs(&mut sched, &mut buffers, &tracker, &hits, false);
+    assert_eq!(images.stats.writebacks, before + 1, "the access records no write-back of its own");
+    let mut out = [0u8; 8];
+    assert!(mem.read_backing(tiny, &mut out));
+    assert_eq!(out, value(2.0, -3.0).as_slice(), "the eager write-back reached guest memory");
+
+    // Written again, no submit since: the access writes the new contents back.
+    images.clear_color(&mut sched, t, vk::ClearColorValue { float32: [5.0, 7.0, 0.0, 0.0] }, None);
+    images.mark_gpu_written(t, 3);
+    let hits = images.table.take_read_backs(tiny).expect("read-watched again after the GPU write");
+    images.resolve_read_backs(&mut sched, &mut buffers, &tracker, &hits, false);
+    assert_eq!(images.stats.writebacks, before + 2, "the access wrote the new contents back");
+    assert!(mem.read_backing(tiny, &mut out));
+    assert_eq!(out, value(5.0, 7.0).as_slice(), "the new contents reached guest memory");
+}
+

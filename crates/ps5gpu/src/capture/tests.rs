@@ -189,7 +189,7 @@ fn sample_draw() -> ResolvedDraw {
 
 fn sample_dispatch() -> ResolvedDispatch {
     ResolvedDispatch {
-        packet: DispatchPacket { queue: 9, packet_address: 0x70_0000_0040, groups: [12, 34, 1], indirect_address: 0x71_0000_0000, dispatch_initiator: 0x21 },
+        packet: DispatchPacket { queue: 9, packet_address: 0x70_0000_0040, groups: [12, 34, 1], indirect_address: 0x71_0000_0000, dispatch_initiator: 0x21, unsynced: false },
         shader: stage(7),
         rsrc3: 0x55,
         threads: [8, 8, 1],

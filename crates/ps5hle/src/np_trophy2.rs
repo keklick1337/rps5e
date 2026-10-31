@@ -556,7 +556,7 @@ fn cb_get_game_icon(ctx: &mut CpuContext) -> HleResult {
     icon_not_found(ctx, ctx.rcx())
 }
 
-/// (context, handle, groupId / trophyId, void* buffer, size_t* size)
+/// (context, handle, groupId / trophyId / rewardId, void* buffer, size_t* size)
 fn cb_get_id_icon(ctx: &mut CpuContext) -> HleResult {
     icon_not_found(ctx, ctx.r8())
 }
@@ -579,6 +579,7 @@ const EXPORTS: &[Export] = &[
     ("2QgUy+xJqS0", "sceNpTrophy2GetGameIcon", cb_get_game_icon),
     ("6IjXJUy6ZnA", "sceNpTrophy2GetGroupIcon", cb_get_id_icon),
     ("-9LLVU0uvs8", "sceNpTrophy2GetTrophyIcon", cb_get_id_icon),
+    ("BsE-m8JxIOg", "sceNpTrophy2GetRewardIcon", cb_get_id_icon),
     ("sUXGfNMalIo", "sceNpTrophy2RegisterUnlockCallback", cb_ok),
     ("wVqxM58sIKs", "sceNpTrophy2UnregisterUnlockCallback", cb_ok),
     ("EHQEDVXZ0TI", "sceNpTrophy2ShowTrophyList", cb_ok),
@@ -772,6 +773,11 @@ mod tests {
         ctx.write_u64(BASE + 0x300, 0x55);
         ctx.set(R8, BASE + 0x300);
         assert_eq!(cb_get_id_icon(&mut ctx), ERR_ICON_FILE_NOT_FOUND);
+        assert_eq!(ctx.read_u64(BASE + 0x300), Some(0));
+        // Reward icons take the trophy icon's arguments (size pointer in r8).
+        let reward = EXPORTS.iter().find(|e| e.1 == "sceNpTrophy2GetRewardIcon").expect("sceNpTrophy2GetRewardIcon is exported");
+        ctx.write_u64(BASE + 0x300, 0x55);
+        assert_eq!((reward.2)(&mut ctx), ERR_ICON_FILE_NOT_FOUND);
         assert_eq!(ctx.read_u64(BASE + 0x300), Some(0));
         // CreateContext validation (no service state touched).
         ctx.set(Rdi, 0);

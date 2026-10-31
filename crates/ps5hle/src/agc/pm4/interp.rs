@@ -389,6 +389,10 @@ pub struct Interpreter {
     pending_flip: (i32, i32, u32, i64),
     pub draws: u64,
     pub dispatches: u64,
+    /// Only register writes and markers followed the last dispatch: the
+    /// next one may run alongside it on the console
+    /// (`ps5gpu::render::DispatchPacket::unsynced`).
+    unsynced: bool,
     pub flips: u64,
     /// Receives resolved draws/dispatches and end-of-pipe work.
     pub executor: Option<Arc<dyn RenderExecutor>>,
@@ -442,6 +446,7 @@ impl Interpreter {
             pending_flip: (0, 0, 0, 0),
             draws: 0,
             dispatches: 0,
+            unsynced: false,
             flips: 0,
             executor: crate::agc::render_executor(),
             draw_cache: None,
@@ -467,6 +472,7 @@ impl Interpreter {
             s.log_reset(self.queue_id, &self.regs);
         }
         self.regs.reset();
+        self.unsynced = false;
         self.index_type = 0;
         self.index_buffer_size = 0;
         self.index_base = 0;
@@ -592,6 +598,9 @@ impl Interpreter {
     /// Returns the payload dwords consumed.
     fn dispatch(&mut self, ex: &mut Execution, p: &Packet, pl: &[u32]) -> Result<u32> {
         let rest = p.len() - 1;
+        if self.unsynced && !keeps_dispatches_unsynced(p, pl) {
+            self.unsynced = false;
+        }
         match super::opcode(p.header) {
             op::NOP => self.nop(ex, p, pl),
             op::SET_BASE => Ok(self.set_base(p, pl)),
@@ -964,7 +973,8 @@ impl Interpreter {
     fn dispatch_packet(&mut self, stack: &[Cursor], p: &Packet, pl: &[u32]) {
         self.dispatches += 1;
         DISPATCHES.fetch_add(1, Ordering::Relaxed);
-        let packet = decode_dispatch(self.queue_id, self.dispatch_args_base, p, pl);
+        let mut packet = decode_dispatch(self.queue_id, self.dispatch_args_base, p, pl);
+        packet.unsynced = std::mem::replace(&mut self.unsynced, true);
         let dims = if packet.indirect_address == 0 { packet.groups } else { [0; 3] };
         self.note_dispatch_registers(packet.dispatch_initiator, dims);
         let Some(ex) = &self.executor else { return };
@@ -1346,15 +1356,36 @@ impl Interpreter {
             if index == 1 && addr != 0 && addr & 7 == 0 {
                 // PIXEL_PIPE_STAT_DUMP of an occlusion query: counted on the
                 // GPU when the executor can (RPS5E_OCCLUSION_QUERIES=1).
-                if self.executor.as_ref().is_some_and(|ex| ex.occlusion_counter_dump(addr, occlusion_write())) {
-                    return Ok(p.len() - 1);
-                }
-                // Publish a ready, always-visible result for every depth block.
+                // Without it, a ready, always-visible result for every
+                // depth block.
                 let result = (1u64 << 63) | self.occlusion_counter;
+                self.occlusion_counter = (self.occlusion_counter + 1) & ((1 << 63) - 1);
+                if let Some(ex) = &self.executor {
+                    let queue_id = self.queue_id;
+                    // Runs in order with the executor's work (the dump is
+                    // not awaited).
+                    let cpu = move || {
+                        for block in 0..16u64 {
+                            let a = addr + block * 16;
+                            let bytes = result.to_le_bytes();
+                            ps5gpu::backend::ordered_cp_write(
+                                a,
+                                &bytes,
+                                Box::new(move || {
+                                    if !mem::write(a, &bytes) && rare_warning(&WRITE_WARNINGS) {
+                                        log::warn!("[pm4] queue {queue_id} cannot write 8 bytes at 0x{a:x}");
+                                    }
+                                }),
+                            );
+                        }
+                    };
+                    if ex.occlusion_counter_dump_or(addr, occlusion_write(), Box::new(cpu)) || ex.occlusion_counter_dump(addr, occlusion_write()) {
+                        return Ok(p.len() - 1);
+                    }
+                }
                 for block in 0..16u64 {
                     self.write64(addr + block * 16, result);
                 }
-                self.occlusion_counter = (self.occlusion_counter + 1) & ((1 << 63) - 1);
             }
         }
         Ok(p.len() - 1)
@@ -2155,6 +2186,25 @@ impl Interpreter {
     }
 }
 
+/// Whether a packet between two dispatches leaves them free to run at the
+/// same time on the console: register writes (shader, context and user
+/// configuration registers, directly or from tables), SET_BASE and marker
+/// NOPs. Everything else (partial flushes and other events, cache actions,
+/// waits, command-processor writes and copies, draws) may order or feed
+/// the next dispatch.
+fn keeps_dispatches_unsynced(p: &Packet, pl: &[u32]) -> bool {
+    match super::opcode(p.header) {
+        op::SET_SH_REG | op::SET_CONTEXT_REG | op::SET_UCONFIG_REG | op::SET_UCONFIG_REG_INDEX | op::SET_SH_REG_INDIRECT | op::SET_CONTEXT_REG_INDIRECT | op::SET_UCONFIG_REG_INDIRECT | op::SET_BASE => true,
+        op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => true,
+        op::NOP => match custom(p.header) {
+            nop::ZERO => pl.first().is_none_or(|&w| w & 0xFFFF_0000 == MARKER_MAGIC),
+            nop::PUSH_MARKER | nop::POP_MARKER => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Decode a dispatch packet: DISPATCH_DIRECT `[x, y, z, initiator]`,
 /// DISPATCH_INDIRECT `[offset, initiator]` (graphics, from SET_BASE) or
 /// `[addr64, initiator]` (compute queues).
@@ -2182,10 +2232,10 @@ const AHEAD_PACKETS: u64 = 1 << 16;
 /// lookahead (`ps5gpu::pipeline::lookahead`): the scan decodes the
 /// following packets on a copy of the queue's registers and resolves their
 /// dispatches. It executes nothing: no memory, label or register writes,
-/// no interrupts or flips. It stops at the first packet whose effect it
-/// cannot know without executing (a wait, a conditional, a branch, a
-/// register load the command processor produces), at a flip, and at the
-/// limit.
+/// no interrupts or flips. It reads on past waits (they change no
+/// register) and stops at the first packet whose effect it cannot know
+/// without executing (a conditional, a branch, a register load the command
+/// processor produces), at a flip, and at the limit.
 struct Ahead<'a> {
     regs: &'a RegisterFile,
     queue: usize,
@@ -2344,14 +2394,19 @@ impl lookahead::Source for Ahead<'_> {
                 },
                 // COPY_DATA into a register.
                 op::COPY_DATA if pl.first().is_some_and(|&c| (c >> 8) & 0xF == 0) => return,
-                // Packets that wait, choose what runs next or load state
-                // the command processor itself produces.
-                op::WAIT_REG_MEM
-                | op::WAIT_REG_MEM64
-                | op::MEM_SEMAPHORE
-                | op::WAIT_ON_CE_COUNTER
-                | op::WAIT_ON_DE_COUNTER_DIFF
-                | op::REWIND
+                // Waits change no register: the dispatches after them are
+                // resolved from the same state (memory the scan reads may
+                // still change before the wait ends; a wrong guess costs a
+                // compile). `RPS5E_LOOKAHEAD_WAITS=0` stops at them.
+                op::WAIT_REG_MEM | op::WAIT_REG_MEM64 | op::MEM_SEMAPHORE | op::WAIT_ON_CE_COUNTER | op::WAIT_ON_DE_COUNTER_DIFF => {
+                    if !lookahead::past_waits() {
+                        return;
+                    }
+                }
+                // Packets that choose what runs next, may run before the
+                // packets after them are written, or load state the
+                // command processor itself produces.
+                op::REWIND
                 | op::COND_EXEC
                 | op::SET_PREDICATION
                 | op::INDEX_ATTRIBUTES_INDIRECT => return,

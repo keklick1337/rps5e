@@ -154,7 +154,7 @@ fn float_rewrites_are_exact_in_every_float_mode() {
     ] {
         programs.extend(list);
     }
-    let variants = [rewrites::ALL & !rewrites::FLUSH_ELISION, rewrites::ALL & !rewrites::FLOAT_CLASS_COMPARE, rewrites::LEAN_FLUSH | rewrites::LANE_ACTIVE_EXEC, 0];
+    let variants = [rewrites::ALL & !rewrites::FLUSH_ELISION, rewrites::ALL & !rewrites::FLOAT_CLASS_COMPARE, rewrites::ALL & !rewrites::NAN_ONCE, rewrites::LEAN_FLUSH | rewrites::LANE_ACTIVE_EXEC, 0];
     let mut fails = Vec::new();
     for (i, (code, wave)) in programs.iter().enumerate() {
         for mode in [0xC0u8, 0xF0, 0xD0, 0xE0, 0xC1, 0xC2, 0xC3] {
@@ -234,4 +234,32 @@ fn midpoint_rows_reach_double_rounding() {
         }
     }
     assert!(double >= 16, "{double} rows round twice");
+}
+
+/// The NaN choice of the f32 arithmetic results is off the results'
+/// dependency chain with NAN_ONCE: the longest chain of selects through the
+/// float chain program is shorter (one select per operation instead of one
+/// per source plus one), so the host compiler schedules the arithmetic
+/// without waiting for the NaN tests. Exactness: the test above.
+#[test]
+fn nan_once_shortens_the_select_chain() {
+    use ps5shader::ssa::Op;
+    let depth = |bits: u32| {
+        let run = ComputeRun { rewrites: bits, ..ComputeRun::new(CHAIN_W32.to_vec(), 32, 32, vec![0; 8]) };
+        let f = run.compile(true).unwrap();
+        let mut d: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        let mut longest = 0;
+        for &b in &f.order {
+            for &v in &f.block(b).insts {
+                let own = usize::from(f.op(v) == Op::Select);
+                let deepest = f.args(v).iter().filter_map(|a| d.get(&a.0)).max().copied().unwrap_or(0);
+                let n = deepest + own;
+                d.insert(v.0, n);
+                longest = longest.max(n);
+            }
+        }
+        longest
+    };
+    let (once, chain) = (depth(rewrites::ALL), depth(rewrites::ALL & !rewrites::NAN_ONCE));
+    assert!(once < chain, "select chain {once} with NAN_ONCE, {chain} without");
 }

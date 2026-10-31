@@ -3545,6 +3545,7 @@ pub fn register(reg: &mut HleRegistry) {
     // Guest accesses to pages the GPU memory tracker protects are resolved
     // by the tracker before a fault is reported.
     ps5cpu::exec::set_fault_hook(ps5gpu::memory::handle_fault);
+    ps5cpu::exec::set_write_protect_hook(ps5gpu::memory::handle_wp_fault);
     ps5cpu::exec::set_describe_hook(ps5gpu::memory::describe_address);
     for &(nid, name, cb) in EXPORTS.iter().chain(jit::JIT_EXPORTS) {
         reg.register_fn(nid, name, "libKernel", cb);
