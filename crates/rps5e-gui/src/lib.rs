@@ -18,6 +18,7 @@ pub mod controls_overlay;
 mod dialogs;
 pub mod dualsense;
 pub mod input_store;
+pub mod ime_dialog_ui;
 pub mod ingame;
 pub mod input_ui;
 pub mod keys;

@@ -227,9 +227,9 @@ impl App {
                 Some(t) => t.saturating_duration_since(Instant::now()).min(Duration::from_millis(16)),
             },
         };
-        // An open menu and the controls overlay redraw at ~60 Hz, the compile overlay at ~10 Hz
-        // (it also shows before the game's first frame).
-        let frame = if crate::menu::is_open() || crate::menu::overlay_shown() { frame.min(crate::menu::UI_PERIOD) } else { frame };
+        // An open menu, a system dialog and the controls overlay redraw at ~60 Hz, the compile
+        // overlay at ~10 Hz (it also shows before the game's first frame).
+        let frame = if crate::menu::captures_input() || crate::menu::overlay_shown() { frame.min(crate::menu::UI_PERIOD) } else { frame };
         let frame = if self.compile_on || crate::osd::compile_progress().is_some() { frame.min(COMPILE_OVERLAY_PERIOD) } else { frame };
         // Wake up when the on-screen hint expires.
         match crate::osd::hint_deadline() {
@@ -243,11 +243,13 @@ impl App {
     /// [`crate::menu::UI_PERIOD`] and on input.
     fn update_ui(&mut self, new_frame: bool) {
         let open = crate::menu::is_open();
+        let dialog = crate::menu::system_dialog_shown();
+        let interactive = open || dialog;
         let controls = crate::menu::overlay_shown();
         let fps_on = crate::display::fps_counter();
         let compile = crate::osd::compile_overlay();
         let (Some(vk), Some(window)) = (self.vk.as_mut(), self.window.as_ref()) else { return };
-        let want = (open || controls || fps_on || compile.is_some()) && !vk.ui_failed;
+        let want = (interactive || controls || fps_on || compile.is_some()) && !vk.ui_failed;
         // The controls overlay appearing or going redraws a still image.
         let controls_changed = controls != self.controls_on;
         self.controls_on = controls;
@@ -271,11 +273,11 @@ impl App {
         let host = self.menu.get_or_insert_with(|| crate::menu::Host::new(window, max_side));
         let stale = host.last_run.is_none_or(|t| t.elapsed() >= crate::menu::UI_PERIOD);
         let spinner_due = compile.is_some() && host.last_run.is_none_or(|t| t.elapsed() >= COMPILE_OVERLAY_PERIOD);
-        if !(new_frame || vk.ui_frame.is_none() || compile_changed || controls_changed || spinner_due || (open && host.input_pending) || ((open || controls) && stale)) {
+        if !(new_frame || vk.ui_frame.is_none() || compile_changed || controls_changed || spinner_due || (interactive && host.input_pending) || ((interactive || controls) && stale)) {
             return;
         }
         let fps = fps_on.then(|| vk.hud.frames.summary(Instant::now(), 1.0).fps);
-        let (frame, textures) = host.run(window, open, controls, fps, compile.as_ref());
+        let (frame, textures) = host.run(window, open, dialog, controls, fps, compile.as_ref());
         if !vk.ensure_ui() {
             crate::menu::set_open(false);
             return;
@@ -426,16 +428,16 @@ impl ApplicationHandler for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, _event: ()) {}
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: winit::event::DeviceEvent) {
-        // Raw mouse motion is mouse-look: not while the menu is open.
-        if !crate::menu::is_open() {
+        // Raw mouse motion is mouse-look: not while the menu or a system dialog has the input.
+        if !crate::menu::captures_input() {
             crate::input::on_device_event(&event);
         }
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // An open menu takes the keyboard and mouse; the game only sees
-        // focus changes (it releases what it holds).
-        if crate::menu::is_open() {
+        // An open menu or a system dialog takes the keyboard and mouse; the
+        // game only sees focus changes (it releases what it holds).
+        if crate::menu::captures_input() {
             if let (Some(host), Some(window)) = (self.menu.as_mut(), self.window.as_ref()) {
                 host.on_window_event(window, &event);
             }

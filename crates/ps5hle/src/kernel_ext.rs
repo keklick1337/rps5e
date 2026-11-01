@@ -718,8 +718,6 @@ fn cb_execvp(ctx: &mut CpuContext) -> HleResult {
 
 const CPU_LEVEL_WHICH: i32 = 3;
 const CPU_WHICH_TID: i32 = 1;
-/// Largest cpuset_t the kernel accepts (CPU_MAXSIZE / 8).
-const CPUSET_MAX_SIZE: u64 = 256 / 8;
 
 const CPU_WHICH_PID: i32 = 2;
 
@@ -752,7 +750,7 @@ fn cb_cpuset_setaffinity(ctx: &mut CpuContext) -> HleResult {
 /// size (ERANGE), mask (EFAULT), target (ESRCH, EINVAL), level (EINVAL).
 fn cb_cpuset_getaffinity(ctx: &mut CpuContext) -> HleResult {
     let (level, which, id, size, out) = (ctx.rdi() as i32, ctx.rsi() as i32, ctx.rdx() as i64, ctx.rcx(), ctx.r8());
-    if !(8..=CPUSET_MAX_SIZE).contains(&size) {
+    if !crate::pthread::cpuset_size_ok(size) {
         return posix_failure(ctx, ERANGE);
     }
     if out == 0 {
@@ -1769,19 +1767,22 @@ mod tests {
         assert_eq!(call(&mut ctx, 3, 1, -1, 8, base), 0);
         assert_eq!(ctx.read_u64(base), Some(expected));
         assert_eq!(ctx.read_u64(base + 8), Some(u64::MAX));
-        assert_eq!(call(&mut ctx, 3, 1, -1, 32, base), 0);
-        assert_eq!(ctx.read_bytes(base + 8, 24), Some(vec![0; 24]));
-        assert_eq!(call(&mut ctx, 3, 1, -1, 4, base), -1);
-        assert_eq!(call(&mut ctx, 3, 1, -1, 33, base), -1);
+        assert_eq!(call(&mut ctx, 3, 1, -1, 16, base), 0);
+        assert_eq!(ctx.read_bytes(base + 8, 8), Some(vec![0; 8]));
+        assert_eq!(ctx.read_bytes(base + 16, 16), Some(vec![0xFF; 16]), "nothing past the size");
+        // Sizes measured on a PS5: 8..16 accepted, below 8 and 24 up ERANGE.
+        for size in [0u64, 4, 7, 17, 24, 32, 33, 64] {
+            assert_eq!(call(&mut ctx, 3, 1, -1, size, base), -1, "size {size}");
+        }
         assert_eq!(call(&mut ctx, 3, 1, -1, 8, 0), -1);
         assert_eq!(call(&mut ctx, 3, 1, 0x3FFF_FFF0, 8, base), -1);
         // The process: the CPUs of its live threads; another pid is ESRCH.
         let pid = std::process::id() as i64;
         for id in [-1, pid] {
             ctx.write_bytes(base, &[0xFF; 32]);
-            assert_eq!(call(&mut ctx, 3, 2, id, 32, base), 0);
+            assert_eq!(call(&mut ctx, 3, 2, id, 12, base), 0);
             assert_eq!(ctx.read_u64(base), Some(crate::pthread::process_affinity()));
-            assert_eq!(ctx.read_bytes(base + 8, 24), Some(vec![0; 24]));
+            assert_eq!(ctx.read_bytes(base + 8, 4), Some(vec![0; 4]));
         }
         assert_eq!(call(&mut ctx, 3, 2, pid + 1, 8, base), -1);
         assert_eq!(call(&mut ctx, 3, 7, -1, 8, base), -1);
@@ -1789,7 +1790,7 @@ mod tests {
     }
 
     /// cpuset_setaffinity on the calling thread drops unavailable CPUs,
-    /// refuses sizes outside 8..=32 (ERANGE), CPUs past 64 (EINVAL), a NULL
+    /// refuses sizes outside 8..=16 (ERANGE), CPUs past 64 (EINVAL), a NULL
     /// set (EFAULT) and a set with no available CPU (EDEADLK, unchanged);
     /// the process target reaches every live thread (reference
     /// GuestAvailableCpumask cases); pthread_setaffinity_np is the same on
@@ -1825,8 +1826,8 @@ mod tests {
             assert_eq!(call(&mut ctx, 1, -1, 16, set), -1);
             assert_eq!(ctx.read_u32(errno), Some(22));
             ctx.write_u64(set + 8, 0);
-            assert_eq!(call(&mut ctx, 1, -1, 32, set), 0);
-            for size in [4u64, 33] {
+            assert_eq!(call(&mut ctx, 1, -1, 16, set), 0);
+            for size in [4u64, 17, 24, 32, 33] {
                 assert_eq!(call(&mut ctx, 1, -1, size, set), -1);
                 assert_eq!(ctx.read_u32(errno), Some(34));
             }
@@ -1850,10 +1851,11 @@ mod tests {
             assert_eq!(ctx.read_u32(errno), Some(3));
             // pthread_setaffinity_np: the same rules, error numbers returned.
             ctx.write_u64(set, last);
-            assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, bystander, 32, set), 0);
+            assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, bystander, 16, set), 0);
             assert_eq!(affinity_of(&mut ctx, bystander), last);
             assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, bystander, 4, set), 34);
-            assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, 0, 32, set), 3);
+            assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, bystander, 32, set), 34);
+            assert_eq!(crate::pthread::test_setaffinity_np(&mut ctx, 0, 16, set), 3);
             // Back to the default process cpuset.
             ctx.write_u64(set + 0x80, 0x7F);
             assert_eq!(call(&mut ctx, 2, -1, 8, set + 0x80), 0);

@@ -223,7 +223,7 @@ pub fn line() -> String {
         own_usage().unwrap_or_default(),
         crate::backend::pipeline_stalls(),
         ab
-    )
+    ) + &super::probe::summary()
 }
 
 #[cfg(test)]

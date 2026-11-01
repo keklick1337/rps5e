@@ -30,6 +30,8 @@ pub struct PageDeps {
     /// What the result was derived from, read by read (see
     /// [`Self::revalidate`]); None when not recorded or too many.
     contents: Option<smallvec::SmallVec<[Content; 8]>>,
+    /// Bytes of the [`Content::Bytes`] entries in `contents`.
+    content_bytes: usize,
 }
 
 /// One input of a result: bytes read from guest memory (their hash), or
@@ -112,14 +114,17 @@ impl PageDeps {
     /// [`Self::revalidate`]).
     pub fn record_contents(&mut self) {
         self.contents = Some(smallvec::SmallVec::new());
+        self.content_bytes = 0;
     }
 
     fn push_content(&mut self, c: Content) {
         if let Some(list) = &mut self.contents {
-            let bytes: usize = list.iter().map(|c| if let Content::Bytes { len, .. } = c { *len as usize } else { 0 }).sum();
-            if list.len() >= MAX_CONTENTS || bytes > MAX_CONTENT_BYTES {
+            if list.len() >= MAX_CONTENTS || self.content_bytes > MAX_CONTENT_BYTES {
                 self.contents = None;
             } else if list.last() != Some(&c) {
+                if let Content::Bytes { len, .. } = c {
+                    self.content_bytes += len as usize;
+                }
                 list.push(c);
             }
         }

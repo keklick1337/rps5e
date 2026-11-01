@@ -389,23 +389,65 @@ fn signed_out_output(ctx: &CpuContext, out: u64, len: usize) -> HleResult {
     ERR_SIGNED_OUT as i64
 }
 
-/// sceNpGetAccountAge(reqId, userId, uint8_t* age)
+/// sceNpGetAccountAge(reqId, userId, uint8_t* age): a server request. The
+/// age is cleared and the request completes as signed out: a synchronous
+/// request returns SIGNED_OUT, an asynchronous one returns 0 and reports
+/// SIGNED_OUT through sceNpPollAsync.
 fn cb_get_account_age(ctx: &mut CpuContext) -> HleResult {
     let (req, out) = (ctx.rdi() as i32, ctx.rdx());
     if req <= 0 || out == 0 {
         return ERR_INVALID_ARGUMENT as i64;
     }
-    signed_out_output(ctx, out, 1)
+    if np_request_completion() == Completion::None {
+        return signed_out_output(ctx, out, 1);
+    }
+    let mut st = state();
+    let Some(r) = st.request(req) else {
+        return ERR_REQUEST_NOT_FOUND as i64;
+    };
+    if !clear(ctx, out, 1) {
+        return ERR_MEMORY_FAULT as i64;
+    }
+    complete_signed_out(r) as i64
 }
 
-/// sceNpGetAccountLanguage2(reqId, userId, SceNpLanguageCode*): the output
-/// is left untouched.
+/// sceNpGetAccountLanguage2(reqId, userId, SceNpLanguageCode*): the
+/// output is left untouched and SIGNED_OUT is returned without completing
+/// the request. Completing it like sceNpGetAccountAge
+/// (`RPS5E_NP_REQUEST_COMPLETION=all`) makes Demon's Souls show "Unable to
+/// connect to the server" at the title; which of the two the console does
+/// is not known.
 fn cb_get_account_language2(ctx: &mut CpuContext) -> HleResult {
     let (req, out) = (ctx.rdi() as i32, ctx.rdx());
     if req <= 0 || out == 0 {
         return ERR_INVALID_ARGUMENT as i64;
     }
-    with_request(req, |_| ERR_SIGNED_OUT)
+    if np_request_completion() != Completion::All {
+        return with_request(req, |_| ERR_SIGNED_OUT);
+    }
+    with_request(req, complete_signed_out)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    /// No account query completes its request.
+    None,
+    /// sceNpGetAccountAge completes its request (default).
+    Age,
+    /// sceNpGetAccountAge and sceNpGetAccountLanguage2 complete theirs.
+    All,
+}
+
+/// `RPS5E_NP_REQUEST_COMPLETION`: `0` restores the account age query that
+/// returned SIGNED_OUT without completing its request (an asynchronous
+/// request then never finished); `all` completes the language request too.
+fn np_request_completion() -> Completion {
+    static MODE: std::sync::OnceLock<Completion> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("RPS5E_NP_REQUEST_COMPLETION").as_deref() {
+        Ok("0") | Ok("off") => Completion::None,
+        Ok("all") => Completion::All,
+        _ => Completion::Age,
+    })
 }
 
 fn cb_create_request(_ctx: &mut CpuContext) -> HleResult {
@@ -799,6 +841,45 @@ mod tests {
         }
         assert_eq!(st.create_request(false), ERR_REQUEST_MAX);
         assert!(st.request(0).is_none());
+    }
+
+    /// sceNpGetAccountAge completes its request: an async request returns 0
+    /// and its poll reports SIGNED_OUT (before, the poll answered INVALID_ID
+    /// forever); a sync request returns SIGNED_OUT; a second query on a
+    /// completed request is an argument error; an unknown request is
+    /// REQUEST_NOT_FOUND and leaves the output alone.
+    #[test]
+    fn account_age_completes_its_request() {
+        let vm = ps5vm::VirtualMemory::new();
+        const BASE: u64 = 0x5D0B_4000_0000;
+        vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
+        let mut ctx = CpuContext::new(&vm);
+        ctx.write_u64(BASE, ASYNC_PARAM_SIZE);
+        args(&mut ctx, &[BASE]);
+        let req = cb_create_async_request(&mut ctx);
+        assert!(req > 0);
+        ctx.write_bytes(BASE + 0x40, &[0x55]);
+        args(&mut ctx, &[req as u64, 1, BASE + 0x40]);
+        assert_eq!(cb_get_account_age(&mut ctx), 0);
+        assert_eq!(ctx.read_bytes(BASE + 0x40, 1).unwrap(), vec![0]);
+        args(&mut ctx, &[req as u64, BASE + 0x50]);
+        assert_eq!(cb_poll_async(&mut ctx), OK);
+        assert_eq!(ctx.read_u32(BASE + 0x50), Some(ERR_SIGNED_OUT as u32));
+        args(&mut ctx, &[req as u64, 1, BASE + 0x40]);
+        assert_eq!(cb_get_account_age(&mut ctx), ERR_INVALID_ARGUMENT as i64);
+        args(&mut ctx, &[]);
+        let sync = cb_create_request(&mut ctx);
+        assert!(sync > 0);
+        args(&mut ctx, &[sync as u64, 1, BASE + 0x40]);
+        assert_eq!(cb_get_account_age(&mut ctx), ERR_SIGNED_OUT as i64);
+        ctx.write_bytes(BASE + 0x40, &[0x66]);
+        args(&mut ctx, &[0x7FFF, 1, BASE + 0x40]);
+        assert_eq!(cb_get_account_age(&mut ctx), ERR_REQUEST_NOT_FOUND as i64);
+        assert_eq!(ctx.read_bytes(BASE + 0x40, 1).unwrap(), vec![0x66]);
+        for id in [req, sync] {
+            args(&mut ctx, &[id as u64]);
+            assert_eq!(cb_delete_request(&mut ctx), 0);
+        }
     }
 
     #[test]

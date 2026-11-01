@@ -4,6 +4,10 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+### Added
+
+- On-screen keyboard for games' text input dialogs (sceImeDialog), drawn over the game: type on the keyboard (Enter accepts, Esc cancels) or use the controller (D-pad and Cross on the keys, Circle cancels, Triangle space, Square delete, L1 / R1 move the caret, L2 shift, R2 or Options accept), or click the keys. The game's pads read released while it is shown, and buttons still held when it (or the in-game menu) closes reach the game only after they are released. Before, the dialog was accepted at once with a default text (Demon's Souls' character name). Runs without a window, scripted runs and input recordings and replays still finish the dialog by themselves; `RPS5E_IME_HEADLESS=1` does so with a window too.
+
 ### Changed
 
 - Play mode no longer waits for shaders at all: a draw whose pipeline is still compiling is skipped from the first frame and drawn from the frame its pipeline is ready (the per-frame wait of 3 ms is now 0, `--compile-wait`); a pipeline the pipeline cache already holds is made on the spot instead of being skipped (`RPS5E_INLINE_PROBE`). Draws that write memory, draws without render targets and compute dispatches still wait, since the game and later GPU work read what they write.
@@ -11,8 +15,13 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 - Compiles are ordered by need: the shaders a draw or dispatch needs now, then the saved list, then the compile lookahead's guesses; an eighth of the compile workers is kept free for the shaders needed now.
 - The compile lookahead also reads the command buffers already queued after the current one, on every GPU queue, and reads past flips and conditional commands (`RPS5E_LOOKAHEAD_QUEUED`, `RPS5E_LOOKAHEAD_GUESS`); the GPU command thread starts it whenever it meets a new compute program (`RPS5E_LOOKAHEAD_EAGER`), so it also works while draws are recorded on their own thread, where it found nothing before.
 
+- Demon's Souls gameplay runs about 1.4-2x faster (user's play recording, frames after the 3rd Triangle: 4.2 → 6.2-8.8 fps; 3 of 3 A/B pairs faster in one run, 5.97 → 8.50 fps). Shader resources read from a guest memory page that also holds GPU results no longer count as GPU-written when the GPU never wrote those bytes, or when its copy back to guest memory already finished: such reads waited 20-40 ms for all queued GPU work, and descriptor-table words were copied on the GPU, which split almost every draw into its own render pass and tripled the GPU time in runs where the game's tables shared a page with GPU output (`RPS5E_UNWRITTEN_WORDS`, `RPS5E_LANDED_WORDS`). The GPU command thread also prepares the shaders of GPU-indirect draws the way the recording thread records them, so they are no longer prepared twice (`RPS5E_PREFETCH_INDIRECT`), and remembers per page whether it holds GPU results while it reads a shader's resources (`RPS5E_DIRTY_PAGE_MEMO`).
+
 ### Fixed
 
+- DOOM: The Dark Ages gets past "PRESS (X) TO START": `sceNpGetAccountAge` now completes its request as signed out, so the game's `sceNpPollAsync` reports the result (it answered "invalid request" forever and the title screen waited). The game goes on to the legal screen, saves its profile and opens the campaign menu. `RPS5E_NP_REQUEST_COMPLETION=0` restores the old behaviour.
+- `cpuset_getaffinity`, `cpuset_setaffinity`, `pthread_getaffinity_np` and `pthread_setaffinity_np` accept sets of 8 to 16 bytes and return ERANGE for other sizes, as measured on the console; `pthread_getaffinity_np` accepted only 32 bytes and the others up to 32.
+- Block-compressed 3D textures in tiled thick layouts (4x4 blocks stacked in depth) are read instead of being bound as empty textures ("image layout (swizzle mode 5, D3, 16 bytes per element)" in DOOM: The Dark Ages and Marvel's Spider-Man 2). `RPS5E_BC_VOLUMES=0` restores the old behaviour.
 - PlayGo reads the chunk count from `playgo-chunks.xml` in the game folder, so games whose dump has no other PlayGo data no longer get "PlayGo not supported" from `scePlayGoOpen` (DOOM: The Dark Ages crashed right after start).
 - DOOM: The Dark Ages no longer loses the GPU ("Vulkan device lost", exit code 3) on the title screen. A slot of the bindless texture set kept its descriptor when a texture's new view got the same handle as its old one, but the driver hands out the handle of a destroyed view again, so the slot still described the destroyed view and sampling it hung the GPU. A slot now belongs to one view of one image.
 - Textures selected through large bindless tables share one slot per view between the tables that read them. DOOM: The Dark Ages reads one texture heap through six tables and filled the 131 072-slot set ("bindless set full"); its draws then failed and the title screen stayed black.

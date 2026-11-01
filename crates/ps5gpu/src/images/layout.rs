@@ -206,6 +206,7 @@ impl LayoutTracker {
                 self.subresources = vec![self.state; (self.levels * self.layers) as usize];
             }
             let r = if partial { range.unwrap() } else { SubRange { base_level: 0, levels: self.levels, base_layer: 0, layers: self.layers } };
+            let emitted = out.len();
             for level in r.base_level..r.base_level + r.levels {
                 for layer in r.base_layer..r.base_layer + r.layers {
                     let s = &mut self.subresources[(level * self.layers + layer) as usize];
@@ -217,6 +218,7 @@ impl LayoutTracker {
                     }
                 }
             }
+            crate::perf::probe::layout((r.levels * r.layers) as u64, (out.len() - emitted) as u64);
             if !partial {
                 self.subresources.clear();
             }

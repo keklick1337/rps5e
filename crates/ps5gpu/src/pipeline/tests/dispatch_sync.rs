@@ -404,3 +404,39 @@ fn dispatch_sync_reads_through_a_gpu_written_vsharp_on_the_device() {
         assert!(frontend(&rig) > 0);
     }
 }
+
+/// A dispatch reading a V# the CPU wrote, on a page GPU work just wrote
+/// other words of: the exact write record shows that the V# was not
+/// written, so the preparation reads it from guest memory without waiting
+/// for the GPU (`RPS5E_UNWRITTEN_WORDS`; with it off the read waits), and
+/// the program reads the right buffer.
+#[test]
+#[ignore]
+fn dispatch_sync_reads_an_unwritten_word_next_to_gpu_results_without_waiting() {
+    let mut g = Guest::new(16 << 20);
+    let mut rig = Rig::with_compiler(&g, |dev| Arc::new(crate::shader::SpirvCompiler::for_device(dev, g.mem)), None, None);
+    let (st, tr) = (store_program(&mut g), table_read_program(&mut g));
+    let input = g.alloc(&asm::bytes(&(0..WORDS as u32).map(|i| 300 + i).collect::<Vec<u32>>()));
+    let mut page = raw_buffer_descriptor(input, (WORDS * 4) as u32).to_vec();
+    page.resize(1024, 0);
+    let table = g.alloc(&asm::bytes(&page));
+    let out = g.zeroed(4096);
+    // GPU work writes 64 words in the second half of the V#'s page.
+    assert_eq!(rig.dispatch(&store(st, table + 0x800, 7)), DrawOutcome::Recorded);
+    assert!(rig.buffers.has_gpu_dirty(table, 16), "the V#'s page holds GPU-written words");
+    let before = rig.buffers.stats();
+    let mut user = vec![table as u32, (table >> 32) as u32, 5, 0];
+    user.extend_from_slice(&raw_buffer_descriptor(out, (WORDS * 4) as u32));
+    assert_eq!(rig.dispatch(&one_wave(tr, &user)), DrawOutcome::Recorded);
+    let after = rig.buffers.stats();
+    let n = |s: &crate::buffers::BufferStats| s.downloads + s.word_landings + s.written_through_waits;
+    let waits = n(&after) - n(&before);
+    let mem = g.mem;
+    assert_eq!(words(&mut rig.buffers, &mut rig.sched, mem, out), expect(305), "the program read through the CPU's V#");
+    assert_eq!(words(&mut rig.buffers, &mut rig.sched, mem, table + 0x800), (0..WORDS as u32).map(|i| 7 + i).collect::<Vec<u32>>(), "the GPU's words");
+    if crate::buffers::unwritten_words_enabled() {
+        assert_eq!(waits, 0, "the V# was read without waiting for the GPU");
+    } else {
+        assert!(waits > 0, "the V# was read after the page came back");
+    }
+}

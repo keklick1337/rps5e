@@ -18,7 +18,11 @@
 //!   input layer neutralises the pads, the frontend pauses the game);
 //! - while the controls overlay key is held ([`set_overlay`]) and the menu
 //!   is closed, [`MenuApp::overlay`] draws over the running game; it takes
-//!   no input (the game keeps it).
+//!   no input (the game keeps it);
+//! - while a system dialog of the game runs (a text entry keyboard,
+//!   [`set_system_dialog`]) and the menu is closed, [`MenuApp::dialog`]
+//!   draws it and has the input like an open menu does
+//!   ([`captures_input`]); the menu can still open over it.
 //!
 //! The egui output is rendered by a small Vulkan pass ([`renderer`],
 //! SPIR-V built with rspirv in [`shaders`]): one pipeline, one combined
@@ -30,7 +34,7 @@
 pub(crate) mod renderer;
 pub mod shaders;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use winit::window::Window;
@@ -44,6 +48,10 @@ pub trait MenuApp: Send {
     fn ui(&mut self, ctx: &egui::Context);
     /// Draw the read-only controls overlay (the menu is closed).
     fn overlay(&mut self, _ctx: &egui::Context) {}
+    /// Add events of a system dialog UI frame (the menu is closed).
+    fn dialog_input(&mut self, _raw: &mut egui::RawInput) {}
+    /// Build one UI frame of the system dialog (the menu is closed).
+    fn dialog(&mut self, _ctx: &egui::Context) {}
 }
 
 type Listener = Arc<dyn Fn(bool) + Send + Sync>;
@@ -52,6 +60,8 @@ static APP: Mutex<Option<Box<dyn MenuApp>>> = Mutex::new(None);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static OPEN: AtomicBool = AtomicBool::new(false);
 static OVERLAY: AtomicBool = AtomicBool::new(false);
+/// Session id of the system dialog on screen (0: none).
+static SYSTEM_DIALOG: AtomicU64 = AtomicU64::new(0);
 static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
 
 /// Install the menu (replacing an earlier one).
@@ -99,9 +109,33 @@ pub fn set_overlay(on: bool) {
 }
 
 /// Whether the controls overlay is drawn: requested, a menu installed to
-/// draw it, and the menu closed.
+/// draw it, and neither the menu nor a system dialog on screen.
 pub fn overlay_shown() -> bool {
-    OVERLAY.load(Ordering::Acquire) && installed() && !is_open()
+    OVERLAY.load(Ordering::Acquire) && installed() && !captures_input()
+}
+
+/// A system dialog with the nonzero session id `id` appears (`visible`)
+/// or goes. Hiding a session that was already replaced by a newer one
+/// changes nothing. Only atomics: callable from guest threads, with locks
+/// held.
+pub fn set_system_dialog(visible: bool, id: u64) {
+    if visible {
+        SYSTEM_DIALOG.store(id, Ordering::Release);
+    } else {
+        let _ = SYSTEM_DIALOG.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Whether a system dialog is drawn: one is active, a menu is installed
+/// to draw it, and the menu is closed.
+pub fn system_dialog_shown() -> bool {
+    SYSTEM_DIALOG.load(Ordering::Acquire) != 0 && installed() && !is_open()
+}
+
+/// Whether the window's input goes to the UI instead of the game: the
+/// menu is open or a system dialog is on screen.
+pub fn captures_input() -> bool {
+    is_open() || (SYSTEM_DIALOG.load(Ordering::Acquire) != 0 && installed())
 }
 
 /// Flip the menu; returns the new state.
@@ -116,16 +150,23 @@ pub fn on_open_change(f: impl Fn(bool) + Send + Sync + 'static) {
     LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(f));
 }
 
-/// Run the installed menu (or, closed, its controls overlay when
-/// `overlay`) for one UI frame (render thread); `extra` adds to the same
-/// frame (the FPS counter).
-pub(crate) fn run_app(raw: &mut egui::RawInput, ctx: &egui::Context, open: bool, overlay: bool, extra: impl Fn(&egui::Context)) -> egui::FullOutput {
+/// Run the installed menu (or, closed, the system dialog when `dialog`,
+/// else its controls overlay when `overlay`) for one UI frame (render
+/// thread); `extra` adds to the same frame (the FPS counter).
+pub(crate) fn run_app(raw: &mut egui::RawInput, ctx: &egui::Context, open: bool, dialog: bool, overlay: bool, extra: impl Fn(&egui::Context)) -> egui::FullOutput {
     let mut g = APP.lock().unwrap_or_else(|e| e.into_inner());
-    match g.as_mut().filter(|_| open || overlay) {
+    match g.as_mut().filter(|_| open || dialog || overlay) {
         Some(app) if open => {
             app.raw_input(raw);
             ctx.run(raw.take(), |ctx| {
                 app.ui(ctx);
+                extra(ctx);
+            })
+        }
+        Some(app) if dialog => {
+            app.dialog_input(raw);
+            ctx.run(raw.take(), |ctx| {
+                app.dialog(ctx);
                 extra(ctx);
             })
         }
@@ -267,20 +308,21 @@ impl Host {
         self.input_pending |= r.repaint;
     }
 
-    /// Run one UI frame: the menu when it is open (else the controls
-    /// overlay with `overlay`), the FPS counter when `fps` is given, the
-    /// compile overlay when `compile` is.
-    pub(crate) fn run(&mut self, window: &Window, open: bool, overlay: bool, fps: Option<f32>, compile: Option<&crate::osd::CompileOverlay>) -> (renderer::UiFrame, egui::TexturesDelta) {
+    /// Run one UI frame: the menu when it is open (else the system dialog
+    /// with `dialog`, else the controls overlay with `overlay`), the FPS
+    /// counter when `fps` is given, the compile overlay when `compile` is.
+    pub(crate) fn run(&mut self, window: &Window, open: bool, dialog: bool, overlay: bool, fps: Option<f32>, compile: Option<&crate::osd::CompileOverlay>) -> (renderer::UiFrame, egui::TexturesDelta) {
         let zoom = zoom_for(window.inner_size().height, window.scale_factor() as f32);
         if (self.ctx.zoom_factor() - zoom).abs() > 0.01 {
             self.ctx.set_zoom_factor(zoom);
         }
         let mut raw = self.state.take_egui_input(window);
-        if !open {
+        let interactive = open || dialog;
+        if !interactive {
             // Closed: the game has the input.
             raw.events.clear();
         }
-        let out = run_app(&mut raw, &self.ctx, open, overlay, |ctx| {
+        let out = run_app(&mut raw, &self.ctx, open, dialog, overlay, |ctx| {
             if let Some(f) = fps {
                 fps_label(ctx, f);
             }
@@ -288,7 +330,7 @@ impl Host {
                 compile_overlay(ctx, c);
             }
         });
-        if open {
+        if interactive {
             self.state.handle_platform_output(window, out.platform_output);
         }
         self.last_run = Some(Instant::now());
@@ -311,6 +353,9 @@ mod tests {
         fn overlay(&mut self, ctx: &egui::Context) {
             egui::Area::new(egui::Id::new("o")).show(ctx, |ui| ui.label("controls"));
         }
+        fn dialog(&mut self, ctx: &egui::Context) {
+            egui::Area::new(egui::Id::new("d")).show(ctx, |ui| ui.label("dialog"));
+        }
     }
 
     #[test]
@@ -332,14 +377,14 @@ mod tests {
         assert_eq!(OPENS.load(Ordering::Relaxed), 1, "no event without a change");
         let ctx = egui::Context::default();
         // (egui lays new areas out invisibly in their first frame.)
-        let _ = run_app(&mut egui::RawInput::default(), &ctx, true, false, |_| {});
-        let out = run_app(&mut egui::RawInput::default(), &ctx, true, false, |_| {});
+        let _ = run_app(&mut egui::RawInput::default(), &ctx, true, false, false, |_| {});
+        let out = run_app(&mut egui::RawInput::default(), &ctx, true, false, false, |_| {});
         assert!(!out.shapes.is_empty());
         // Closed: only the extra content (the FPS counter).
-        let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, |_| {});
+        let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, false, |_| {});
         assert!(out.shapes.is_empty());
-        let _ = run_app(&mut egui::RawInput::default(), &ctx, false, false, |c| fps_label(c, 60.0));
-        let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, |c| fps_label(c, 60.0));
+        let _ = run_app(&mut egui::RawInput::default(), &ctx, false, false, false, |c| fps_label(c, 60.0));
+        let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, false, |c| fps_label(c, 60.0));
         assert!(!out.shapes.is_empty());
         assert!(!toggle());
         assert_eq!(CLOSES.load(Ordering::Relaxed), 1);
@@ -347,13 +392,33 @@ mod tests {
         // menu hides it.
         set_overlay(true);
         assert!(overlay_shown());
-        let _ = run_app(&mut egui::RawInput::default(), &ctx, false, true, |_| {});
-        let out = run_app(&mut egui::RawInput::default(), &ctx, false, true, |_| {});
+        let _ = run_app(&mut egui::RawInput::default(), &ctx, false, false, true, |_| {});
+        let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, true, |_| {});
         assert!(!out.shapes.is_empty(), "the overlay draws");
         assert!(toggle());
         assert!(!overlay_shown());
         assert!(!toggle());
         assert!(!overlay_shown(), "the key was released while the menu was open");
+        // A system dialog takes the input and hides the overlay; the menu
+        // opens over it and the dialog comes back when it closes.
+        assert!(!captures_input());
+        set_overlay(true);
+        set_system_dialog(true, 7);
+        assert!(captures_input() && system_dialog_shown() && !overlay_shown());
+        let _ = run_app(&mut egui::RawInput::default(), &ctx, false, true, false, |_| {});
+        let out = run_app(&mut egui::RawInput::default(), &ctx, false, true, false, |_| {});
+        assert!(!out.shapes.is_empty(), "the dialog draws");
+        assert!(toggle());
+        assert!(captures_input() && !system_dialog_shown());
+        assert!(!toggle());
+        assert!(system_dialog_shown());
+        // A late hide of an older session leaves the newer one.
+        set_system_dialog(true, 8);
+        set_system_dialog(false, 7);
+        assert!(system_dialog_shown());
+        set_system_dialog(false, 8);
+        assert!(!captures_input() && !system_dialog_shown());
+        set_overlay(false);
     }
 
     #[test]
@@ -362,8 +427,8 @@ mod tests {
         let ctx = egui::Context::default();
         let full = CompileOverlay::Full(CompileProgress { done: 10, total: 40, eta: Some(Duration::from_secs(30)), note: "The game starts when this finishes.".into() });
         let shapes = |o: &CompileOverlay| {
-            let _ = run_app(&mut egui::RawInput::default(), &ctx, false, false, |c| compile_overlay(c, o));
-            let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, |c| compile_overlay(c, o));
+            let _ = run_app(&mut egui::RawInput::default(), &ctx, false, false, false, |c| compile_overlay(c, o));
+            let out = run_app(&mut egui::RawInput::default(), &ctx, false, false, false, |c| compile_overlay(c, o));
             out.shapes.len()
         };
         let n_full = shapes(&full);

@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::ime_common::{test_support, utf16, Keycode};
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicI32, AtomicU64};
 
 const BASE: u64 = 0x5D30_0000_0000;
 const PARAM: u64 = BASE;
@@ -378,6 +378,41 @@ fn test_headless_host(env: &Env) {
     set_visibility_callback(Some(noop_visibility));
 }
 
+static SHOWN: AtomicU64 = AtomicU64::new(0);
+static HIDDEN: AtomicU64 = AtomicU64::new(0);
+
+fn recording_visibility(visible: bool, generation: u64) {
+    if visible {
+        SHOWN.store(generation, Ordering::SeqCst);
+    } else {
+        HIDDEN.store(generation, Ordering::SeqCst);
+    }
+}
+
+/// The host UI hears of every session that starts and ends, force close
+/// included; a running dialog with a host UI does not finish by itself.
+fn test_visibility_notifications(env: &Env) {
+    let ctx = env.ctx();
+    set_visibility_callback(Some(recording_visibility));
+    env.set_text("");
+    write_param(env, make_param());
+    assert_eq!(init(&ctx, PARAM, 0), 0);
+    let generation = snapshot().generation;
+    assert_eq!(SHOWN.load(Ordering::SeqCst), generation);
+    for _ in 0..4 {
+        assert_eq!(get_status(&ctx), STATUS_RUNNING as i32, "waits for the user");
+    }
+    assert!(host_cancel(generation));
+    assert_eq!(HIDDEN.load(Ordering::SeqCst), generation);
+    assert_eq!(term(&ctx), 0);
+    assert_eq!(init(&ctx, PARAM, 0), 0);
+    let generation = snapshot().generation;
+    assert_eq!(SHOWN.load(Ordering::SeqCst), generation);
+    assert_eq!(force_close(), 0);
+    assert_eq!(HIDDEN.load(Ordering::SeqCst), generation);
+    set_visibility_callback(Some(noop_visibility));
+}
+
 #[test]
 fn ime_dialog_reference_cases() {
     let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -391,6 +426,7 @@ fn ime_dialog_reference_cases() {
     test_filtered_cursor_boundary(&env);
     test_position_and_form(&env);
     test_headless_host(&env);
+    test_visibility_notifications(&env);
 }
 
 #[test]

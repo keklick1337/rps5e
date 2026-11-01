@@ -24,6 +24,10 @@
 //! - **System**: console language (after restart), pausing the game while
 //!   the menu is open, exit to the launcher.
 //!
+//! The same UI draws the games' text input dialogs (sceImeDialog, an
+//! on-screen keyboard, [`crate::ime_dialog_ui`]) while the menu is closed;
+//! the menu key still opens the menu over a dialog.
+//!
 //! Settings are saved to the game's configuration in `games.toml` (the
 //! launcher's per-game configuration, created from the global settings
 //! when the game has none) and reach the next start as environment
@@ -622,11 +626,26 @@ pub struct InGameMenu {
     actions: NavActions,
     /// Keys egui held at the end of the last frame.
     keys_down: std::collections::HashSet<egui::Key>,
+    /// The on-screen keyboard of a game's text input dialog.
+    pub ime: crate::ime_dialog_ui::ImeDialogUi,
 }
 
 impl InGameMenu {
     pub fn new(state: MenuState) -> Self {
-        InGameMenu { state, actions: NavActions::default(), keys_down: Default::default() }
+        InGameMenu { state, actions: NavActions::default(), keys_down: Default::default(), ime: Default::default() }
+    }
+
+    /// Whether this frame pressed a key bound to the menu.
+    fn menu_key_pressed(&self, ctx: &egui::Context) -> bool {
+        let keys = self.state.menu_keys();
+        ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Key { physical_key: Some(k), pressed: true, repeat: false, .. } => {
+                    crate::keys::key_code(*k).is_some_and(|c| keys.contains(&c))
+                }
+                _ => false,
+            })
+        })
     }
 
     /// The menu opened. Keys pressed while it was open last time were
@@ -679,6 +698,20 @@ impl ps5gpu::menu::MenuApp for InGameMenu {
         }
     }
 
+    fn dialog_input(&mut self, _raw: &mut egui::RawInput) {
+        self.ime.queue_nav(&ps5input::menu::take_nav());
+    }
+
+    fn dialog(&mut self, ctx: &egui::Context) {
+        // The menu key opens the menu over the dialog (the window's keys go
+        // to the UI while the dialog is shown).
+        if self.menu_key_pressed(ctx) {
+            ps5gpu::menu::set_open(true);
+            return;
+        }
+        self.ime.show(ctx);
+    }
+
     fn overlay(&mut self, ctx: &egui::Context) {
         let cfg = self.state.effective_input();
         let source = self.state.bindings_source();
@@ -692,17 +725,8 @@ impl ps5gpu::menu::MenuApp for InGameMenu {
         let capturing = self.state.bindings.capturing();
         // Close: Resume, Escape / the menu key (not while binding), the
         // controller's Options, or Circle with nothing to back out of.
-        let keys = self.state.menu_keys();
-        let (escape, menu_key) = ctx.input(|i| {
-            let esc = i.key_pressed(egui::Key::Escape);
-            let menu = i.events.iter().any(|e| match e {
-                egui::Event::Key { physical_key: Some(k), pressed: true, repeat: false, .. } => {
-                    crate::keys::key_code(*k).is_some_and(|c| keys.contains(&c))
-                }
-                _ => false,
-            });
-            (esc, menu)
-        });
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let menu_key = self.menu_key_pressed(ctx);
         let mut close = !capturing && (actions.close || menu_key || (escape && !popup));
         if self.state.hint {
             if !close {
@@ -780,6 +804,8 @@ pub fn install(eboot: &Path) {
     let inputs = input_dir(config_dir.as_deref());
     let state = MenuState::new(GameInfo::detect(eboot), config_dir, inputs, Started::from_env());
     ps5gpu::menu::install(Box::new(InGameMenu::new(state)));
+    // Text input dialogs are drawn by the menu's UI and wait for the user.
+    crate::ime_dialog_ui::install();
     ps5gpu::menu::on_open_change(|open| {
         if open {
             JUST_OPENED.store(true, Ordering::Release);

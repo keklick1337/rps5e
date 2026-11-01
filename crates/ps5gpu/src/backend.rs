@@ -898,14 +898,17 @@ impl Backend {
         // The interpreter-side prefetch checks page state without the
         // back-end lock.
         crate::pipeline::frontend::set_tracker(tracker.clone());
+        let buffers = BufferCache::new(dev, memory, tracker.clone())?;
+        let sched = Scheduler::new(dev)?;
+        crate::pipeline::frontend::set_written_words(buffers.written_words(), sched.timeline.clone());
         // Read the switches here: the fault handler must not be the first
         // to ask (environment lookups allocate).
         crate::memory::landing_enabled();
         Ok(Backend {
             dev: dev.clone(),
-            sched: Scheduler::new(dev)?,
+            sched,
             memory,
-            buffers: BufferCache::new(dev, memory, tracker.clone())?,
+            buffers,
             images: ImageCache::new(dev, memory)?,
             tracker,
             pipelines: crate::pipeline::default_provider(dev, memory),
@@ -3589,7 +3592,12 @@ pub mod ab {
 
     fn start() -> std::time::Instant {
         static S: OnceLock<std::time::Instant> = OnceLock::new();
-        *S.get_or_init(std::time::Instant::now)
+        *S.get_or_init(|| {
+            // The periods count from here (analysis scripts align the
+            // frame times to this line).
+            log::info!("[ab] periods start (fast first, {} s each)", period().unwrap_or(0));
+            std::time::Instant::now()
+        })
     }
 
     #[inline]
@@ -5464,6 +5472,8 @@ fn summary_locked() -> Option<String> {
             b.dev.arena.stats().used_bytes >> 20,
             provider
         ) + &format!(" unranged-syncs={}/{}buf", bf.unranged_syncs, bf.unranged_synced_buffers) + &format!(" watch-index-misses={}", crate::images::WATCH_INDEX_MISSES.load(Ordering::Relaxed))
+            + &format!(" unwritten-words={} landed-words={}", crate::buffers::UNWRITTEN_WORD_READS.load(Ordering::Relaxed), crate::buffers::LANDED_WORD_READS.load(Ordering::Relaxed))
+            + &format!(" scope-breakers=[{}]", crate::scheduler::scope_breakers_line())
             + &gpu_time_line(b.sched.stats().gpu, &b.sched.gpu_top(gpu_top_count()))
             + &profile::line()
             + &ab::line()

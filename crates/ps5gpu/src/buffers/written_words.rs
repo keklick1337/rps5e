@@ -39,11 +39,18 @@ fn in_place_enabled() -> bool {
 pub(super) struct WrittenWords {
     /// start -> (end, state); the ranges never overlap.
     map: BTreeMap<u64, (u64, State)>,
+    /// Ranges of records dropped when the record was full (start -> end,
+    /// merged, never overlapping): GPU work may have written there.
+    lost: BTreeMap<u64, u64>,
+    /// Too much was dropped to keep: no byte is known unwritten.
+    lost_all: bool,
 }
 
 impl WrittenWords {
     /// Ranges kept at most; a full record is cleared.
     const MAX: usize = 16384;
+    /// Dropped ranges kept at most (then nothing is known unwritten).
+    const LOST_MAX: usize = 65536;
 
     /// Take `[start, end)` out of every range (the parts outside stay).
     fn cut(&mut self, start: u64, end: u64) {
@@ -71,7 +78,10 @@ impl WrittenWords {
             return;
         }
         if self.map.len() >= Self::MAX {
-            self.map.clear();
+            let dropped = std::mem::take(&mut self.map);
+            for (s, (e, _)) in dropped {
+                self.lose(s, e);
+            }
         }
         self.cut(start, end);
         self.map.insert(start, (end, state));
@@ -127,10 +137,78 @@ impl WrittenWords {
         self.insert(addr.max(page_start), (addr + size).min(page_end), State::Landed(tick));
     }
 
+    /// Remember that GPU work may have written `[start, end)` although its
+    /// record is gone.
+    fn lose(&mut self, start: u64, end: u64) {
+        if self.lost_all || start >= end {
+            return;
+        }
+        let (mut s, mut e) = (start, end);
+        // Merge with every lost range touching it.
+        let touching: smallvec::SmallVec<[u64; 8]> = self.lost.range(..=end).rev().take_while(|(_, &le)| le >= start).map(|(&ls, _)| ls).collect();
+        for k in touching {
+            let le = self.lost.remove(&k).expect("listed range");
+            s = s.min(k);
+            e = e.max(le);
+        }
+        self.lost.insert(s, e);
+        if self.lost.len() > Self::LOST_MAX {
+            self.lost.clear();
+            self.lost_all = true;
+        }
+    }
+
     /// The guest pages `[addr, addr+size)` hold no GPU data any more (they
     /// were downloaded or unmapped).
     pub fn forget(&mut self, addr: u64, size: u64) {
         self.cut(addr, addr + size);
+        let end = addr + size;
+        let keys: smallvec::SmallVec<[u64; 8]> = self.lost.range(..end).rev().take_while(|(_, &le)| le > addr).map(|(&ls, _)| ls).collect();
+        for k in keys {
+            let le = self.lost.remove(&k).expect("listed range");
+            if k < addr {
+                self.lost.insert(k, addr);
+            }
+            if le > end {
+                self.lost.insert(end, le);
+            }
+        }
+    }
+
+    /// What guest memory holds of `[addr, addr+size)`: no GPU work wrote
+    /// any byte of it (`Some(0)`), or the bytes GPU work wrote all landed
+    /// with write-throughs, the newest at the returned tick (`Some(tick)`);
+    /// None when a byte is pending or its record was dropped.
+    pub fn in_guest_memory_after(&self, addr: u64, size: u64) -> Option<u64> {
+        let end = addr + size;
+        if self.lost_all || self.lost.range(..end).next_back().is_some_and(|(_, &le)| le > addr) {
+            return None;
+        }
+        let mut tick = 0;
+        for (_, &(_, st)) in self.overlapping(addr, end) {
+            match st {
+                State::Pending => return None,
+                State::Landed(t) => tick = tick.max(t),
+            }
+        }
+        Some(tick)
+    }
+
+    /// The records of `[start, end)` (one page) for many questions without
+    /// the lock: see [`PageWords`].
+    pub fn page_words(&self, start: u64, end: u64) -> PageWords {
+        let lost = self.lost_all || self.lost.range(..end).next_back().is_some_and(|(_, &le)| le > start);
+        let ranges = if lost {
+            smallvec::SmallVec::new()
+        } else {
+            self.overlapping(start, end)
+                .map(|(&s, &(e, st))| (s, e, match st {
+                    State::Pending => None,
+                    State::Landed(t) => Some(t),
+                }))
+                .collect()
+        };
+        PageWords { start, end, lost, ranges }
     }
 
     /// Diagnostics: the recorded ranges overlapping `[start, end)`.
@@ -165,6 +243,34 @@ impl WrittenWords {
             }
         }
         None
+    }
+}
+
+/// A copy of the write records of one page (see
+/// [`WrittenWords::page_words`]).
+#[derive(Clone)]
+pub struct PageWords {
+    pub start: u64,
+    pub end: u64,
+    lost: bool,
+    /// (start, end, landing tick or None while pending).
+    ranges: smallvec::SmallVec<[(u64, u64, Option<u64>); 8]>,
+}
+
+impl PageWords {
+    /// [`WrittenWords::in_guest_memory_after`] for a range inside the page.
+    pub fn in_guest_memory_after(&self, addr: u64, size: u64) -> Option<u64> {
+        let end = addr + size;
+        if self.lost || addr < self.start || end > self.end {
+            return None;
+        }
+        let mut tick = 0;
+        for &(s, e, st) in &self.ranges {
+            if s < end && e > addr {
+                tick = tick.max(st?);
+            }
+        }
+        Some(tick)
     }
 }
 
@@ -254,6 +360,49 @@ mod tests {
                 assert_eq!(a.map, b.map);
             }
         }
+    }
+
+    /// A word next to a written range on the same page is known unwritten;
+    /// ranges dropped from a full record are not, until they are forgotten.
+    #[test]
+    fn unwritten_words_stay_known_across_a_full_record() {
+        let mut w = WrittenWords::default();
+        w.written(0x15c0, 0xb8);
+        assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0));
+        assert!(w.in_guest_memory_after(0x1674, 4) != Some(0), "last word of the range");
+        assert!(w.in_guest_memory_after(0x1690, 4) == Some(0), "after the range on its page");
+        assert!(w.in_guest_memory_after(0x1000, 4) == Some(0), "before it");
+        w.written_through(0x1000, 0x2000, 0x15c0, 0xb8, 5);
+        assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0), "landed is still written");
+        for i in 0..WrittenWords::MAX as u64 {
+            w.written(0x100000 + i * 16, 8);
+        }
+        assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0), "dropped from the full record");
+        assert!(w.in_guest_memory_after(0x1690, 4) == Some(0));
+        assert!(w.in_guest_memory_after(0x100000 + 5 * 16, 4) != Some(0));
+        assert!(w.in_guest_memory_after(0x100000 + 5 * 16 + 8, 4) == Some(0), "a gap between dropped ranges");
+        w.forget(0x1000, 0x1000);
+        assert!(w.in_guest_memory_after(0x15c0, 4) == Some(0), "downloaded and forgotten");
+    }
+
+    /// Guest memory holds a word once nothing pending covers it: at once
+    /// when unwritten, after the newest landing tick otherwise.
+    #[test]
+    fn guest_memory_holds_unwritten_and_landed_words() {
+        let mut w = WrittenWords::default();
+        assert_eq!(w.in_guest_memory_after(0x1000, 4), Some(0));
+        w.written(0x1000, 0x10);
+        assert_eq!(w.in_guest_memory_after(0x1000, 4), None, "pending");
+        assert_eq!(w.in_guest_memory_after(0x1010, 4), Some(0), "next to it");
+        w.written_through(0x1000, 0x2000, 0x1000, 0x10, 9);
+        assert_eq!(w.in_guest_memory_after(0x100c, 8), Some(9), "half landed, half unwritten");
+        let page = w.page_words(0x1000, 0x2000);
+        assert_eq!(page.in_guest_memory_after(0x100c, 8), Some(9), "the page copy agrees");
+        assert_eq!(page.in_guest_memory_after(0x1f00, 4), Some(0));
+        assert_eq!(page.in_guest_memory_after(0x2000, 4), None, "outside the page");
+        w.written(0x1004, 4);
+        assert_eq!(w.in_guest_memory_after(0x1000, 0x10), None, "rewritten");
+        assert_eq!(w.page_words(0x1000, 0x2000).in_guest_memory_after(0x1004, 4), None);
     }
 
     #[test]

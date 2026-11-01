@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 //! Controller side of the in-game menu (`ps5gpu::menu`): while it is open
-//! the guest sees neutral pads, the input thread turns player 1's
-//! controller into navigation steps ([`Nav`], with auto-repeat for
-//! directions) and publishes the connected controllers and their raw
+//! (or a system dialog such as the on-screen keyboard is shown) the guest
+//! sees neutral pads, the input thread turns player 1's controller into
+//! navigation steps ([`Nav`], with auto-repeat for directions and Square)
+//! and publishes the connected controllers and their raw
 //! inputs (device choice and binding capture in the menu). The PS button
 //! (`Guide`, when no pad button is bound to it) opens and closes the menu.
 
@@ -34,6 +35,12 @@ pub enum Nav {
     NextTab,
     /// Options: close the menu.
     Close,
+    /// Square, Triangle, L2 and R2 (the on-screen keyboard: backspace,
+    /// space, shift, done).
+    Square,
+    Triangle,
+    L2,
+    R2,
 }
 
 /// Delay before a held direction repeats, and the repeat period.
@@ -43,9 +50,30 @@ pub const REPEAT: Duration = Duration::from_millis(90);
 /// Stick deflection (from centre, of 128) that counts as a direction.
 const STICK_THRESHOLD: i32 = 64;
 
-const INPUTS: [Nav; 9] = [Nav::Up, Nav::Down, Nav::Left, Nav::Right, Nav::Accept, Nav::Back, Nav::PrevTab, Nav::NextTab, Nav::Close];
+const COUNT: usize = 13;
 
-fn held(s: &HostPadState) -> [bool; 9] {
+const INPUTS: [Nav; COUNT] = [
+    Nav::Up,
+    Nav::Down,
+    Nav::Left,
+    Nav::Right,
+    Nav::Accept,
+    Nav::Back,
+    Nav::PrevTab,
+    Nav::NextTab,
+    Nav::Close,
+    Nav::Square,
+    Nav::Triangle,
+    Nav::L2,
+    Nav::R2,
+];
+
+/// Inputs that repeat while held: the directions and Square (backspace).
+fn repeats(n: Nav) -> bool {
+    matches!(n, Nav::Up | Nav::Down | Nav::Left | Nav::Right | Nav::Square)
+}
+
+fn held(s: &HostPadState) -> [bool; COUNT] {
     let b = |bit| s.buttons & bit != 0;
     let (x, y) = (s.left_x as i32 - 128, s.left_y as i32 - 128);
     [
@@ -58,14 +86,21 @@ fn held(s: &HostPadState) -> [bool; 9] {
         b(button::L1),
         b(button::R1),
         b(button::OPTIONS),
+        b(button::SQUARE),
+        b(button::TRIANGLE),
+        b(button::L2) || s.l2 >= TRIGGER_THRESHOLD,
+        b(button::R2) || s.r2 >= TRIGGER_THRESHOLD,
     ]
 }
+
+/// Trigger travel (of 255) that counts as a press.
+const TRIGGER_THRESHOLD: u8 = 128;
 
 /// Edge detection and auto-repeat of the navigation inputs.
 #[derive(Clone, Debug, Default)]
 pub struct NavState {
-    held: [bool; 9],
-    next_repeat: [Option<Instant>; 9],
+    held: [bool; COUNT],
+    next_repeat: [Option<Instant>; COUNT],
 }
 
 impl NavState {
@@ -73,17 +108,16 @@ impl NavState {
     /// that opened the menu).
     pub fn reset(&mut self, s: &HostPadState) {
         self.held = held(s);
-        self.next_repeat = [None; 9];
+        self.next_repeat = [None; COUNT];
     }
 
     /// Steps for the controller state `s` at `now`.
     pub fn update(&mut self, s: &HostPadState, now: Instant, out: &mut Vec<Nav>) {
         let h = held(s);
         for i in 0..INPUTS.len() {
-            let direction = i < 4;
             if h[i] && !self.held[i] {
                 out.push(INPUTS[i]);
-                self.next_repeat[i] = direction.then_some(now + FIRST_REPEAT);
+                self.next_repeat[i] = repeats(INPUTS[i]).then_some(now + FIRST_REPEAT);
             } else if h[i] {
                 if let Some(t) = self.next_repeat[i].filter(|t| now >= *t) {
                     out.push(INPUTS[i]);
@@ -196,6 +230,26 @@ mod tests {
         assert_eq!(out, [Nav::Back]);
         n.update(&pad(button::L1), t, &mut out);
         assert_eq!(out, [Nav::Back, Nav::PrevTab]);
+    }
+
+    #[test]
+    fn keyboard_buttons_and_triggers() {
+        let t = Instant::now();
+        let mut n = NavState::default();
+        let mut out = Vec::new();
+        n.update(&pad(button::TRIANGLE | button::R2), t, &mut out);
+        assert_eq!(out, [Nav::Triangle, Nav::R2]);
+        out.clear();
+        // An analog trigger past half its travel is a press.
+        n.update(&HostPadState { l2: 100, ..HostPadState::NEUTRAL }, t, &mut out);
+        assert!(out.is_empty());
+        n.update(&HostPadState { l2: 200, ..HostPadState::NEUTRAL }, t, &mut out);
+        assert_eq!(out, [Nav::L2]);
+        out.clear();
+        // Square (backspace) repeats; Triangle does not.
+        n.update(&pad(button::SQUARE | button::TRIANGLE), t, &mut out);
+        n.update(&pad(button::SQUARE | button::TRIANGLE), t + FIRST_REPEAT, &mut out);
+        assert_eq!(out, [Nav::Square, Nav::Triangle, Nav::Square]);
     }
 
     #[test]

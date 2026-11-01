@@ -22,6 +22,7 @@ pub mod frames;
 pub mod gpu;
 pub mod items;
 pub mod panel;
+pub mod probe;
 pub mod proc;
 pub mod shaders;
 pub mod sys;

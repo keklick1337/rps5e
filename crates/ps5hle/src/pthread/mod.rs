@@ -1296,30 +1296,46 @@ fn px_rename(ctx: &mut CpuContext) -> HleResult {
     posix_error(cb_rename(ctx))
 }
 
-/// Size of a FreeBSD `cpuset_t` (256 CPUs).
-const CPUSET_BYTES: u64 = 32;
+/// Set sizes the console's cpuset calls accept (cpuset_getaffinity,
+/// cpuset_setaffinity, pthread_getaffinity_np, measured on a PS5: 8 to 16
+/// bytes; below 8 and from 24 up ERANGE; 17..23 were not measured and are
+/// refused like 24). The mask fills the first 8 bytes.
+pub(crate) const CPUSET_SIZES: std::ops::RangeInclusive<u64> = 8..=16;
+
+/// Whether a cpuset call accepts a set of `size` bytes ([`CPUSET_SIZES`]);
+/// the first refusal of a larger set is logged (FreeBSD itself takes up to
+/// 32 bytes, so a game built against that size is visible in the log).
+pub(crate) fn cpuset_size_ok(size: u64) -> bool {
+    let ok = CPUSET_SIZES.contains(&size);
+    if !ok && size > *CPUSET_SIZES.end() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| log::info!("[pthread] cpuset of {size} bytes refused with ERANGE (the console takes 8..16)"));
+    }
+    ok
+}
 const POSIX_EINVAL: HleResult = 22;
 const POSIX_ESRCH: HleResult = 3;
 const POSIX_EFAULT: HleResult = 14;
 const POSIX_ERANGE: HleResult = 34;
 
 /// pthread_getaffinity_np(thread, cpusetsize, cpuset_t*) -> 0 or an error
-/// number, FreeBSD 11's: EINVAL for a NULL thread, ERANGE for any size but
-/// a full cpuset_t (32 bytes), EFAULT for a NULL set, ESRCH for an unknown
-/// thread. The mask fills the first 8 bytes, the rest of the set is zero.
+/// number: EINVAL for a NULL thread, ERANGE for a size outside
+/// [`CPUSET_SIZES`], EFAULT for a NULL set, ESRCH for an unknown thread.
+/// The mask fills the first 8 bytes, the rest of the `cpusetsize` bytes is
+/// zero.
 fn px_getaffinity(ctx: &mut CpuContext) -> HleResult {
     let (handle, size, set) = (ctx.rdi(), ctx.rsi(), ctx.rdx());
     if handle == 0 {
         return POSIX_EINVAL;
     }
-    if size != CPUSET_BYTES {
+    if !cpuset_size_ok(size) {
         return POSIX_ERANGE;
     }
     if set == 0 {
         return POSIX_EFAULT;
     }
     let Some(info) = thread(handle) else { return POSIX_ESRCH };
-    let mut bytes = [0u8; CPUSET_BYTES as usize];
+    let mut bytes = vec![0u8; size as usize];
     bytes[..8].copy_from_slice(&info.attr.lock().unwrap().affinity.to_le_bytes());
     if ctx.write_bytes(set, &bytes) { OK } else { POSIX_EFAULT }
 }
@@ -1337,12 +1353,12 @@ pub(crate) enum CpusetTarget {
 }
 
 /// FreeBSD cpuset_setaffinity on a cpuset_t at `set` of `size` bytes ->
-/// 0 or an error number: ERANGE for a size outside 8..=32, EFAULT for a
+/// 0 or an error number: ERANGE for a size outside [`CPUSET_SIZES`], EFAULT for a
 /// NULL set, EINVAL for a CPU beyond the 64 the mask holds, EDEADLK when
 /// none of the requested CPUs is available to the game (the bits outside
 /// the available mask are dropped), ESRCH for an unknown thread.
 pub(crate) fn set_cpuset_affinity(ctx: &CpuContext, target: CpusetTarget, size: u64, set: u64) -> HleResult {
-    if !(8..=CPUSET_BYTES).contains(&size) {
+    if !cpuset_size_ok(size) {
         return POSIX_ERANGE;
     }
     if set == 0 {

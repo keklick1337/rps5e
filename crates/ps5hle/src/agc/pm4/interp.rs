@@ -865,7 +865,9 @@ impl Interpreter {
             return;
         }
         if packet.kind.indirect() {
+            let t = ps5gpu::perf::probe::start();
             self.apply_indirect_arguments(&packet);
+            ps5gpu::perf::probe::indirect(t);
         }
         self.record_draw(stack, p, packet);
     }

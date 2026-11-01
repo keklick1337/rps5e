@@ -8,8 +8,8 @@
 use super::plan::ShaderResourcePlan;
 use super::value::{evaluate_operation, ValueId, ValueKind};
 use crate::inline_constants;
+use crate::fxhash::HashMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 /// Device addresses carry 48 bits; upper handle bits are ignored.
 pub const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -171,7 +171,7 @@ impl<'a> RuntimeValueEvaluator<'a> {
             clean_flat_slots,
             clean,
             active_mask,
-            cache: RefCell::new(HashMap::new()),
+            cache: RefCell::new(HashMap::with_capacity_and_hasher(32, Default::default())),
             visiting: RefCell::new(Vec::new()),
         }
     }

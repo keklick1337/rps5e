@@ -427,6 +427,29 @@ pub struct RenderingKey {
 }
 
 /// Command recording + submission with completion callbacks.
+/// The code that ended rendering scopes for other work (scope end
+/// reason 2), with counts (profile only, `RPS5E_GPU_PROFILE`): where a
+/// frame's draws stop sharing their scopes.
+static SCOPE_BREAKERS: std::sync::Mutex<Vec<(&'static std::panic::Location<'static>, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn note_scope_breaker(at: &'static std::panic::Location<'static>) {
+    if !crate::backend::profile::on() {
+        return;
+    }
+    let mut g = SCOPE_BREAKERS.lock().unwrap_or_else(|e| e.into_inner());
+    match g.iter_mut().find(|(l, _)| std::ptr::eq(*l, at) || **l == *at) {
+        Some(e) => e.1 += 1,
+        None => g.push((at, 1)),
+    }
+}
+
+/// The most frequent scope breakers so far (`file:line=count`).
+pub fn scope_breakers_line() -> String {
+    let mut v = SCOPE_BREAKERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    v.iter().take(8).map(|(l, n)| format!("{}:{}={n}", l.file().rsplit('/').next().unwrap_or(""), l.line())).collect::<Vec<_>>().join(" ")
+}
+
 pub struct Scheduler {
     pub dev: Arc<GpuDevice>,
     pub timeline: Arc<Timeline>,
@@ -926,7 +949,12 @@ impl Scheduler {
     /// ordering every draw had with the work after it), and so do scopes
     /// ended earlier without one. The next rendering scope begins after a
     /// full barrier.
+    #[track_caller]
     pub fn cmd(&mut self) -> vk::CommandBuffer {
+        let open = self.rendering.is_some();
+        if open {
+            note_scope_breaker(std::panic::Location::caller());
+        }
         if !self.end_rendering_scope_for(2) && self.unfenced {
             let cb = self.raw_cmd();
             self.barrier_raw(cb);
@@ -1059,7 +1087,11 @@ impl Scheduler {
     /// those ranges only. Later dispatches writing the ranges wait for
     /// them. Work recorded through [`Self::cmd`] before (it may have
     /// written anything) gets a full barrier first.
+    #[track_caller]
     pub fn transfer_read_cmd(&mut self, ranges: &[(u64, u64)]) -> vk::CommandBuffer {
+        if self.rendering.is_some() {
+            note_scope_breaker(std::panic::Location::caller());
+        }
         self.end_rendering_plain(2);
         let cb = self.raw_cmd();
         if self.dirty {
@@ -1086,7 +1118,11 @@ impl Scheduler {
     /// upload ring) are visible to the shader reads of later work: a
     /// barrier from the transfer stage to every shader stage, outside any
     /// rendering scope.
+    #[track_caller]
     pub fn staging_read_barrier(&mut self) {
+        if self.rendering.is_some() {
+            note_scope_breaker(std::panic::Location::caller());
+        }
         self.end_rendering_plain(2);
         let cb = self.raw_cmd();
         let mb = vk::MemoryBarrier2::default()

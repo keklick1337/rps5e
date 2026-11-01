@@ -269,6 +269,28 @@ fn content_checks_enabled() -> bool {
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_CONTENT_CHECKS")) && crate::backend::ab::release_fast("content-checks")
 }
 
+/// `RPS5E_DIRTY_PAGE_MEMO=0`: every guest word a materialisation reads
+/// asks the page tracker whether its page holds GPU results. By default
+/// the answer is remembered per page for the rest of the call (A/B scope
+/// release `dirty-page-memo`).
+fn dirty_page_memo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_DIRTY_PAGE_MEMO")) && crate::backend::ab::release_fast("dirty-page-memo")
+}
+
+/// Pages [`dirty_page_memo_enabled`] remembers per call.
+const DIRTY_PAGE_MEMO: usize = 8;
+
+/// `RPS5E_PREFETCH_INDIRECT=0`: the prefetch prepares the stages of a
+/// GPU-indirect draw with the user data the interpreter left in the offset
+/// registers, which the recorder replaces with zeros (every such stage was
+/// prepared twice: 2.3 M of 2.9 M prefetched draw stages in Demon's Souls).
+/// A/B scope release `prefetch-indirect`.
+fn prefetch_indirect_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PREFETCH_INDIRECT")) && crate::backend::ab::release_fast("prefetch-indirect")
+}
+
 /// Stages whose changed pages still held the words read (reused).
 pub(crate) static CONTENT_REVALIDATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -325,14 +347,22 @@ pub(crate) fn defer_records() -> bool {
 /// keyed by it miss), and eight layouts are kept per plan.
 /// `RPS5E_DESC_WAIT_WHY=1`: the first waits of 2 ms or more for a
 /// GPU-written word a materialisation reads are logged with the program,
-/// the word's address and value and (with `RPS5E_MEM_HISTORY=1`) the
-/// GPU history of its page.
-fn note_slow_word_wait(program: u64, addr: u64, waited: std::time::Duration) {
+/// the word's address, the exact write records of its page before the
+/// wait and (with `RPS5E_MEM_HISTORY=1`) the GPU history of its page.
+/// `RPS5E_DESC_WAIT_MIN_US=<us>`: only waits that long or longer.
+fn note_slow_word_wait(program: u64, addr: u64, waited: std::time::Duration, records: Option<&str>) {
     static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if waited.as_micros() < 2000 || !crate::backend::profile::desc_wait_why() || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 400 {
+    static MIN_US: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let min_us = *MIN_US.get_or_init(|| std::env::var("RPS5E_DESC_WAIT_MIN_US").ok().and_then(|v| v.parse().ok()).unwrap_or(2000));
+    if waited.as_micros() < min_us || !crate::backend::profile::desc_wait_why() || LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 400 {
         return;
     }
-    log::info!("ps5gpu: desc-wait p{program:#x} word {addr:#x} waited {} us {}", waited.as_micros(), crate::memory::history::describe(addr, 8).unwrap_or_default());
+    log::info!(
+        "ps5gpu: desc-wait p{program:#x} word {addr:#x} waited {} us {} | {}",
+        waited.as_micros(),
+        records.unwrap_or_default(),
+        crate::memory::history::describe(addr, 8).unwrap_or_default()
+    );
 }
 
 /// `RPS5E_WORD_WAIT_LOG=<seconds>` (diagnostics): the first GPU-written words a
@@ -419,6 +449,17 @@ pub(crate) fn set_tracker(tracker: std::sync::Arc<GuestPageTracker>) {
     let _ = TRACKER.set(tracker);
 }
 
+/// The live back-end's exact record of GPU-written ranges (set at its
+/// creation): the prefetch tells words GPU work wrote from their
+/// neighbours on the same page.
+static WRITTEN_WORDS: std::sync::OnceLock<(crate::buffers::SharedWrittenWords, std::sync::Arc<crate::scheduler::Timeline>)> = std::sync::OnceLock::new();
+
+/// Remember the back-end's exact write record and timeline for the
+/// prefetch path.
+pub(crate) fn set_written_words(words: crate::buffers::SharedWrittenWords, timeline: std::sync::Arc<crate::scheduler::Timeline>) {
+    let _ = WRITTEN_WORDS.set((words, timeline));
+}
+
 /// `RPS5E_GPU_PREFETCH=0`: the interpreter thread does not
 /// pre-materialise the stages of the draws it hands to the recording
 /// thread; the recorder prepares them itself.
@@ -476,14 +517,21 @@ pub(crate) struct PrefetchedDraw {
 
 impl PrefetchedStage {
     fn matches(&self, program: &Arc<StageProgram>, user: &[u32], cursor: u32) -> bool {
-        self.address == program.address
-            && self.code_hash == program.code_hash
-            && self.user_data_base == program.user_data_base
-            && self.user_data_count == program.user_data_count
-            && self.wave_size == program.wave_size
-            && self.cursor == cursor
-            && user.len() >= self.user.len()
-            && self.user[..] == user[..self.user.len()]
+        // Which part differed (diagnostics: `prefetch-miss` entries 4..8:
+        // program, layout of its user data, push cursor, user data).
+        let why = if self.address != program.address || self.code_hash != program.code_hash {
+            4
+        } else if self.user_data_base != program.user_data_base || self.user_data_count != program.user_data_count || self.wave_size != program.wave_size {
+            5
+        } else if self.cursor != cursor {
+            6
+        } else if user.len() < self.user.len() || self.user[..] != user[..self.user.len()] {
+            7
+        } else {
+            return true;
+        };
+        PREFETCH_MISSES[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
     }
 }
 
@@ -541,6 +589,23 @@ pub(crate) fn prefetch_draw(d: &crate::render::ResolvedDraw) -> Option<Box<Prefe
         return None;
     }
     let tracker = TRACKER.get()?.clone();
+    // A GPU-indirect draw is recorded as one direct draw whose offset
+    // registers (vertex/instance offset, first index, draw index) hold 0
+    // (the records move them on the GPU): its stages are prepared with
+    // that user data, so the prefetch prepares the same.
+    let zeroed;
+    let d = if d.packet.kind.indirect() && prefetch_indirect_enabled() {
+        let template = if d.packet.kind.indexed() { [d.packet.index_buffer_size.max(1), 1, 0, 0, 0] } else { [3, 1, 0, 0, 0] };
+        match crate::pipeline::indirect::direct_draw(d, &template, 0) {
+            Some(sub) => {
+                zeroed = sub;
+                &zeroed
+            }
+            None => d,
+        }
+    } else {
+        d
+    };
     with_prefetch(|f| {
         let vs_stage = d.shaders.vertex_program();
         if !vs_stage.bound() || d.shaders.stages & crate::pipeline::provider::STAGES_GS_EN != 0 {
@@ -694,7 +759,7 @@ pub(crate) enum PrefetchMiss {
     AbsentDispatch = 3,
 }
 
-pub(crate) static PREFETCH_MISSES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static PREFETCH_MISSES: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 fn prefetch_miss(why: PrefetchMiss) {
     PREFETCH_MISSES[why as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1474,8 +1539,82 @@ impl ShaderFrontend {
         };
         let page = crate::memory::PAGE_BYTES;
         let waited = std::cell::Cell::new(false);
+        // Whether the page of a word holds GPU results, remembered for the
+        // pages this call asked about (`RPS5E_DIRTY_PAGE_MEMO`): every word
+        // read asks, and the answer takes a region lock that the recorder,
+        // the interpreter and faulting guest threads share. An answer holds
+        // while the page's generation is the one read before it (the
+        // prefetch runs beside the recorder, which marks pages GPU-dirty and
+        // moves their generations: a result must never rest on an answer
+        // older than the generation `PageDeps` noted); a page made clean by
+        // a download here is forgotten.
+        let memo_pages = dirty_page_memo_enabled();
+        let dirty_pages: RefCell<[(u64, bool, u32); DIRTY_PAGE_MEMO]> = RefCell::new([(u64::MAX, false, 0); DIRTY_PAGE_MEMO]);
+        let page_gpu_dirty = |a: u64, n: u64| -> bool {
+            let base = a & !(page - 1);
+            if !memo_pages || (a - base) + n > page {
+                return tracker.has_gpu_dirty_pages(a, n);
+            }
+            // The generation first: a change after it moves it.
+            let Some(generation) = tracker.page_generation(base) else { return tracker.has_gpu_dirty_pages(a, n) };
+            if let Some(&(_, dirty, _)) = dirty_pages.borrow().iter().find(|&&(p, _, g)| p == base && g == generation) {
+                return dirty;
+            }
+            let dirty = tracker.has_gpu_dirty_pages(base, page);
+            let mut pages = dirty_pages.borrow_mut();
+            pages.rotate_right(1);
+            pages[0] = (base, dirty, generation);
+            dirty
+        };
+        let forget_page = |a: u64| {
+            let base = a & !(page - 1);
+            for e in dirty_pages.borrow_mut().iter_mut().filter(|(p, _, _)| *p == base) {
+                *e = (u64::MAX, false, 0);
+            }
+        };
+        // Whether GPU work recorded so far wrote any byte of the range: its
+        // page holds GPU results and the exact write record does not rule
+        // the bytes out (`RPS5E_UNWRITTEN_WORDS`; the recorder asks its own
+        // cache's record, the prefetch the live back-end's).
+        let written_words = match record {
+            Some(cell) => {
+                let g = cell.borrow();
+                Some((g.1.cache().written_words(), g.0.timeline.clone()))
+            }
+            None => WRITTEN_WORDS.get().cloned(),
+        };
+        // The write records of the GPU-dirty pages asked about, copied once
+        // per call (the record's lock is shared with the other thread),
+        // each with the page generation read before the copy: GPU work
+        // recorded later writes its range into the record before it moves
+        // the generation, so a copy is used only while that is unchanged.
+        let word_pages: RefCell<smallvec::SmallVec<[(crate::buffers::written_words::PageWords, u32); 2]>> = RefCell::new(smallvec::SmallVec::new());
+        let gpu_dirty = |a: u64, n: u64| -> bool {
+            if !page_gpu_dirty(a, n) {
+                return false;
+            }
+            let Some((w, t)) = written_words.as_ref() else { return true };
+            let base = a & !(page - 1);
+            if (a - base) + n > page {
+                return !w.in_guest_memory(a, n, t);
+            }
+            let Some(generation) = tracker.page_generation(base) else { return !w.in_guest_memory(a, n, t) };
+            let mut pages = word_pages.borrow_mut();
+            let i = match pages.iter().position(|(p, g)| p.start == base && *g == generation) {
+                Some(i) => i,
+                None => {
+                    pages.retain(|(p, _)| p.start != base);
+                    if pages.len() >= 4 {
+                        pages.remove(0);
+                    }
+                    pages.push((w.page(base, base + page), generation));
+                    pages.len() - 1
+                }
+            };
+            !crate::buffers::in_guest_memory_by(pages[i].0.in_guest_memory_after(a, n), t)
+        };
         let read = |a: u64| -> Option<u32> {
-            if tracker.has_gpu_dirty_pages(a, 4) {
+            if gpu_dirty(a, 4) {
                 // The recording state downloads the current bytes; the
                 // prefetch path has none - the read fails and the draw is
                 // prepared on the recorder.
@@ -1494,8 +1633,10 @@ impl ShaderFrontend {
                         }
                     }
                     let t0 = std::time::Instant::now();
+                    let before = crate::backend::profile::desc_wait_why().then(|| b.cache().describe_word(a, s.current_tick()));
                     crate::backend::profile::preparing(shader_base, || b.download_window(s, a));
-                    note_slow_word_wait(shader_base, a, t0.elapsed());
+                    note_slow_word_wait(shader_base, a, t0.elapsed(), before.as_deref());
+                    forget_page(a);
                     waited.set(true);
                 } else {
                     return None;
@@ -1505,46 +1646,54 @@ impl ShaderFrontend {
             memory.read_backing(a, &mut w).then(|| u32::from_le_bytes(w))
         };
         let read_clean = |a: u64| -> Option<u32> {
-            if tracker.has_gpu_dirty_pages(a, 4) {
+            if gpu_dirty(a, 4) {
                 return None;
             }
             let mut w = [0u8; 4];
             memory.read_backing(a, &mut w).then(|| u32::from_le_bytes(w))
         };
         // Pages found resident and clean during this call, with their
-        // backing: nothing but GPU work recorded under the back-end lock
-        // (which the caller holds) makes a page GPU-dirty again.
-        let clean_pages: RefCell<[(u64, usize); 4]> = RefCell::new([(u64::MAX, 0); 4]);
+        // backing and the page generation read before the answer: only GPU
+        // work recorded since makes a page GPU-dirty again, and it moves the
+        // generation (the recorder holds the back-end lock, but the
+        // prefetch runs beside it).
+        let clean_pages: RefCell<[(u64, usize, u32); 4]> = RefCell::new([(u64::MAX, 0, 0); 4]);
         let resident = |a: u64, out: &mut [u8], _clean: bool| -> bool {
             let n = out.len() as u64;
             let base = a & !(page - 1);
             if (a - base) + n <= page {
-                if let Some(&(_, ptr)) = clean_pages.borrow().iter().find(|(p, _)| *p == base) {
+                let generation = tracker.page_generation(base);
+                if let Some(&(_, ptr, _)) = clean_pages.borrow().iter().find(|&&(p, _, g)| p == base && Some(g) == generation) {
                     // SAFETY: the backing alias of a resident guest page stays mapped.
                     unsafe { std::ptr::copy_nonoverlapping((ptr as *const u8).add((a - base) as usize), out.as_mut_ptr(), out.len()) };
                     return true;
                 }
-                if tracker.has_gpu_dirty_pages(base, page) {
+                if page_gpu_dirty(base, page) {
+                    // The page holds GPU results: the bytes only when GPU
+                    // work wrote none of them (not remembered as clean).
+                    if !gpu_dirty(a, n) {
+                        return memory.read_backing(a, out);
+                    }
                     return false;
                 }
                 if let Some(ptr) = memory.backing_ptr(base, page) {
                     crate::capture::note_read(memory, base, page);
                     let mut pages = clean_pages.borrow_mut();
                     pages.rotate_right(1);
-                    pages[0] = (base, ptr as usize);
+                    pages[0] = (base, ptr as usize, generation.unwrap_or(u32::MAX));
                     // SAFETY: as above.
                     unsafe { std::ptr::copy_nonoverlapping(ptr.add((a - base) as usize), out.as_mut_ptr(), out.len()) };
                     return true;
                 }
             }
-            if tracker.has_gpu_dirty_pages(a, n) {
+            if gpu_dirty(a, n) {
                 return false;
             }
             memory.read_backing(a, out)
         };
         // Words GPU work recorded before is still producing: a table slot
         // that only copies one is filled on the GPU instead of waiting.
-        let gpu_written = |a: u64| tracker.has_gpu_dirty_pages(a, 4);
+        let gpu_written = |a: u64| gpu_dirty(a, 4);
         // What each read gave goes into `deps` too (see
         // `PageDeps::revalidate`).
         let got_bytes = |a: u64, b: &[u8]| {

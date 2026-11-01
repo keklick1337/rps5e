@@ -296,12 +296,19 @@ fn thick_mips(mode: u32, bpe: u32, width: u32, height: u32, levels: u32) -> Opti
     Some((mips, block[2], offset))
 }
 
+/// `RPS5E_BC_VOLUMES=0`: block-compressed tiled volumes have no layout
+/// (their textures read as unbound).
+fn bc_volumes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("RPS5E_BC_VOLUMES").as_deref(), Ok("0" | "off")))
+}
+
 /// The layout of a surface of `mode` with `bytes_per_element`-byte
 /// elements of `texel_scale` x `texel_scale` texels: `width` x `height`
 /// texels at level 0, `levels` mip levels and `slices` array layers (or
 /// depth slices when `volume`). None for unsupported combinations
-/// (unknown modes, block-compressed thick volumes, volumes of modes with
-/// neither a thick nor a thin-slice layout).
+/// (unknown modes, volumes of modes with neither a thick nor a thin-slice
+/// layout).
 pub fn describe(mode: u32, bytes_per_element: u32, texel_scale: u32, width: u32, height: u32, slices: u32, levels: u32, volume: bool) -> Option<SurfaceLayout> {
     let bpe = bytes_per_element;
     if width == 0 || height == 0 || slices == 0 || levels == 0 || levels > 16 || !bpe.is_power_of_two() || bpe > 16 {
@@ -309,10 +316,20 @@ pub fn describe(mode: u32, bytes_per_element: u32, texel_scale: u32, width: u32,
     }
     let thin_volume = volume && matches!(mode, tiling::SWIZZLE_64KB_Z_X | tiling::SWIZZLE_64KB_R_X);
     if volume && !thin_volume {
-        if texel_scale != 1 {
+        if texel_scale != 1 && !bc_volumes() {
             return None;
         }
-        let (mips, block_depth, slab) = thick_mips(mode, bpe, width, height, levels)?;
+        // Block-compressed volumes are volumes of 4x4-texel elements: the
+        // chain is laid out from the element extent of level 0 (depth is
+        // not compressed), each level keeping its own element extent.
+        let (ew, eh) = (width.div_ceil(texel_scale), height.div_ceil(texel_scale));
+        let (mut mips, block_depth, slab) = thick_mips(mode, bpe, ew, eh, levels)?;
+        if texel_scale != 1 {
+            for (level, m) in mips.iter_mut().enumerate() {
+                m.width = level_elements(width, level as u32, texel_scale);
+                m.height = level_elements(height, level as u32, texel_scale);
+            }
+        }
         let thick = mode != SWIZZLE_LINEAR;
         let guest_bytes = slab * slices.div_ceil(block_depth) as u64;
         return Some(SurfaceLayout { mode, bytes_per_element: bpe, mips, slices, volume, thick, block_depth, layer_bytes: slab, guest_bytes });
@@ -389,6 +406,30 @@ mod tests {
                 assert_eq!(l.element_offset(level, z, x, y), Some(want), "{what}: mip {level} ({x}, {y}, {z})");
             }
         }
+    }
+
+    /// A block-compressed thick volume addresses its 4x4 blocks like a
+    /// volume of the block extent with the same element size (addrlib
+    /// works in elements); each level keeps its own block extent.
+    #[test]
+    fn block_compressed_volumes_are_volumes_of_blocks() {
+        for &(mode, bpe, w, h, d, levels) in &[(tiling::SWIZZLE_4KB_S, 16, 36, 20, 12, 6), (tiling::SWIZZLE_4KB_S, 8, 132, 80, 9, 7), (tiling::SWIZZLE_64KB_S, 16, 160, 96, 20, 6), (tiling::SWIZZLE_64KB_D_X, 16, 20, 20, 3, 3)] {
+            let bc = describe(mode, bpe, 4, w, h, d, levels, true).expect("BC volume layout");
+            let blocks = describe(mode, bpe, 1, w.div_ceil(4), h.div_ceil(4), d, levels, true).unwrap();
+            assert!(bc.thick);
+            assert_eq!((bc.guest_bytes, bc.layer_bytes, bc.block_depth), (blocks.guest_bytes, blocks.layer_bytes, blocks.block_depth));
+            for level in 0..levels {
+                let (a, b) = (bc.mips[level as usize], blocks.mips[level as usize]);
+                assert_eq!((a.offset, a.size, a.pitch, a.blocks_per_row, a.tail, a.tail_x, a.tail_y), (b.offset, b.size, b.pitch, b.blocks_per_row, b.tail, b.tail_x, b.tail_y), "mode {mode} level {level}");
+                assert_eq!((a.width, a.height), (level_elements(w, level, 4), level_elements(h, level, 4)));
+                for z in 0..bc.level_slices(level) {
+                    assert_eq!(bc.element_offset(level, z, a.width - 1, a.height - 1), blocks.element_offset(level, z, a.width - 1, a.height - 1));
+                }
+            }
+        }
+        // 20 texels wide: level 1 is 10 texels, 3 blocks (not 5 >> 1).
+        let bc = describe(tiling::SWIZZLE_4KB_S, 16, 4, 20, 20, 4, 2, true).unwrap();
+        assert_eq!(bc.mips[1].width, 3);
     }
 
     #[test]
@@ -471,7 +512,7 @@ mod tests {
         let lut = describe(tiling::SWIZZLE_64KB_R_X, 8, 1, 64, 64, 64, 1, true).unwrap();
         assert!(!lut.thick);
         assert_eq!((lut.layer_bytes, lut.guest_bytes), (65536, 64 * 65536));
-        // Block-compressed volumes have no thick layout.
-        assert!(describe(tiling::SWIZZLE_64KB_S, 16, 4, 64, 64, 4, 1, true).is_none());
+        // Block-compressed volumes are thick volumes of 4x4 blocks.
+        assert_eq!(describe(tiling::SWIZZLE_64KB_S, 16, 4, 64, 64, 4, 1, true).map(|l| l.mips[0].width), Some(16));
     }
 }

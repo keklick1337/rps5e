@@ -26,7 +26,7 @@
 pub mod async_copy;
 pub mod guest;
 mod through;
-mod written_words;
+pub(crate) mod written_words;
 
 use crate::device::{Buffer, GpuDevice, MemoryUse};
 use crate::memory::tracker::GuestPageTracker;
@@ -268,7 +268,7 @@ pub struct BufferCache {
     written_through: through::ThroughSpans,
     /// The exact ranges GPU work wrote and the write-throughs landing them
     /// (descriptor reads next to newer writes, see [`Self::download_window`]).
-    written_words: written_words::WrittenWords,
+    written_words: SharedWrittenWords,
     /// Ranges whose mirror bytes the last GPU write of them set to one
     /// 32-bit value: a fill ([`Self::fill`]) no other GPU write overlapped
     /// since (start -> (end, value), see [`Self::known_fill`]).
@@ -625,6 +625,92 @@ fn written_words_enabled() -> bool {
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_WRITTEN_WORDS")) && crate::backend::ab::release_fast("RPS5E_WRITTEN_WORDS")
 }
 
+/// `RPS5E_UNWRITTEN_WORDS=0`: a word a materialisation reads on a page
+/// that holds GPU results is always downloaded with its page (a submit and
+/// a wait for all the work recorded so far). On, a word no GPU work
+/// recorded so far wrote (the exact write record covers every GPU write of
+/// a buffer range before its pages turn GPU-dirty, and keeps the ranges it
+/// drops when full) is read from guest memory at once: the GPU only wrote
+/// other words of its page (Demon's Souls: pixel programs write a few
+/// hundred bytes next to descriptor words the next dispatches read, each
+/// read waited 20-40 ms). A/B scope `release` (`unwritten-words`).
+pub(crate) fn unwritten_words_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_UNWRITTEN_WORDS")) && crate::backend::ab::release_fast("unwritten-words")
+}
+
+/// The exact write record ([`written_words::WrittenWords`]) of a cache,
+/// shared with the interpreter-side prefetch (which asks whether a word on
+/// a page holding GPU results was written by GPU work at all).
+#[derive(Clone, Default)]
+pub struct SharedWrittenWords(std::sync::Arc<std::sync::Mutex<written_words::WrittenWords>>);
+
+impl SharedWrittenWords {
+    fn lock(&self) -> std::sync::MutexGuard<'_, written_words::WrittenWords> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The write records of the page `[start, end)` (one lock for many
+    /// questions about its words).
+    pub(crate) fn page(&self, start: u64, end: u64) -> written_words::PageWords {
+        self.lock().page_words(start, end)
+    }
+
+    /// Guest memory holds the current bytes of `[addr, addr+size)`: no GPU
+    /// work wrote them ([`unwritten_words_enabled`]), or every byte GPU work
+    /// wrote landed with a write-through whose tick `timeline` completed
+    /// ([`landed_words_enabled`]); counted.
+    pub fn in_guest_memory(&self, addr: u64, size: u64, timeline: &crate::scheduler::Timeline) -> bool {
+        if !unwritten_words_enabled() {
+            return false;
+        }
+        let tick = self.lock().in_guest_memory_after(addr, size);
+        in_guest_memory_by(tick, timeline)
+    }
+}
+
+/// [`SharedWrittenWords::in_guest_memory`] for the answer of a write
+/// record (`None`: pending or dropped; `Some(0)`: unwritten; `Some(tick)`:
+/// landed at `tick`); counted.
+pub fn in_guest_memory_by(tick: Option<u64>, timeline: &crate::scheduler::Timeline) -> bool {
+    if !unwritten_words_enabled() {
+        return false;
+    }
+    let Some(tick) = tick else { return false };
+    if tick == 0 {
+        if crate::backend::profile::on() {
+            UNWRITTEN_WORD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return true;
+    }
+    if !landed_words_enabled() || !timeline.is_complete(tick) {
+        return false;
+    }
+    if crate::backend::profile::on() {
+        LANDED_WORD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// `RPS5E_LANDED_WORDS=0`: a word GPU work wrote stays "GPU-written" for
+/// materialisation while its page holds GPU results, also after the
+/// write-through that brought it to guest memory completed (the recorder
+/// downloads its window again, a table slot of it is copied on the GPU,
+/// which ends the draws' rendering scope). On, such a word is read from
+/// guest memory (A/B scope release `landed-words`).
+pub(crate) fn landed_words_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LANDED_WORDS")) && crate::backend::ab::release_fast("landed-words")
+}
+
+/// Words read from guest memory on pages holding GPU results because their
+/// GPU writes landed with a completed write-through (profile only).
+pub static LANDED_WORD_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Words read from guest memory on pages holding GPU results because no
+/// GPU work wrote them ([`in_guest_memory_by`], profile only).
+pub static UNWRITTEN_WORD_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `RPS5E_WORD_LANDED_ALONE=0`: a descriptor word whose last GPU write
 /// landed with a direct write-through is read after that write-through
 /// only while its page's write-through spans are still remembered; when
@@ -760,7 +846,7 @@ impl BufferCache {
             stats: BufferStats::default(),
             zero_copy: zero_copy_enabled(),
             written_through: through::ThroughSpans::default(),
-            written_words: Default::default(),
+            written_words: SharedWrittenWords::default(),
             known_fills: BTreeMap::new(),
             last_through_tick: 0,
             pending_through: Vec::new(),
@@ -1210,7 +1296,7 @@ impl BufferCache {
         if written {
             // GPU work may change these pages after any write-through.
             self.forget_written_through(addr, size);
-            self.written_words.written(addr, size);
+            self.written_words.lock().written(addr, size);
             self.forget_fills(addr, size);
         }
         // Written ranges the CPU may poll are written through to guest
@@ -1636,7 +1722,7 @@ impl BufferCache {
                 return true;
             }
             self.written_through.push(ThroughSpan { start, end, tick: sched.current_tick(), staged: None });
-            self.written_words.written_through(start, end, addr, size, sched.current_tick());
+            self.written_words.lock().written_through(start, end, addr, size, sched.current_tick());
             self.note_landing(start, end - start, sched.current_tick());
             self.last_through_tick = sched.current_tick();
             self.note_unpublished_through(sched, start, end);
@@ -1668,7 +1754,7 @@ impl BufferCache {
         }
         crate::memory::history::note(crate::memory::history::Event::Through, start, end - start, sched.current_tick());
         self.written_through.push(ThroughSpan { start, end, tick: sched.current_tick(), staged: None });
-        self.written_words.written_through(start, end, addr, size, sched.current_tick());
+        self.written_words.lock().written_through(start, end, addr, size, sched.current_tick());
         self.note_landing(start, end - start, sched.current_tick());
         self.last_through_tick = sched.current_tick();
         self.note_unpublished_through(sched, start, end);
@@ -1931,7 +2017,7 @@ impl BufferCache {
         if written_words_enabled() {
             // The word itself landed with an older write-through than its
             // page's newest: wait for that one only, and leave the page.
-            if let Some(word_tick) = self.written_words.landed(addr & !3, 4) {
+            if let Some(word_tick) = self.written_words.lock().landed(addr & !3, 4) {
                 let page_tick = self.written_through_tick(first, page);
                 if page_tick.map_or(word_landed_alone_enabled(), |p| word_tick <= p) {
                     let t0 = std::time::Instant::now();
@@ -1977,15 +2063,23 @@ impl BufferCache {
         self.memory
     }
 
+    /// No GPU work recorded so far wrote the word at `addr` (on a page that
+    /// holds GPU results elsewhere): its bytes in guest memory are current
+    /// (see [`unwritten_words_enabled`]).
+    /// The exact write record, for the prefetch path.
+    pub fn written_words(&self) -> SharedWrittenWords {
+        self.written_words.clone()
+    }
+
     /// Diagnostics (`RPS5E_WORD_WAIT_LOG`): what the exact write record
     /// and the page's write-throughs say about the word at `addr`.
     pub fn describe_word(&self, addr: u64, current: u64) -> String {
         let page = crate::memory::PAGE_BYTES;
         let first = addr & !(page - 1);
-        let ranges: Vec<String> = self.written_words.describe(first, first + page);
+        let ranges: Vec<String> = self.written_words.lock().describe(first, first + page);
         format!(
             "word {:?} page-through {:?} now {current} ranges [{}]",
-            self.written_words.landed(addr & !3, 4),
+            self.written_words.lock().landed(addr & !3, 4),
             self.written_through_tick(first, page),
             ranges.join(" ")
         )
@@ -2264,7 +2358,7 @@ impl BufferCache {
         };
         self.download(sched, lo, hi - lo);
         self.forget_written_through(addr, size);
-        self.written_words.forget(addr, size);
+        self.written_words.lock().forget(addr, size);
         self.forget_fills(addr, size);
         self.settling.retain(|&(s, e, _)| e <= addr || s >= addr + size);
         self.pending_through.retain(|&(a, n)| a + n <= addr || a >= addr + size);

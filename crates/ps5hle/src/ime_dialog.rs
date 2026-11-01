@@ -9,6 +9,12 @@
 //! the guest text filter and committed into the guest input buffer on the
 //! next status/result poll; cancel and abort restore the original text.
 //!
+//! A host UI registers a visibility callback ([`set_visibility_callback`]):
+//! it is called with `(true, generation)` when a session starts running and
+//! with `(false, generation)` when it stops (accept, cancel, abort, force
+//! close), on whichever thread caused the change, so it must be cheap and
+//! take no locks the caller may hold.
+//!
 //! When no host UI is attached (no visibility callback), the emulator acts
 //! as the user: after the guest has seen the dialog running once, an empty
 //! field gets the default text and the dialog is accepted.
@@ -559,17 +565,23 @@ pub fn term(ctx: &CpuContext) -> i32 {
 }
 
 /// sceImeDialogForceClose(): end the dialog from any state but NONE; the
-/// text is not written back.
+/// text is not written back. A running dialog disappears from the screen.
 pub fn force_close() -> i32 {
-    let mut s = state();
-    if s.status == STATUS_NONE {
-        return ERROR_NOT_IN_USE;
+    let (generation, was_running) = {
+        let mut s = state();
+        if s.status == STATUS_NONE {
+            return ERROR_NOT_IN_USE;
+        }
+        let (generation, revision, was_running) = (s.generation, s.revision, s.status == STATUS_RUNNING);
+        *s = State::default();
+        s.generation = generation;
+        s.revision = revision;
+        STATUS.store(STATUS_NONE, Ordering::Release);
+        (generation, was_running)
+    };
+    if was_running {
+        notify_visibility(false, generation);
     }
-    let (generation, revision) = (s.generation, s.revision);
-    *s = State::default();
-    s.generation = generation;
-    s.revision = revision;
-    STATUS.store(STATUS_NONE, Ordering::Release);
     0
 }
 

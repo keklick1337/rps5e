@@ -21,9 +21,12 @@
 //! (and `r...`) push a stick fully, `a+b` presses buttons together;
 //! it works with host input disabled.
 //!
-//! While the in-game menu (`ps5gpu::menu`) is open the guest sees neutral
-//! pads and player 1's controller navigates the menu ([`menu`]);
-//! [`reconfigure`] applies settings edited there to the running game.
+//! While the in-game menu (`ps5gpu::menu`) is open, or a system dialog
+//! (the on-screen keyboard of a game's text entry) is shown, the guest
+//! sees neutral pads and player 1's controller navigates the UI
+//! ([`menu`]); buttons still held when the UI lets go stay hidden from the
+//! game until they are released. [`reconfigure`] applies settings edited
+//! in the menu to the running game.
 
 pub mod assign;
 pub mod capture;
@@ -62,6 +65,11 @@ struct Hub {
     /// (restored when it closes).
     menu_look: bool,
     menu_touch: bool,
+    /// The UI has the input (menu open or system dialog shown).
+    captured: bool,
+    /// Per player: buttons that were held when the UI let go, hidden from
+    /// the game until released.
+    masked: [u32; MAX_PLAYERS],
 }
 
 static HUB: OnceLock<Mutex<Hub>> = OnceLock::new();
@@ -85,25 +93,98 @@ fn hub() -> Option<MutexGuard<'static, Hub>> {
     HUB.get().map(|m| m.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// `s` without the `masked` buttons (digital bits and their analog
+/// triggers); bits no longer held leave the mask.
+fn unmask(s: HostPadState, masked: &mut u32) -> HostPadState {
+    let s = s.normalized();
+    *masked &= s.buttons;
+    let mut out = HostPadState { buttons: s.buttons & !*masked, ..s };
+    if *masked & button::L2 != 0 {
+        out.l2 = 0;
+    }
+    if *masked & button::R2 != 0 {
+        out.r2 = 0;
+    }
+    out
+}
+
 impl Hub {
-    fn publish(&self) {
-        if ps5gpu::menu::is_open() {
-            // The menu has the controls: the game sees released pads.
-            pad::set_host_pad_state(HostPadState::NEUTRAL);
+    /// What each player's pad shows the game now.
+    fn guest_states(&mut self) -> Vec<HostPadState> {
+        let mut out = Vec::with_capacity(self.players);
+        if self.captured {
+            // The UI has the controls: the game sees released pads. (The
+            // PS4 SDK's "intercepted" button bit is not set: its PS5 value
+            // is not verified.)
+            out.push(HostPadState::NEUTRAL);
             for p in 1..self.players {
-                let connected = self.pads[p].is_some();
-                pad::set_host_pad_state_for(p, HostPadState { connected, ..HostPadState::NEUTRAL });
+                out.push(HostPadState { connected: self.pads[p].is_some(), ..HostPadState::NEUTRAL });
             }
-            return;
+            return out;
         }
         // Player 1: the keyboard/mouse bindings of its mode overlaid on its
         // controller (neutral without one).
         let p1 = self.pads[0].unwrap_or(HostPadState::NEUTRAL);
-        pad::set_host_pad_state(self.kbm.compose(&p1));
+        out.push(unmask(self.kbm.compose(&p1), &mut self.masked[0]));
         for p in 1..self.players {
-            let state = self.pads[p].map(|s| HostPadState { connected: true, ..s });
-            pad::set_host_pad_state_for(p, state.unwrap_or(HostPadState { connected: false, ..HostPadState::NEUTRAL }));
+            let state = match self.pads[p] {
+                Some(s) => unmask(HostPadState { connected: true, ..s }, &mut self.masked[p]),
+                None => {
+                    self.masked[p] = 0;
+                    HostPadState { connected: false, ..HostPadState::NEUTRAL }
+                }
+            };
+            out.push(state);
         }
+        out
+    }
+
+    fn publish(&mut self) {
+        for (p, s) in self.guest_states().into_iter().enumerate() {
+            if p == 0 {
+                pad::set_host_pad_state(s);
+            } else {
+                pad::set_host_pad_state_for(p, s);
+            }
+        }
+    }
+
+    /// The UI took the input (`captured`) or gave it back: release what
+    /// the game holds (and the mouse) or give mouse-look back and hide the
+    /// buttons still held. Returns a mouse capture request; the caller
+    /// publishes.
+    fn capture_changed(&mut self, captured: bool) -> Option<bool> {
+        if self.captured == captured {
+            return None;
+        }
+        self.captured = captured;
+        let mut capture = None;
+        if captured {
+            self.menu_look = self.kbm.mouse_look;
+            self.menu_touch = self.kbm.touch_mode;
+            capture = self.kbm.release_all().capture_mouse;
+            if self.guest_mouse && self.mouse_buttons != 0 {
+                self.mouse_buttons = 0;
+                pad::push_host_mouse_event(0, 0, 0, 0, 0);
+            }
+        } else {
+            let (look, touch) = (std::mem::take(&mut self.menu_look), std::mem::take(&mut self.menu_touch));
+            if touch {
+                self.kbm.set_touch_mode(true);
+            }
+            if look {
+                self.kbm.set_mouse_look(true);
+            }
+            if (look || touch) && self.mode.uses_mouse() {
+                capture = Some(true);
+            }
+            let p1 = self.pads[0].unwrap_or(HostPadState::NEUTRAL);
+            self.masked[0] = self.kbm.compose(&p1).normalized().buttons;
+            for p in 1..self.players {
+                self.masked[p] = self.pads[p].map_or(0, |s| s.normalized().buttons);
+            }
+        }
+        capture
     }
 }
 
@@ -355,34 +436,25 @@ pub fn reconfigure(cfg: &Config) {
     }
 }
 
-/// The menu opened or closed: release what the game holds (and the mouse)
-/// or give mouse-look back.
-fn menu_changed(open: bool) {
-    let mut capture = None;
-    if let Some(mut h) = hub() {
-        if open {
-            h.menu_look = h.kbm.mouse_look;
-            h.menu_touch = h.kbm.touch_mode;
-            capture = h.kbm.release_all().capture_mouse;
-            if h.guest_mouse && h.mouse_buttons != 0 {
-                h.mouse_buttons = 0;
-                pad::push_host_mouse_event(0, 0, 0, 0, 0);
-            }
-        } else {
-            let (look, touch) = (std::mem::take(&mut h.menu_look), std::mem::take(&mut h.menu_touch));
-            if touch {
-                h.kbm.set_touch_mode(true);
-            }
-            if look {
-                h.kbm.set_mouse_look(true);
-            }
-            if (look || touch) && h.mode.uses_mouse() {
-                capture = Some(true);
-            }
-        }
-        h.publish();
-    }
+/// The menu opened or closed: the navigation queue starts empty, and the
+/// game's input follows whether the UI still has it.
+fn menu_changed(_open: bool) {
     menu::clear();
+    sync_capture();
+}
+
+/// Follow [`ps5gpu::menu::captures_input`] (the menu, and system dialogs
+/// that appear and go on guest threads; polled by the input thread).
+fn sync_capture() {
+    let captured = ps5gpu::menu::captures_input();
+    let capture = match hub() {
+        Some(mut h) => {
+            let c = h.capture_changed(captured);
+            h.publish();
+            c
+        }
+        None => return,
+    };
     if let Some(on) = capture {
         request_window(WindowRequest::CaptureMouse(on));
     }
@@ -472,6 +544,8 @@ pub fn start() {
         mouse_buttons: 0,
         menu_look: false,
         menu_touch: false,
+        captured: false,
+        masked: [0; MAX_PLAYERS],
     }));
     ps5gpu::set_input_sink(Some(Box::new(on_event)));
     ps5gpu::menu::on_open_change(menu_changed);
@@ -628,7 +702,7 @@ fn input_thread(cfg: Config, shared: output::SharedOutput) {
     let mut assigned: Vec<Option<u32>> = vec![None; MAX_PLAYERS];
     let mut first = true;
     let mut nav = menu::NavState::default();
-    let mut menu_was_open = false;
+    let mut was_navigating = false;
     let mut menu_button_held = false;
     while !ps5vm::shutdown::requested() {
         // Settings edited in the menu.
@@ -661,6 +735,8 @@ fn input_thread(cfg: Config, shared: output::SharedOutput) {
             }
         }
         let open = ps5gpu::menu::is_open();
+        // The menu or a system dialog reads the controller as navigation.
+        let navigating = ps5gpu::menu::captures_input();
         let mut snaps: [Option<HostPadState>; MAX_PLAYERS] = [None; MAX_PLAYERS];
         if let Some(s) = sdl.as_mut().filter(|_| gamepad) {
             if s.pump() || first {
@@ -719,11 +795,11 @@ fn input_thread(cfg: Config, shared: output::SharedOutput) {
                 menu::publish(devices, pressed, &[]);
             }
         }
-        if open {
+        if navigating {
             let now = Instant::now();
             let state = snaps.iter().flatten().next().copied().unwrap_or(HostPadState::NEUTRAL);
             let mut steps = Vec::new();
-            if menu_was_open {
+            if was_navigating {
                 nav.update(&state, now, &mut steps);
             } else {
                 nav.reset(&state);
@@ -734,11 +810,19 @@ fn input_thread(cfg: Config, shared: output::SharedOutput) {
                 ps5gpu::input::wake_window();
             }
         }
-        menu_was_open = open;
-        if let Some(mut h) = hub() {
-            h.pads = snaps;
-            h.kbm.tick(Instant::now());
-            h.publish();
+        was_navigating = navigating;
+        let capture = match hub() {
+            Some(mut h) => {
+                h.pads = snaps;
+                h.kbm.tick(Instant::now());
+                let c = h.capture_changed(ps5gpu::menu::captures_input());
+                h.publish();
+                c
+            }
+            None => None,
+        };
+        if let Some(on) = capture {
+            request_window(WindowRequest::CaptureMouse(on));
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -747,4 +831,71 @@ fn input_thread(cfg: Config, shared: output::SharedOutput) {
         h.shutdown();
     }
     drop(sdl);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hub_for_test() -> Hub {
+        let cfg = Config::default();
+        Hub {
+            kbm: KbmState::from_config(&cfg),
+            mode: DeviceMode::Controller,
+            players: 2,
+            pads: [None; MAX_PLAYERS],
+            guest_mouse: false,
+            mouse_buttons: 0,
+            menu_look: false,
+            menu_touch: false,
+            captured: false,
+            masked: [0; MAX_PLAYERS],
+        }
+    }
+
+    fn pad(buttons: u32) -> Option<HostPadState> {
+        Some(HostPadState { buttons, ..HostPadState::NEUTRAL })
+    }
+
+    #[test]
+    fn captured_input_is_neutral_and_held_buttons_stay_hidden() {
+        let mut h = hub_for_test();
+        h.pads[0] = pad(button::CROSS);
+        h.pads[1] = pad(button::TRIANGLE);
+        assert_eq!(h.guest_states()[0].buttons, button::CROSS);
+        // The UI takes the input: released pads, player 2 still connected.
+        assert_eq!(h.capture_changed(true), None);
+        let s = h.guest_states();
+        assert_eq!(s[0], HostPadState::NEUTRAL);
+        assert_eq!((s[1].buttons, s[1].connected), (0, true));
+        // Cross accepted the dialog and is still held when it closes: the
+        // game sees it only after a release and a new press.
+        h.pads[0] = Some(HostPadState { r2: 255, ..pad(button::CROSS).unwrap() });
+        h.capture_changed(false);
+        let s = h.guest_states();
+        assert_eq!((s[0].buttons, s[0].r2), (0, 0));
+        assert_eq!(s[1].buttons, 0);
+        h.pads[0] = pad(button::CROSS | button::SQUARE);
+        assert_eq!(h.guest_states()[0].buttons, button::SQUARE, "a new press shows");
+        h.pads[0] = pad(0);
+        h.pads[1] = pad(0);
+        assert_eq!(h.guest_states()[0].buttons, 0);
+        h.pads[0] = pad(button::CROSS);
+        h.pads[1] = pad(button::TRIANGLE);
+        let s = h.guest_states();
+        assert_eq!((s[0].buttons, s[1].buttons), (button::CROSS, button::TRIANGLE));
+        assert_eq!(h.capture_changed(false), None, "no change, nothing to do");
+    }
+
+    #[test]
+    fn unmask_clears_released_bits() {
+        let mut m = button::CROSS | button::L2;
+        let s = unmask(HostPadState { l2: 200, ..pad(button::CROSS).unwrap() }, &mut m);
+        assert_eq!((s.buttons, s.l2), (0, 0));
+        let s = unmask(pad(button::L2).unwrap(), &mut m);
+        assert_eq!(m, button::L2);
+        assert_eq!(s.buttons, 0);
+        let s = unmask(pad(button::CROSS).unwrap(), &mut m);
+        assert_eq!((m, s.buttons), (0, button::CROSS));
+    }
 }

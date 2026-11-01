@@ -771,9 +771,9 @@ fn posix_thread_names() {
     assert_eq!(call(&mut ctx, px_getname, &[me, buf]), 3);
 }
 
-/// pthread_getaffinity_np reports the mask as a 32-byte cpuset_t (rest
-/// zero, nothing past it written), with FreeBSD 11's errors (reference
-/// GuestAvailableCpumask cases).
+/// pthread_getaffinity_np reports the mask in the first 8 bytes of a set
+/// of 8 to 16 bytes (rest zero, nothing past it written); other sizes are
+/// ERANGE (measured on a PS5: 8..16 accepted, below 8 and 24 up refused).
 #[test]
 fn getaffinity_np_writes_a_cpuset() {
     let _g = AFFINITY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -782,18 +782,22 @@ fn getaffinity_np_writes_a_cpuset() {
     let (me, _) = fake_thread("cpuset", 0x0F0);
     let set = s.base;
     ctx.write_bytes(set, &[0xAB; 40]);
-    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 32, set]), 0);
+    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 16, set]), 0);
     assert_eq!(ctx.read_u64(set), Some(0x0F0));
-    assert_eq!(ctx.read_bytes(set + 8, 24).unwrap(), vec![0; 24]);
-    assert_eq!(ctx.read_bytes(set + 32, 8).unwrap(), vec![0xAB; 8], "past the set");
-    for size in [0u64, 8, 31, 33, 64] {
+    assert_eq!(ctx.read_bytes(set + 8, 8).unwrap(), vec![0; 8]);
+    assert_eq!(ctx.read_bytes(set + 16, 8).unwrap(), vec![0xAB; 8], "past the set");
+    ctx.write_bytes(set, &[0xAB; 40]);
+    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 8, set]), 0);
+    assert_eq!(ctx.read_u64(set), Some(0x0F0));
+    assert_eq!(ctx.read_bytes(set + 8, 8).unwrap(), vec![0xAB; 8], "past the set");
+    for size in [0u64, 7, 17, 24, 31, 32, 33, 64] {
         assert_eq!(call(&mut ctx, px_getaffinity, &[me, size, set]), 34, "size {size}");
     }
-    assert_eq!(call(&mut ctx, px_getaffinity, &[0, 32, set]), 22);
+    assert_eq!(call(&mut ctx, px_getaffinity, &[0, 16, set]), 22);
     assert_eq!(call(&mut ctx, px_getaffinity, &[0, 0, set]), 22);
-    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 32, 0]), 14);
+    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 16, 0]), 14);
     forget_fake_thread(me);
-    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 32, set]), 3);
+    assert_eq!(call(&mut ctx, px_getaffinity, &[me, 16, set]), 3);
 }
 
 /// A new thread inherits its creator's affinity unless its attributes set
