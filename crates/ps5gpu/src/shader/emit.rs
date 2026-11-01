@@ -60,6 +60,11 @@ pub mod custom {
 pub struct Emitter<'a, 'p> {
     pub b: Builder,
     pub f: &'a Function,
+    /// Which values are never f32 denormals
+    /// (`ps5shader::opt::denorm::never_denormal`), where the host compares
+    /// denormals as zero and [`super::EmitOptions::native_f32_compare`]:
+    /// a compare of two of them is the host's.
+    never_denormal: Option<Vec<bool>>,
     pub input: &'a EmitInput<'a, 'p>,
     pub stage: ShaderStage,
     pub feat: Features,
@@ -301,9 +306,11 @@ impl<'a, 'p> Emitter<'a, 'p> {
         let mut b = Builder::new();
         b.set_version(1, 5);
         let glsl = b.ext_inst_import("GLSL.std.450");
+        let native_compares = input.features.emit.native_f32_compare && !input.features.denorm_preserve[1];
         Emitter {
             b,
             f: input.func,
+            never_denormal: native_compares.then(|| ps5shader::opt::denorm::never_denormal(input.func, input.host_float)),
             input,
             stage: input.stage,
             feat: input.features,
@@ -2327,8 +2334,9 @@ impl<'a, 'p> Emitter<'a, 'p> {
                     let (zero, y) = (a(self, i)?, a(self, 1 - i)?);
                     self.max_with_positive_zero(ty, zero, y)
                 } else {
+                    let native = self.never_denormals(&d.args);
                     let (x, y) = (a(self, 0)?, a(self, 1)?);
-                    self.float_min_max(ty, x, y, d.op == Op::FMax)
+                    self.float_min_max(ty, x, y, d.op == Op::FMax, native)
                 }
             }
             Op::FMin => gl2(self, GLOp::NMin)?,
@@ -2380,8 +2388,9 @@ impl<'a, 'p> Emitter<'a, 'p> {
                 self.ldexp(ty, x, e)
             }
             Op::FCmp(p) => {
+                let native = self.never_denormals(&d.args);
                 let (x, y) = (a(self, 0)?, a(self, 1)?);
-                self.fcmp(p, a0ty, x, y)
+                self.fcmp_with(p, a0ty, x, y, native)
             }
             Op::FConvert(r) => {
                 let x = a(self, 0)?;
@@ -2613,9 +2622,18 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.gl(t, GLOp::Ldexp, &[s1, rest])
     }
 
-    fn fcmp(&mut self, p: FCmp, ty: Type, x: Word, y: Word) -> Word {
+    /// Whether every value of `args` is never an f32 denormal (where the
+    /// emitter tracks it): their f32 compare is the host's.
+    fn never_denormals(&self, args: &[Value]) -> bool {
+        self.never_denormal.as_ref().is_some_and(|nd| args.iter().all(|a| nd[a.index()]))
+    }
+
+    /// An f32/f16/f64 compare; `native`: neither operand is an f32
+    /// denormal, so the host's compare is exact also where it compares
+    /// denormals as zero.
+    fn fcmp_with(&mut self, p: FCmp, ty: Type, x: Word, y: Word, native: bool) -> Word {
         let tb = self.t_bool();
-        if ty == Type::F32 && self.f32_compares_flush() && !matches!(p, FCmp::Ord | FCmp::Uno) {
+        if ty == Type::F32 && !native && self.f32_compares_flush() && !matches!(p, FCmp::Ord | FCmp::Uno) {
             return self.fcmp_bits(p, x, y);
         }
         let op = match p {
@@ -2651,14 +2669,14 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.ins(op, tb, &[x, y])
     }
 
-    /// [`Self::fcmp`] of two f32 values through their bits: NaNs are
+    /// [`Self::fcmp_with`] of two f32 values through their bits: NaNs are
     /// unordered, -0 equals +0, and otherwise the sign-magnitude integers
     /// order as the values do (denormals included).
     /// A host that flushes f32 denormals in every module (no DenormPreserve
     /// 32) compares them as zero: unless the module runs on that flush on
     /// purpose, f32 comparisons compare the bits ([`Self::fcmp_bits`]).
     fn f32_compares_flush(&self) -> bool {
-        let native32 = self.input.native_ftz && self.feat.denorm_flush_to_zero32;
+        let native32 = self.input.native_ftz && (self.feat.denorm_flush_to_zero32 || self.feat.emit.no_f32_flush);
         !self.feat.denorm_preserve[1] && !native32
     }
 
@@ -2767,7 +2785,8 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.bitcast(t, r)
     }
 
-    fn float_min_max(&mut self, ty: Type, x: Word, y: Word, max: bool) -> Word {
+    /// `native`: neither operand is an f32 denormal.
+    fn float_min_max(&mut self, ty: Type, x: Word, y: Word, max: bool, native: bool) -> Word {
         let t = self.ty(ty);
         let (it, mag, inf) = match ty.component() {
             Scalar::F16 => (Type::U16, 0x7FFFu64, 0x7C00u64),
@@ -2785,7 +2804,7 @@ impl<'a, 'p> Emitter<'a, 'p> {
         let ym = self.ins(S::BitwiseAnd, iw, &[yb, mm]);
         // Denormal operands are ordered by value also where the host
         // compares them as zero (med3 picks among denormals by them).
-        let c = if ty == Type::F32 && self.f32_compares_flush() {
+        let c = if ty == Type::F32 && !native && self.f32_compares_flush() {
             self.fcmp_bits(if max { FCmp::OGe } else { FCmp::OLt }, x, y)
         } else {
             let cmp = if max { S::FOrdGreaterThanEqual } else { S::FOrdLessThan };
@@ -3139,7 +3158,11 @@ impl<'a, 'p> Emitter<'a, 'p> {
         // flush code and the DenormPreserve of the other widths.
         let native32 = self.input.native_ftz && self.feat.denorm_flush_to_zero32;
         let denorm_widths = [
-            (16, self.feat.denorm_preserve[0] && has(&self, Capability::Float16)),
+            // Where the flush elision relies on the host's f32 flush and f16
+            // keeps its denormals without the mode (measured), the module
+            // does not declare DenormPreserve(16): a driver may keep f32
+            // denormals then.
+            (16, self.feat.denorm_preserve[0] && has(&self, Capability::Float16) && !(self.input.host_float.any() && self.feat.f16_denormals_kept)),
             (32, !native32 && self.feat.denorm_preserve[1]),
             (64, self.feat.denorm_preserve[2] && has(&self, Capability::Float64)),
         ];

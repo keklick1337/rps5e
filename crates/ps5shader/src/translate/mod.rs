@@ -157,6 +157,12 @@ pub struct TranslateOptions {
     /// flushes f32 inputs and results everywhere and whose opcodes all
     /// agree with the native semantics ([`native_ftz_applies`]).
     pub native_ftz: bool,
+    /// The host operations that flush f32 denormals in the module the
+    /// translation goes into ([`crate::opt::denorm::HostFloat`], measured):
+    /// a host product already flushes a product that is tiny after
+    /// rounding to nearest, so that flush is not translated
+    /// ([`Translator::flush_tiny_product`]).
+    pub host_float: crate::opt::denorm::HostFloat,
 }
 
 /// Bits of [`TranslateOptions::rewrites`]: translations equal bit for bit
@@ -262,13 +268,13 @@ impl TranslateOptions {
             sgprs.push(((user_sgprs as u8) + axis, InputValue::System(SystemValue::WorkgroupId(axis))));
         }
         let vgprs = (0..3u16).map(|a| (a, InputValue::System(SystemValue::LocalInvocationId(a as u8)))).collect();
-        TranslateOptions { wave_size, stage: Stage::Compute, sgprs, vgprs, initial_exec: InitialExec::All, optimize: true, fold_code_address: true, float_mode: FloatMode::default(), strict_mode_writes: false, float_rules: float_rules::ALL, rewrites: rewrites::ALL, fast_transcendental: false, native_ftz: false }
+        TranslateOptions { wave_size, stage: Stage::Compute, sgprs, vgprs, initial_exec: InitialExec::All, optimize: true, fold_code_address: true, float_mode: FloatMode::default(), strict_mode_writes: false, float_rules: float_rules::ALL, rewrites: rewrites::ALL, fast_transcendental: false, native_ftz: false, host_float: crate::opt::denorm::HostFloat::NONE }
     }
 
     /// Generic options with only user data (no system values).
     pub fn with_user_data(wave_size: u32, stage: Stage, user_sgprs: u32) -> Self {
         let sgprs = (0..user_sgprs).map(|i| (i as u8, InputValue::UserData(i))).collect();
-        TranslateOptions { wave_size, stage, sgprs, vgprs: Vec::new(), initial_exec: InitialExec::All, optimize: true, fold_code_address: true, float_mode: FloatMode::default(), strict_mode_writes: false, float_rules: float_rules::ALL, rewrites: rewrites::ALL, fast_transcendental: false, native_ftz: false }
+        TranslateOptions { wave_size, stage, sgprs, vgprs: Vec::new(), initial_exec: InitialExec::All, optimize: true, fold_code_address: true, float_mode: FloatMode::default(), strict_mode_writes: false, float_rules: float_rules::ALL, rewrites: rewrites::ALL, fast_transcendental: false, native_ftz: false, host_float: crate::opt::denorm::HostFloat::NONE }
     }
 }
 

@@ -62,6 +62,14 @@ pub fn note_split(split: bool) {
     WAVE64_SPLIT[!split as usize].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Modules translated again because the emitted module declared
+/// DenormPreserve(16) where the flush elision expected none.
+pub static F16_RETRANSLATIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn note_f16_retranslation() {
+    F16_RETRANSLATIONS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Optimizer passes ([`ps5shader::opt::PASSES`], ns).
 pub static PASS_NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
@@ -80,7 +88,9 @@ pub fn phases_text() -> String {
 pub fn line() -> String {
     let (split, paired) = (WAVE64_SPLIT[0].load(Ordering::Relaxed), WAVE64_SPLIT[1].load(Ordering::Relaxed));
     let waves = if split + paired > 0 { format!("; wave64 split {split}/paired {paired}") } else { String::new() };
-    format!(" shaders=[{}, {}; phases ms: {}; passes ms: {}{waves}]", TRANSLATE.text("translate"), DISK_HITS.text("disk"), phases_text(), passes_text())
+    let again = F16_RETRANSLATIONS.load(Ordering::Relaxed);
+    let again = if again > 0 { format!("; f16 retranslations {again}") } else { String::new() };
+    format!(" shaders=[{}, {}; phases ms: {}; passes ms: {}{waves}{again}]", TRANSLATE.text("translate"), DISK_HITS.text("disk"), phases_text(), passes_text())
 }
 
 /// The parts of one translation timed for [`last`]: the front end's phases

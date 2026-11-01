@@ -2,7 +2,7 @@
 
 All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.4-alpha] - 2026-11-01
 
 ### Added
 
@@ -14,8 +14,10 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 - The saved shader list of a game is built in the background while the game runs (on all compile workers, with "Building the shader cache: done / total" in the corner) instead of before the game starts; `--prewarm-wait` (`RPS5E_PREWARM_WAIT=1`) keeps the old behaviour. Tests and input replays still build it first.
 - Compiles are ordered by need: the shaders a draw or dispatch needs now, then the saved list, then the compile lookahead's guesses; an eighth of the compile workers is kept free for the shaders needed now.
 - The compile lookahead also reads the command buffers already queued after the current one, on every GPU queue, and reads past flips and conditional commands (`RPS5E_LOOKAHEAD_QUEUED`, `RPS5E_LOOKAHEAD_GUESS`); the GPU command thread starts it whenever it meets a new compute program (`RPS5E_LOOKAHEAD_EAGER`), so it also works while draws are recorded on their own thread, where it found nothing before.
-
 - Demon's Souls gameplay runs about 1.4-2x faster (user's play recording, frames after the 3rd Triangle: 4.2 → 6.2-8.8 fps; 3 of 3 A/B pairs faster in one run, 5.97 → 8.50 fps). Shader resources read from a guest memory page that also holds GPU results no longer count as GPU-written when the GPU never wrote those bytes, or when its copy back to guest memory already finished: such reads waited 20-40 ms for all queued GPU work, and descriptor-table words were copied on the GPU, which split almost every draw into its own render pass and tripled the GPU time in runs where the game's tables shared a page with GPU output (`RPS5E_UNWRITTEN_WORDS`, `RPS5E_LANDED_WORDS`). The GPU command thread also prepares the shaders of GPU-indirect draws the way the recording thread records them, so they are no longer prepared twice (`RPS5E_PREFETCH_INDIRECT`), and remembers per page whether it holds GPU results while it reads a shader's resources (`RPS5E_DIRTY_PAGE_MEMO`).
+- The recording thread (`RPS5E_GPU_RECORD_THREAD=auto`) no longer switches itself off during loading pauses: a one-second window that recorded almost nothing no longer counts as the recorder waiting (`RPS5E_POLICY_QUIET`). In GTA V's city a probe that fell into such a pause kept the thread off for one to two minutes, and the city then ran at ~6.2 fps instead of ~7.8 (2 of 9 benchmark runs).
+- Bindless texture tables cost less to keep current: elements that can never have a view (null, another dimension, a depth compare on a colour format, ...) are no longer looked up again at every guest mapping change (`RPS5E_BINDLESS_WORD_FAILURES`), a changed table is read again only on its changed pages (`RPS5E_BINDLESS_PAGE_READS`), and pinned images are logged once between two reads of the log (`RPS5E_PINNED_DEDUP`). GTA V's two ray-tracing dispatches per frame took 2.2-4 ms of recording each, now 1-1.9 ms (the recording thread's CPU per city frame 79 → 75 ms).
+- Shaders are much smaller and build up to twice as fast where the GPU flushes f32 denormals itself: the console's flush of tiny float values (FLOAT_MODE) was emulated with about six extra instructions per float operation; the emulator now measures at start what the GPU's own float operations do with denormals (each shader stage) and leaves the emulated flush out wherever the GPU already gives the same bits, and compares values that cannot be denormal with the GPU's own compare (`RPS5E_HOST_FTZ`, `RPS5E_NATIVE_F32_COMPARE`). On an RTX 5090: building the saved shader lists from scratch takes GRAND THEFT AUTO V 23 s instead of 37 s, ASTRO BOT 18 s instead of 40 s and SILENT HILL: The Short Message 11 s instead of 25 s, and the largest ASTRO BOT shader shrinks from 1.1 M to 0.56 M words; pictures are unchanged. Games translate their shaders once more on the first start. `RPS5E_NO_F32_FLUSH=1` drops the flush emulation entirely (not exact, for measurements).
 
 ### Fixed
 
@@ -174,7 +176,7 @@ First public alpha.
 - The project is named RustPS5Emu (RPS5E): binaries `rps5e` and `rps5e-cli`, environment variables `RPS5E_*`, data, settings and caches under `rps5e` folders.
 - Release packages: `scripts/package.sh` (Linux tarball, Windows zip) with a `dist` build profile without debug info.
 
-[Unreleased]: https://github.com/keklick1337/rps5e/compare/v0.1.3-alpha...HEAD
+[0.1.4-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.4-alpha
 [0.1.3-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.3-alpha
 [0.1.2-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.2-alpha
 [0.1.1-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.1-alpha

@@ -8663,8 +8663,8 @@ impl PipelineProvider for ShaderPipelines {
         ) + " " + &self.t.compile_times.format() + &crate::shader::stats::line()
             + &self.bindless_stats().map_or(String::new(), |b| {
                 format!(
-                    " bindless=[binds {} reads {} records {} looks {} maps {} slots {} tables {}]",
-                    b.binds, b.reads, b.resolved, b.revalidated, b.maps, b.slots, b.tables
+                    " bindless=[binds {} reads {} records {} looks {} maps {} slots {} tables {} all-memory {} all-uses {} entries {}u/{}m first {} quick {} lookups {} same {} failed {} uncovered {} page-reads {}]",
+                    b.binds, b.reads, b.resolved, b.revalidated, b.maps, b.slots, b.tables, b.all_memory, b.all_uses, b.use_entries, b.memory_entries, b.first_looks, b.quick_looks, b.view_lookups, b.same_views, b.failed_looks, b.uncovered_looks, b.page_reads
                 )
             }))
     }

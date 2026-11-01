@@ -484,7 +484,7 @@ fn compile_as(s: &Stage, adjust: &dyn Fn(&mut ShaderCompileRequest<'_>), mesh: O
     let mut r = ShaderCompileRequest::new(&plan, resources, layout);
     r.wave_size = 32;
     adjust(&mut r);
-    let features = Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit: super::EmitOptions::ALL };
+    let features = Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, host_float: ps5shader::opt::denorm::HostFloat::NONE, host_float16: ps5shader::opt::denorm::HostFloat::NONE, f16_denormals_kept: false, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit: super::EmitOptions::ALL };
     SpirvCompiler::new(features, None).compile_mesh_request(s.stage, &r, 0, mesh).map_err(|e| format!("compile: {e}"))
 }
 

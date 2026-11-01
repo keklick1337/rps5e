@@ -228,6 +228,10 @@ pub struct GpuDevice {
     /// The device shader clock calibrated against the reference clock
     /// (set once by [`crate::clock::calibrate`] when it succeeds).
     pub clock: OnceLock<crate::clock::DeviceClock>,
+    /// Which f32 operations of the device flush denormals in modules
+    /// without an f32 denormal mode, and in modules that declare
+    /// DenormPreserve(16) (measured once, [`crate::shader::host_denormals`]).
+    pub f32_host_ftz: OnceLock<crate::shader::host_denormals::HostDenormals>,
 }
 
 // SAFETY: Vulkan handles are plain identifiers; every externally
@@ -563,6 +567,7 @@ impl GpuDevice {
                     log::info!("ps5gpu: no D16_UNORM_S8_UINT attachments: 16-bit depth with stencil uses D32_SFLOAT_S8_UINT");
                 }
                 crate::clock::calibrate(&d);
+                let _ = d.f32_host_ftz.set(crate::shader::host_denormals::measure(&d));
                 Ok(d)
             }
             Err(e) => {
@@ -1181,6 +1186,7 @@ impl GpuDevice {
             arena: crate::suballoc::Arena::default(),
             image_arena: crate::suballoc::Arena::default(),
             clock: OnceLock::new(),
+            f32_host_ftz: OnceLock::new(),
         })
     }
 

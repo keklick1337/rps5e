@@ -234,6 +234,9 @@ fn bindless_large_table_follows_cpu_writes() {
     let reds = t.run(&g);
     let after = t.rig.provider.bindless_stats().unwrap();
     assert_eq!((after.reads - before.reads, after.resolved - before.resolved, after.maps - before.maps), (1, 1, 1), "one record read and mapped again");
+    // Only the page the CPU may have written without a fault is read again
+    // (`RPS5E_BINDLESS_PAGE_READS`), not the whole table.
+    assert_eq!(after.page_reads - before.page_reads, 1, "the table's page read again on its own");
     let table = |k: u32| {
         let k = if k == 5 { 9 } else { k };
         if k % 7 == 3 { 0.0 } else { expected_red(k * 7 + 1) }

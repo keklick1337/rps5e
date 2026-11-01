@@ -386,6 +386,15 @@ pub fn pinned_log_enabled() -> bool {
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PINNED_LOG")) && crate::backend::ab::release_fast("RPS5E_PINNED_LOG")
 }
 
+/// `RPS5E_PINNED_DEDUP=0`: every change of a pinned image is logged for
+/// the bindless tables, also when its previous entry is one every reader
+/// still has to read (see `ImageCache::note_pinned`; A/B scope `release`
+/// name `pinned-dedup`).
+pub fn pinned_dedup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PINNED_DEDUP")) && crate::backend::ab::release_fast("pinned-dedup")
+}
+
 /// `RPS5E_WATCH_INDEX=0`: a CPU write (a fault) or a GPU buffer write
 /// looks at every image entry to find the ones it hits instead of only the
 /// entries over its 1 MiB of memory (with thousands of images, the scan
@@ -1397,6 +1406,9 @@ pub struct CachedImage {
     /// Bindless table slots holding a view of the image (see
     /// [`ImageCache::pin`]).
     pins: u32,
+    /// One past the pinned-use log position of the image's latest entry
+    /// (0: none; see [`ImageCache::note_pinned`]).
+    pinned_note: u64,
     /// `seq` at the last write-back (0: never): the buffer mirror of the
     /// image's memory holds these contents.
     written_back_seq: u64,
@@ -1692,6 +1704,9 @@ pub struct ImageCache {
     /// (see [`Self::pinned_since`]), from position `pinned_base` on.
     pinned_log: Vec<u64>,
     pinned_base: u64,
+    /// The latest log position a reader was handed ([`Self::pinned_cursor`]):
+    /// an image whose entry lies at or after it is seen by every reader.
+    pinned_read: std::sync::atomic::AtomicU64,
 }
 
 /// How GPU-written linear storage images reach guest memory
@@ -2189,6 +2204,7 @@ impl ImageCache {
             no_idle_below: 0,
             pinned_log: Vec::new(),
             pinned_base: 0,
+            pinned_read: std::sync::atomic::AtomicU64::new(0),
             barriers: Vec::new(),
             blit: None,
             // RPS5E_SAFE: every linear storage image is read back at
@@ -2303,7 +2319,9 @@ impl ImageCache {
 
     /// The log position after the last change of a pinned image.
     pub fn pinned_cursor(&self) -> u64 {
-        self.pinned_base + self.pinned_log.len() as u64
+        let c = self.pinned_base + self.pinned_log.len() as u64;
+        self.pinned_read.fetch_max(c, std::sync::atomic::Ordering::Relaxed);
+        c
     }
 
     /// Pinned images changed since log position `cursor` (an image may
@@ -2329,13 +2347,32 @@ impl ImageCache {
         self.table.pinned_changed_since(since, out)
     }
 
+    /// Log a change of pinned image `id` for the bindless tables. With
+    /// [`pinned_dedup_enabled`] an image whose latest entry is still in
+    /// the log at or after every position handed to a reader is not logged
+    /// again: every reader's next look sees that entry (a render target in
+    /// a bindless set is otherwise logged at each of its attachment uses,
+    /// and the log overflowed between two binds of a table, which then
+    /// looked at every image it holds).
     fn note_pinned(&mut self, id: u64) {
         const LOG: usize = 1 << 14;
+        let dedup = pinned_dedup_enabled();
+        if dedup {
+            let read = self.pinned_read.load(std::sync::atomic::Ordering::Relaxed);
+            let base = self.pinned_base;
+            if self.images.get(&id).is_some_and(|i| i.pinned_note > read && i.pinned_note > base) {
+                return;
+            }
+        }
         if self.pinned_log.len() >= LOG {
             self.pinned_log.drain(..LOG / 2);
             self.pinned_base += (LOG / 2) as u64;
         }
         self.pinned_log.push(id);
+        let at = self.pinned_base + self.pinned_log.len() as u64;
+        if let Some(i) = self.images.get_mut(&id) {
+            i.pinned_note = at;
+        }
     }
 
     /// Mark an image used by `tick` (a memoised lookup).
@@ -2739,6 +2776,7 @@ impl ImageCache {
                 merged: false,
                 generation: 0,
                 pins: 0,
+                pinned_note: 0,
                 written_back_seq: 0,
             },
         );

@@ -66,14 +66,15 @@ impl ThroughSpans {
     }
 
     /// Keys of the spans overlapping `[start, end)`, in no particular order.
-    fn overlapping_keys(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
-        let hit = |s: &ThroughSpan| s.start < end && start < s.end;
-        if indexed() {
-            let from = start.saturating_sub(self.max_len);
-            self.map.range((from, 0)..(end, 0)).filter(|(_, s)| hit(s)).map(|(&k, _)| k).collect()
-        } else {
-            self.map.iter().filter(|(_, s)| hit(s)).map(|(&k, _)| k).collect()
-        }
+    fn overlapping_keys(&self, start: u64, end: u64) -> smallvec::SmallVec<[(u64, u64); 8]> {
+        self.overlapping(start, end).map(|(&k, _)| k).collect()
+    }
+
+    /// The spans overlapping `[start, end)` with their keys, in no
+    /// particular order.
+    fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = (&(u64, u64), &ThroughSpan)> + '_ {
+        let (from, to) = if indexed() { ((start.saturating_sub(self.max_len), 0), (end, 0)) } else { ((0, 0), (u64::MAX, u64::MAX)) };
+        self.map.range(from..to).filter(move |(_, s)| s.start < end && start < s.end)
     }
 
     /// Whether a span overlaps `[start, end)`.
@@ -97,8 +98,7 @@ impl ThroughSpans {
 
     /// The newest span holding byte `addr`.
     pub fn newest_containing(&self, addr: u64) -> Option<&ThroughSpan> {
-        let keys = self.overlapping_keys(addr, addr + 1);
-        keys.iter().max_by_key(|k| k.1).map(|k| &self.map[k])
+        self.overlapping(addr, addr + 1).max_by_key(|(k, _)| k.1).map(|(_, s)| s)
     }
 
     /// Cut `[start, end)` out of every span (the parts outside stay, with

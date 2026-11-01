@@ -252,7 +252,7 @@ pub(crate) fn all_cases() -> Vec<&'static RefCase> {
     v
 }
 
-const FEATURES: Features = Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit: super::EmitOptions::ALL };
+const FEATURES: Features = Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, host_float: ps5shader::opt::denorm::HostFloat::NONE, host_float16: ps5shader::opt::denorm::HostFloat::NONE, f16_denormals_kept: false, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit: super::EmitOptions::ALL };
 
 /// Cases the back-end does not compile, with the reason.
 const KNOWN_UNSUPPORTED: &[(&str, &str)] = &[];

@@ -176,6 +176,19 @@ impl<'a> Translator<'a> {
         }
         let after_rounding = after_rounding && self.options.float_rules & super::float_rules::TINY_AFTER_ROUNDING != 0;
         let round_mode = (self.float_mode.mode & 3) as u32;
+        // A host multiply / fma that flushes f32 denormals decides
+        // tininess after rounding to nearest too (measured): its product
+        // is already the flushed one.
+        let host = self.options.host_float;
+        let host_product = match self.func.op(product) {
+            Op::FMul => host.arith,
+            Op::FFma => host.fused,
+            _ => false,
+        };
+        let on_constants = self.func.args(product).iter().all(|&v| self.func.as_const(v).is_some());
+        if after_rounding && round_mode == 0 && host_product && !on_constants && self.func.ty(product) == Type::F32 {
+            return product;
+        }
         if after_rounding && round_mode == 0 && self.options.float_rules & super::float_rules::TINY_ONE_MULTIPLY != 0 {
             return self.flush_tiny_product_nearest(a, b, product, addend);
         }

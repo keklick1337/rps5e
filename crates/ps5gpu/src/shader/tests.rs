@@ -134,7 +134,7 @@ fn compile_emit(
         r.local_size = [m.threads, 1, 1];
         r.local_data_share_dwords = 2304;
     }
-    let compiler = SpirvCompiler::new(Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit }, None);
+    let compiler = SpirvCompiler::new(Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, host_float: ps5shader::opt::denorm::HostFloat::NONE, host_float16: ps5shader::opt::denorm::HostFloat::NONE, f16_denormals_kept: false, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit }, None);
     let out = compiler.compile_mesh_request(stage, &r, 0, mesh).map_err(|e| format!("compile: {e}"))?;
     // PS5SHADER_DUMP_SPV=<dir>: write every module for inspection.
     if let Some(dir) = std::env::var_os("PS5SHADER_DUMP_SPV") {
@@ -408,7 +408,7 @@ fn translate_list_bench() {
     let Some(list) = std::env::var_os("RPS5E_TRANSLATE_BENCH") else { return };
     let keys: Vec<u64> = std::env::var("RPS5E_TRANSLATE_BENCH_KEYS").unwrap_or_default().split(',').filter_map(|k| u64::from_str_radix(k.trim(), 16).ok()).collect();
     let emit = super::EmitOptions::ALL;
-    let compiler = SpirvCompiler::new(Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit }, None);
+    let compiler = SpirvCompiler::new(Features { barycentric: true, demote: true, subgroup_size: 32, subgroup64_compute: false, max_compute_workgroup_subgroups: 32, max_shared_bytes: 49152, sample_offset: false, image_int64_atomics: true, shared_int64_atomics: true, compute_derivatives: true, compute_derivatives_linear: true, preserve_inf_nan: [true; 3], denorm_preserve: [true; 3], denorm_flush_to_zero32: true, host_float: ps5shader::opt::denorm::HostFloat::NONE, host_float16: ps5shader::opt::denorm::HostFloat::NONE, f16_denormals_kept: false, f16_rte: false, device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }), subgroup_clock: true, bindless_tables: true, no_float64: false, amd_proprietary: false, emit }, None);
     let only = |k: u64| keys.is_empty() || keys.contains(&k);
     let modules = crate::pipeline::precompile::translate_list_with(&compiler, Path::new(&list), 1, &only, None).unwrap();
     for m in &modules {

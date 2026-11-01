@@ -1011,7 +1011,7 @@ mod tests {
             compute_derivatives_linear: true,
             preserve_inf_nan: [true; 3],
             denorm_preserve: [true; 3],
-            denorm_flush_to_zero32: true,
+            denorm_flush_to_zero32: true, host_float: ps5shader::opt::denorm::HostFloat::NONE, host_float16: ps5shader::opt::denorm::HostFloat::NONE, f16_denormals_kept: false,
             f16_rte: false,
             device_clock: Some(crate::clock::DeviceClock { num: 1, den: 10 }),
             subgroup_clock: true,

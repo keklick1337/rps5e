@@ -85,6 +85,17 @@ pub struct Features {
     /// DenormFlushToZero(32) is available: modules whose FLOAT_MODE flushes
     /// f32 everywhere run without the emulated flush code.
     pub denorm_flush_to_zero32: bool,
+    /// Which f32 operations of the device flush denormals in modules
+    /// without an f32 denormal mode (measured, [`host_denormals::measure`]):
+    /// the emulated flush is elided where it is the host's own
+    /// (`ps5shader::opt::denorm::HostFloat`).
+    pub host_float: ps5shader::opt::denorm::HostFloat,
+    /// [`Self::host_float`] in modules that declare DenormPreserve(16).
+    pub host_float16: ps5shader::opt::denorm::HostFloat,
+    /// f16 keeps its denormals without DenormPreserve(16) as with it
+    /// (measured): where the flush elision relies on the host's f32 flush,
+    /// modules do not declare it (a driver may keep f32 denormals with it).
+    pub f16_denormals_kept: bool,
     /// Round-to-nearest-even f32 -> f16 conversions as native OpFConvert
     /// under the 16-bit RoundingModeRTE / DenormPreserve /
     /// SignedZeroInfNanPreserve modes (`RPS5E_NATIVE_F16_RTE=0`: the exact
@@ -184,6 +195,21 @@ pub struct EmitOptions {
     /// never a denormal (an earlier flush's result through EXEC selects
     /// and phis) is not emitted (`ps5shader::opt::denorm`).
     pub flush_elision: bool,
+    /// `RPS5E_HOST_FTZ`: where the device's own f32 arithmetic flushes
+    /// denormals ([`Features::host_ftz32`]), the emulated flush of those
+    /// operations' results and operands is not emitted, nor the flush of
+    /// any value that is never a denormal
+    /// (`ps5shader::opt::denorm::elide_flushes_on`). Exact.
+    pub host_flush: bool,
+    /// `RPS5E_NATIVE_F32_COMPARE`: where the host compares f32 denormals as
+    /// zero (no DenormPreserve(32)), a comparison (and min / max) of two
+    /// values that are never denormals is the host's compare, not a
+    /// comparison of the bits. Exact.
+    pub native_f32_compare: bool,
+    /// `RPS5E_NO_F32_FLUSH=1` (opt-in, not exact): no f32 denormal flush
+    /// code at all; f32 arithmetic keeps whatever the host does with
+    /// denormals (the host's compares too).
+    pub no_f32_flush: bool,
     /// `RPS5E_FULL_WAVE_EXEC=1` (opt-in): a compute program whose
     /// work-group is whole waves (and whose dispatch has no thread limits)
     /// starts with every lane active, so its EXEC-masked writes fold in the
@@ -252,6 +278,9 @@ impl EmitOptions {
         fast_transcendental: false,
         native_ftz: true,
         flush_elision: false,
+        host_flush: true,
+        native_f32_compare: true,
+        no_f32_flush: false,
         full_wave_exec: false,
         float_class_compare: false,
         const_fold: false,
@@ -282,6 +311,9 @@ impl EmitOptions {
         fast_transcendental: false,
         native_ftz: false,
         flush_elision: false,
+        host_flush: false,
+        native_f32_compare: false,
+        no_f32_flush: false,
         full_wave_exec: false,
         float_class_compare: false,
         const_fold: false,
@@ -318,6 +350,9 @@ impl EmitOptions {
                 // garbage at the bottom/right screen edges with these three
                 // on (GPU_PLAN §62 addendum).
                 flush_elision: opt_in("RPS5E_FLUSH_ELISION"),
+                host_flush: on("RPS5E_HOST_FTZ"),
+                native_f32_compare: on("RPS5E_NATIVE_F32_COMPARE"),
+                no_f32_flush: opt_in("RPS5E_NO_F32_FLUSH"),
                 full_wave_exec: opt_in("RPS5E_FULL_WAVE_EXEC"),
                 float_class_compare: opt_in("RPS5E_FLOAT_CLASS_COMPARE"),
                 const_fold: opt_in("RPS5E_EMIT_FOLD"),
@@ -330,6 +365,9 @@ impl EmitOptions {
                 nan_once: on("RPS5E_NAN_ONCE"),
                 zero_max: on("RPS5E_ZERO_MAX"),
             };
+            if o.no_f32_flush {
+                log::warn!("[shader] RPS5E_NO_F32_FLUSH=1: f32 denormals are not flushed as the guest's FLOAT_MODE asks (the host's own behaviour)");
+            }
             if o.fast_transcendental {
                 log::warn!("[shader] RPS5E_FAST_TRANSCENDENTAL=1: v_exp/log/rcp/rsq/sqrt_f32 use the host's precision and special values");
             }
@@ -375,6 +413,9 @@ impl Features {
             preserve_inf_nan: dev.caps.signed_zero_inf_nan_preserve,
             denorm_preserve: dev.caps.denorm_preserve,
             denorm_flush_to_zero32: dev.caps.denorm_flush_to_zero32,
+            host_float: dev.f32_host_ftz.get().map_or(ps5shader::opt::denorm::HostFloat::NONE, |h| h.plain),
+            host_float16: dev.f32_host_ftz.get().map_or(ps5shader::opt::denorm::HostFloat::NONE, |h| h.with_preserve16),
+            f16_denormals_kept: dev.f32_host_ftz.get().is_some_and(|h| h.f16_kept),
             f16_rte: dev.caps.float16_rte && native_f16_rte_enabled(),
             device_clock: dev.clock.get().copied(),
             subgroup_clock: dev.caps.shader_subgroup_clock,
@@ -400,10 +441,14 @@ pub struct EmitInput<'a, 'p> {
     /// A wave64 compute program split over two 32-wide host subgroups
     /// ([`wave_split`]), with `lanes` 1.
     pub split: Option<wave_split::SplitPlan>,
-    /// The module's f32 denormals are the host's (DenormFlushToZero(32)):
-    /// the translation carries no flush code (see
-    /// `ps5shader::translate::native_ftz_applies`).
+    /// The module's f32 denormals are the host's (DenormFlushToZero(32)
+    /// where the device has it): the translation carries no flush code
+    /// (see `ps5shader::translate::native_ftz_applies`, and
+    /// [`EmitOptions::no_f32_flush`]).
     pub native_ftz: bool,
+    /// The host f32 behaviour the flush elision relied on (also for which
+    /// values are never denormals in the emitter's compares).
+    pub host_float: ps5shader::opt::denorm::HostFloat,
 }
 
 /// Native f32 -> f16 conversions where the device guarantees them, unless
@@ -588,7 +633,39 @@ pub fn translate_options(stage: ShaderStage, r: &ShaderCompileRequest<'_>, mesh:
         rewrites: translate::rewrites::ALL,
         fast_transcendental: false,
         native_ftz: false,
+        host_float: ps5shader::opt::denorm::HostFloat::NONE,
     }
+}
+
+/// Whether the translation of `program` may use f16 types (f16 / packed /
+/// mixed-precision / D16 operations, half interpolation): the module then
+/// declares the 16-bit float modes.
+fn may_use_f16(program: &ps5shader::Program) -> bool {
+    program.instructions.iter().any(|i| {
+        let name = format!("{:?}", i.opcode);
+        name.contains("F16") || name.contains("D16") || name.contains("Pk") || name.contains("Mix") || matches!(&i.control, Some(ps5shader::Control::Image(c)) if c.d16)
+    })
+}
+
+/// Whether the SPIR-V module `words` declares the execution mode `mode`
+/// with the literal `width` (the float-controls modes).
+pub fn declares_execution_mode(words: &[u32], mode: spirv::ExecutionMode, width: u32) -> bool {
+    let mut i = 5;
+    while i < words.len() {
+        let (count, op) = ((words[i] >> 16) as usize, words[i] & 0xFFFF);
+        if count == 0 {
+            return false;
+        }
+        if op == spirv::Op::ExecutionMode as u32 && count == 4 && i + 3 < words.len() && words[i + 2] == mode as u32 && words[i + 3] == width {
+            return true;
+        }
+        // Execution modes precede every function: stop at the first type.
+        if op == spirv::Op::TypeVoid as u32 || op == spirv::Op::Function as u32 {
+            return false;
+        }
+        i += count;
+    }
+    false
 }
 
 /// Whether every lane of a compute program's waves runs: the work-group is
@@ -815,6 +892,21 @@ impl SpirvCompiler {
         mesh: Option<crate::pipeline::compiler::MeshConfig>,
         code: Option<&(dyn ps5shader::CodeSource + Sync)>,
     ) -> Result<CompiledShader, CompileError> {
+        self.compile_regime(stage, r, key, mesh, code, false)
+    }
+
+    /// [`Self::compile_from`]; `wide`: the module declares
+    /// DenormPreserve(16), so the flush elision keeps to the host
+    /// operations that flush under it ([`Features::host_float16`]).
+    fn compile_regime(
+        &self,
+        stage: ShaderStage,
+        r: &ShaderCompileRequest<'_>,
+        key: u64,
+        mesh: Option<crate::pipeline::compiler::MeshConfig>,
+        code: Option<&(dyn ps5shader::CodeSource + Sync)>,
+        wide: bool,
+    ) -> Result<CompiledShader, CompileError> {
         let mesh = mesh.filter(|_| stage == ShaderStage::Vertex);
         let feats = self.features;
         let mut options = translate_options(stage, r, mesh.is_some());
@@ -831,10 +923,23 @@ impl SpirvCompiler {
         // One decision for the translation and the emitted module: the
         // module's FLOAT_MODE flushes f32 everywhere and its opcodes agree
         // with the host's flush.
-        let native_ftz = self.features.emit.native_ftz
-            && self.features.denorm_flush_to_zero32
-            && translate::native_ftz_applies(r.program(), r.float_mode, options.float_rules);
+        let native_ftz = self.features.emit.no_f32_flush
+            || self.features.emit.native_ftz && self.features.denorm_flush_to_zero32 && translate::native_ftz_applies(r.program(), r.float_mode, options.float_rules);
         options.native_ftz = native_ftz;
+        // The host's f32 flush depends on whether the module declares
+        // DenormPreserve(16) (the emitter does where it uses f16): the
+        // translation and the flush elision follow the modes expected from
+        // the program; a module that turns out to declare it after all is
+        // translated again with the 16-bit rules.
+        let regimes = feats.host_float != feats.host_float16 && !feats.f16_denormals_kept;
+        let host_flush = feats.emit.host_flush && !native_ftz && (feats.host_float.any() || feats.host_float16.any());
+        let wide = wide || host_flush && regimes && may_use_f16(r.program());
+        let host_float = match (host_flush, wide) {
+            (false, _) => ps5shader::opt::denorm::HostFloat::NONE,
+            (true, false) => feats.host_float,
+            (true, true) => feats.host_float16,
+        };
+        options.host_float = host_float;
         let memory = self.memory;
         let reads = std::cell::RefCell::new(Vec::new());
         let read = |a: u64| -> Option<u32> {
@@ -859,6 +964,20 @@ impl SpirvCompiler {
         if r.relocatable_code {
             ps5shader::opt::fold::unfold_code_address(&mut compiled.function, RELOCATION_SPAN);
         }
+        if host_flush && regimes && !wide && ps5shader::opt::denorm::uses_f16(&compiled.function) {
+            stats::note_f16_retranslation();
+            return self.compile_regime(stage, r, key, mesh, code, true);
+        }
+        if host_float.any() {
+            let t = std::time::Instant::now();
+            let n = ps5shader::opt::denorm::elide_flushes_on(&mut compiled.function, host_float);
+            if n > 0 {
+                ps5shader::opt::dce::dce(&mut compiled.function);
+                compiled.stats.opt.elided_flushes += n;
+            }
+            stats::PASS_NS[9].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let mut last = [0u64; 10];
         for (k, ns) in compiled.stats.phase_ns.iter().enumerate() {
             stats::PHASE_NS[k].fetch_add(*ns, std::sync::atomic::Ordering::Relaxed);
@@ -903,6 +1022,15 @@ impl SpirvCompiler {
             // runs add branches and phis, so it is made again after them.
             let before = split.as_ref().filter(|p| !p.slots.is_empty() || !p.fused.is_empty() || !p.riders.is_empty()).map(|_| compiled.function.clone());
             let mut runs = ps5shader::opt::exec_runs::group_exec_runs(&mut compiled.function, self.exec_run_minimum);
+            // Inside a run the written values are read without their EXEC
+            // selects: flushes of flushed values show again.
+            if runs > 0 && host_float.any() {
+                let n = ps5shader::opt::denorm::elide_flushes_on(&mut compiled.function, host_float);
+                if n > 0 {
+                    ps5shader::opt::dce::dce(&mut compiled.function);
+                    compiled.stats.opt.elided_flushes += n;
+                }
+            }
             if let (Some(before), true) = (before, runs > 0) {
                 match wave_split::plan(&compiled.function, r.local_size, r.local_data_share_dwords, &self.features, self.wave64_native_shuffles) {
                     Ok(p) => split = Some(p),
@@ -915,7 +1043,7 @@ impl SpirvCompiler {
             }
             // Inside a run the written values are read without their EXEC
             // selects: flushes of flushed values show again.
-            if runs > 0 && options.rewrites & translate::rewrites::FLUSH_ELISION != 0 {
+            if runs > 0 && options.rewrites & translate::rewrites::FLUSH_ELISION != 0 && !host_float.any() {
                 let n = ps5shader::opt::denorm::elide_flushes(&mut compiled.function);
                 if n > 0 {
                     ps5shader::opt::dce::dce(&mut compiled.function);
@@ -939,13 +1067,20 @@ impl SpirvCompiler {
         last[8] = t.elapsed().as_nanos() as u64;
         stats::PHASE_NS[6].fetch_add(last[8], std::sync::atomic::Ordering::Relaxed);
         let t = std::time::Instant::now();
-        let input = EmitInput { func: &compiled.function, stage, request: r, uses: &uses, features: feats, lanes, mesh, split, native_ftz };
+        let input = EmitInput { func: &compiled.function, stage, request: r, uses: &uses, features: feats, lanes, mesh, split, native_ftz, host_float };
         let (spirv, mut reflection) = emit_module(&input).map_err(CompileError::Unsupported)?;
+        last[9] = t.elapsed().as_nanos() as u64;
+        stats::PHASE_NS[7].fetch_add(last[9], std::sync::atomic::Ordering::Relaxed);
+        // The elision assumed a module without DenormPreserve(16) (the host
+        // then flushes more operations): translate again with the 16-bit
+        // modes' rules when the emitted module declares it after all.
+        if host_flush && regimes && !wide && declares_execution_mode(&spirv, spirv::ExecutionMode::DenormPreserve, 16) {
+            stats::note_f16_retranslation();
+            return self.compile_regime(stage, r, key, mesh, code, true);
+        }
         if required64 {
             reflection.required_subgroup_size = 64;
         }
-        last[9] = t.elapsed().as_nanos() as u64;
-        stats::PHASE_NS[7].fetch_add(last[9], std::sync::atomic::Ordering::Relaxed);
         stats::set_last(last);
         if let Some(dir) = &self.dump {
             let tag = match stage {
@@ -960,7 +1095,7 @@ impl SpirvCompiler {
             let _ = std::fs::write(dir.join(format!("{stem}.spv")), bytes);
             // The guest program and the IR the module was emitted from.
             let _ = std::fs::write(dir.join(format!("{stem}.s")), r.program().to_string());
-            let _ = std::fs::write(dir.join(format!("{stem}.ir")), format!("; lanes {lanes} split {} required64 {required64} float_mode {:?} native_ftz {native_ftz} rewrites {:#x} opt {:?}\n{}", input.split.is_some(), r.float_mode, options.rewrites, compiled.stats.opt, compiled.function));
+            let _ = std::fs::write(dir.join(format!("{stem}.ir")), format!("; lanes {lanes} split {} required64 {required64} float_mode {:?} native_ftz {native_ftz} host_float {host_float:?} rewrites {:#x} opt {:?}\n{}", input.split.is_some(), r.float_mode, options.rewrites, compiled.stats.opt, compiled.function));
         }
         if reflection.private_lds_bytes != 0 {
             log::info!("[shader] {stage:?} {:#x}: {} bytes of private LDS per invocation", r.program().address, reflection.private_lds_bytes);
@@ -1121,3 +1256,4 @@ mod tests;
 pub(crate) mod ref_tests;
 #[cfg(test)]
 mod graphics_tests;
+pub mod host_denormals;

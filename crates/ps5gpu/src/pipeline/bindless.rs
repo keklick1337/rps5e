@@ -71,6 +71,27 @@ pub struct BindlessStats {
     /// Slots in use and tables kept.
     pub slots: u64,
     pub tables: u64,
+    /// Binds that looked at every held image: the guest-memory change log
+    /// no longer reached back to the table's last look, or the pinned-use
+    /// log did not.
+    pub all_memory: u64,
+    pub all_uses: u64,
+    /// Entries of the pinned-use and guest-memory change logs read by
+    /// binds, and the distinct T#s their first look covered.
+    pub use_entries: u64,
+    pub memory_entries: u64,
+    pub first_looks: u64,
+    /// Looks that found the held image unchanged (a transition only), and
+    /// looks that resolved the view again, of which the same view.
+    pub quick_looks: u64,
+    pub view_lookups: u64,
+    pub same_views: u64,
+    /// Looks at failed T#s after a mapping change, and at T#s whose
+    /// image's CPU writes no watch reports (once per tick).
+    pub failed_looks: u64,
+    pub uncovered_looks: u64,
+    /// Runs of table pages read again (instead of the whole table).
+    pub page_reads: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,6 +171,8 @@ struct Distinct {
     /// Listed in the table's `failed` / `uncovered` lists.
     failed: bool,
     uncovered: bool,
+    /// Its failure is decided by its words (see [`NoView::decided_by_words`]).
+    word_failure: bool,
 }
 
 impl Distinct {
@@ -185,6 +208,11 @@ struct Table {
     // Memory stamps of the records read last.
     stamp: [u64; 4],
     generations: Vec<Option<u32>>,
+    /// Per page of `generations`: the CPU could write it without moving
+    /// its generation at the last read, and the backing memory it showed
+    /// then (0: none).
+    page_volatile: Vec<bool>,
+    backing: Vec<usize>,
     volatile: bool,
     sync: u64,
     maps: u64,
@@ -219,6 +247,7 @@ pub struct BindlessSet {
     // Scratch of one bind.
     scratch: Vec<u32>,
     generations: Vec<Option<u32>>,
+    backing: Vec<usize>,
     barriers: Vec<vk::ImageMemoryBarrier2<'static>>,
     writes: Vec<(u32, vk::DescriptorImageInfo)>,
     pub stats: BindlessStats,
@@ -247,6 +276,33 @@ enum NoView {
     Numeric(u32, ImageNumericClass),
     NotCached,
     View(String),
+}
+
+impl NoView {
+    /// The T#'s words and the binding kind alone decide this failure: no
+    /// mapping or image cache change can give the element a view (its
+    /// words changing makes it another distinct T#).
+    fn decided_by_words(&self) -> bool {
+        !matches!(self, NoView::NotCached | NoView::View(_))
+    }
+}
+
+/// `RPS5E_BINDLESS_PAGE_READS=0`: a table whose memory changed is read
+/// again whole, not only the pages that may hold other bytes (A/B scope
+/// `release` name `bindless-page-reads`).
+fn page_reads_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_BINDLESS_PAGE_READS")) && crate::backend::ab::release_fast("bindless-page-reads")
+}
+
+/// `RPS5E_BINDLESS_WORD_FAILURES=0`: table elements whose T# can never have
+/// a view (null, another dimension, a converted format, a depth reference
+/// on a colour format, ...: decided by its words and the binding alone) are
+/// looked up again after every mapping change, like elements whose image
+/// was missing (A/B scope `release` name `bindless-word-failures`).
+fn word_failures_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_BINDLESS_WORD_FAILURES")) && crate::backend::ab::release_fast("bindless-word-failures")
 }
 
 impl std::fmt::Display for NoView {
@@ -399,6 +455,7 @@ impl BindlessSet {
             collected: 0,
             scratch: Vec::new(),
             generations: Vec::new(),
+            backing: Vec::new(),
             barriers: Vec::new(),
             writes: Vec::new(),
             stats: BindlessStats::default(),
@@ -579,6 +636,8 @@ impl BindlessSet {
                 null_slot: self.null_slot(ctx, dummies, kind)?,
                 stamp: [0; 4],
                 generations: Vec::new(),
+                page_volatile: Vec::new(),
+                backing: Vec::new(),
                 volatile: true,
                 sync: 0,
                 maps: 0,
@@ -649,15 +708,19 @@ impl BindlessSet {
         let memory_known = memory_changes == t.memory_changes
             || (crate::images::pinned_log_enabled() && ctx.images.pinned_memory_changed_since(t.memory_changes, &mut changed).is_some());
         if !memory_known || ctx.images.pinned_since(t.cursor).is_none() {
+            self.stats.all_memory += !memory_known as u64;
+            self.stats.all_uses += memory_known as u64;
             check.extend(t.by_image.values().flatten().copied());
         } else {
             if cursor != t.cursor {
+                self.stats.use_entries += ctx.images.pinned_since(t.cursor).map_or(0, |l| l.len() as u64);
                 for id in ctx.images.pinned_since(t.cursor).unwrap_or_default() {
                     if let Some(ds) = t.by_image.get(id) {
                         check.extend_from_slice(ds);
                     }
                 }
             }
+            self.stats.memory_entries += changed.len() as u64;
             for id in &changed {
                 if let Some(ds) = t.by_image.get(id) {
                     check.extend_from_slice(ds);
@@ -668,6 +731,7 @@ impl BindlessSet {
             t.tick_checked = now;
             let distinct = &mut t.distinct;
             t.uncovered.retain(|&d| distinct[d as usize].uncovered);
+            self.stats.uncovered_looks += t.uncovered.len() as u64;
             check.extend_from_slice(&t.uncovered);
         }
         // Mappings changed: T#s without a view may have one now.
@@ -676,10 +740,14 @@ impl BindlessSet {
             t.failed_maps = maps;
             let distinct = &mut t.distinct;
             t.failed.retain(|&d| distinct[d as usize].failed);
-            check.extend_from_slice(&t.failed);
+            let words_only = word_failures_enabled();
+            let before = check.len();
+            check.extend(t.failed.iter().copied().filter(|&d| !(words_only && distinct[d as usize].word_failure)));
+            self.stats.failed_looks += (check.len() - before) as u64;
         }
         check.sort_unstable();
         check.dedup();
+        self.stats.first_looks += check.len() as u64;
         // A lookup may delete or change an image an earlier T# of this
         // table took (an image of more layers of the same surface absorbs
         // it, a fill replaces it): its T#s are looked at again until no
@@ -786,6 +854,86 @@ impl BindlessSet {
             return Ok(None);
         }
         self.stats.reads += 1;
+        // Only the records on pages that may hold other bytes now are read
+        // again: a page whose generation moved, or one the CPU may write
+        // without a fault (no region, or CPU-dirty at the last read) after
+        // a synchronisation point.
+        if !fresh && page_reads_enabled() && self.generations.len() == t.generations.len() && t.page_volatile.len() == t.generations.len() && t.backing.len() == t.generations.len() {
+            let first_page = addr & !(PAGE_BYTES - 1);
+            let end = addr + bytes;
+            // After a mapping change a page shows other bytes where it is
+            // backed by other memory now (or by none: read again, which
+            // fails for an unmapped page as a whole read does).
+            let remapped = maps != t.maps;
+            if remapped {
+                self.backing.clear();
+                self.backing.extend((0..self.generations.len() as u64).map(|i| memory.backing_ptr(first_page + i * PAGE_BYTES, PAGE_BYTES).map_or(0, |p| p as usize)));
+            }
+            // Taken before the bytes, as the generations: a page the CPU
+            // writes without a fault after this is noted as such.
+            let mut volatility = self.page_volatility(&tracker, addr, bytes);
+            let mut changed: Vec<u32> = Vec::new();
+            let mut i = 0;
+            let n = self.generations.len();
+            while i < n {
+                let stale = |i: usize| {
+                    let (now, then) = (self.generations[i], t.generations[i]);
+                    (now != then && !(then.is_none() && same_sync)) || (!same_sync && t.page_volatile[i]) || (remapped && (self.backing[i] == 0 || self.backing[i] != t.backing[i]))
+                };
+                if !stale(i) {
+                    // Not read again: what the CPU may have written into
+                    // it without a fault is still unseen.
+                    volatility[i] |= t.page_volatile[i];
+                    i += 1;
+                    continue;
+                }
+                // A run of stale pages, read at once.
+                let mut j = i + 1;
+                while j < n && stale(j) {
+                    j += 1;
+                }
+                let (lo, hi) = ((first_page + i as u64 * PAGE_BYTES).max(addr), (first_page + j as u64 * PAGE_BYTES).min(end));
+                let (k0, k1) = ((lo - addr) / 32, (hi - addr).div_ceil(32).min(t.key.entries as u64));
+                let (k0, k1) = (k0 as usize, k1 as usize);
+                self.scratch.clear();
+                self.scratch.resize((k1 - k0) * 8, 0);
+                // SAFETY: plain u32s viewed as bytes.
+                let out = unsafe { std::slice::from_raw_parts_mut(self.scratch.as_mut_ptr() as *mut u8, self.scratch.len() * 4) };
+                let at = addr + k0 as u64 * 32;
+                crate::capture::note_read(memory, at, out.len() as u64);
+                if !memory.read_backing(at, out) {
+                    return Err(format!("bindless table at {addr:#x} is not mapped"));
+                }
+                for k in k0..k1 {
+                    let new = &self.scratch[(k - k0) * 8..(k - k0) * 8 + 8];
+                    if t.words[k * 8..k * 8 + 8] != *new {
+                        t.words[k * 8..k * 8 + 8].copy_from_slice(new);
+                        // A record over a page boundary may come twice.
+                        if changed.last() != Some(&(k as u32)) {
+                            changed.push(k as u32);
+                        }
+                    }
+                }
+                self.stats.page_reads += 1;
+                i = j;
+            }
+            t.page_volatile = volatility;
+            std::mem::swap(&mut t.generations, &mut self.generations);
+            if remapped {
+                std::mem::swap(&mut t.backing, &mut self.backing);
+            }
+            t.volatile = volatile;
+            t.sync = sync;
+            t.maps = maps;
+            t.stamp = stamp;
+            return Ok((!changed.is_empty()).then_some(changed));
+        }
+        t.page_volatile = self.page_volatility(&tracker, addr, bytes);
+        {
+            let first_page = addr & !(PAGE_BYTES - 1);
+            t.backing.clear();
+            t.backing.extend((0..self.generations.len() as u64).map(|i| memory.backing_ptr(first_page + i * PAGE_BYTES, PAGE_BYTES).map_or(0, |p| p as usize)));
+        }
         self.scratch.clear();
         self.scratch.resize(t.key.entries as usize * 8, 0);
         // SAFETY: plain u32s viewed as bytes.
@@ -806,6 +954,21 @@ impl BindlessSet {
         };
         std::mem::swap(&mut t.words, &mut self.scratch);
         Ok((!changed.is_empty()).then_some(changed))
+    }
+
+    /// Which pages of `[addr, addr+bytes)` the CPU may write without moving
+    /// their generation (no region, or CPU-dirty now), per page of
+    /// `self.generations` (read just before).
+    fn page_volatility(&self, tracker: &crate::memory::tracker::GuestPageTracker, addr: u64, bytes: u64) -> Vec<bool> {
+        let mut out = Vec::with_capacity(self.generations.len());
+        let mut page = addr & !(PAGE_BYTES - 1);
+        let mut i = 0;
+        while page < addr + bytes {
+            out.push(self.generations.get(i).is_none_or(|g| g.is_none()) || tracker.page_maybe_cpu_dirty(page));
+            page += PAGE_BYTES;
+            i += 1;
+        }
+        out
     }
 
     /// Key `k`'s record is `t.words[k]` now.
@@ -848,6 +1011,7 @@ impl BindlessSet {
                     view: vk::ImageView::null(),
                     failed: false,
                     uncovered: false,
+                    word_failure: false,
                 };
                 let d = match t.free_distinct.pop() {
                     Some(d) => {
@@ -880,14 +1044,17 @@ impl BindlessSet {
         if let Some(held) = x.image {
             if ctx.images.image_generation(held.id) == Some(held.generation) && !ctx.images.needs_upload(held.id) {
                 // Only the layout (another use took the image away).
+                self.stats.quick_looks += 1;
                 ctx.images.transition(held.id, held.usage, held.range, &mut self.barriers);
                 return Ok(());
             }
         }
         let words = x.words;
         self.flush(ctx);
+        self.stats.view_lookups += 1;
         match table_view(ctx, dummies, &self.dev, &words, t.key.kind) {
             Ok((view, id, mode)) => {
+                self.stats.same_views += t.distinct[d as usize].owned.is_some_and(|k| k.view == view && k.image == id) as u64;
                 let generation = ctx.images.image_generation(id).unwrap_or(u64::MAX);
                 let depth = ctx.images.get(id).is_some_and(|i| i.key.is_depth());
                 // An atomic element's view is a storage one: it lives in
@@ -937,11 +1104,13 @@ impl BindlessSet {
                 }
             }
             Err(why) => {
-                // Failed entries are looked at again whenever images change:
-                // the message is formatted when the entry first fails.
+                // Failed entries are looked at again whenever mappings
+                // change, except those their words decide: the message is
+                // formatted when the entry first fails.
                 if !t.distinct[d as usize].failed {
                     crate::log_once(&format!("ps5gpu: bindless table entry reads zeros: {why}"));
                 }
+                t.distinct[d as usize].word_failure = why.decided_by_words();
                 if t.distinct[d as usize].slot != t.null_slot {
                     t.map_stale = true;
                 }
@@ -995,6 +1164,23 @@ mod no_view_tests {
         assert_eq!(s.share(other_layout), None);
     }
 
+
+    /// Only a missing image or a failed view lookup may change with the
+    /// mappings or the image cache; every other reason is the T#'s words.
+    #[test]
+    fn only_lookup_failures_depend_on_more_than_the_words() {
+        let words = [
+            NoView::Null,
+            NoView::Dimension(ImageDimension::Dim3D, ImageDimension::Dim2D),
+            NoView::Converted(7),
+            NoView::Atomic64,
+            NoView::DepthCompare(9),
+            NoView::Numeric(4, ImageNumericClass::Uint),
+        ];
+        assert!(words.iter().all(NoView::decided_by_words));
+        assert!(!NoView::NotCached.decided_by_words());
+        assert!(!NoView::View("unmapped".into()).decided_by_words());
+    }
 
     /// The lazily formatted reasons read as the strings formatted before.
     #[test]

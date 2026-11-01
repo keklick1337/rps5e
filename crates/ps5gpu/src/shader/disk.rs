@@ -82,7 +82,7 @@ pub fn translator_stamp(features: &super::Features) -> u64 {
     (features.barycentric, features.demote, features.subgroup_size, features.sample_offset).hash(&mut h);
     (features.image_int64_atomics, features.shared_int64_atomics, features.compute_derivatives, features.compute_derivatives_linear).hash(&mut h);
     (features.preserve_inf_nan, features.denorm_preserve, features.f16_rte).hash(&mut h);
-    (features.denorm_flush_to_zero32, features.no_float64).hash(&mut h);
+    (features.denorm_flush_to_zero32, features.no_float64, features.host_float, features.host_float16, features.f16_denormals_kept).hash(&mut h);
     (features.device_clock, features.subgroup_clock).hash(&mut h);
     features.amd_proprietary.hash(&mut h);
     features.emit.hash(&mut h);

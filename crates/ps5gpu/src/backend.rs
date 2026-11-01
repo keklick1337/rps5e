@@ -880,6 +880,9 @@ fn skipped_shader(addresses: &[u64]) -> bool {
     !skip.is_empty() && addresses.iter().any(|a| skip.contains(a))
 }
 
+/// Dispatches recorded per PM4 queue (graphics, compute 1..6, the rest).
+static QUEUE_DISPATCHES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 /// `RPS5E_GPU_TRACE_CS=<addr>` (hex): log the user data and the first 256
 /// bytes its resource-table pointer (SGPRs 12:13) addresses for every
 /// dispatch of that compute shader.
@@ -2339,6 +2342,9 @@ impl Backend {
         match outcome {
             DrawOutcome::NeedsShader => self.stats.needs_shader_dispatches += 1,
             DrawOutcome::Recorded => {
+                if profile::on() {
+                    QUEUE_DISPATCHES[d.packet.queue.min(7)].fetch_add(1, Ordering::Relaxed);
+                }
                 let n = self.dispatch_counts.entry(d.shader.address).or_default();
                 *n += 1;
                 let n = *n;
@@ -2348,7 +2354,7 @@ impl Backend {
                     let mut bytes = [0u8; 256];
                     let ok = self.memory.read_backing(table & 0xFFFF_FFFF_FFFF, &mut bytes);
                     let words: Vec<String> = bytes.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
-                    log::info!("[gpu-trace] cs {:#x} #{n} user={:08x?} table {table:#x} ({ok}): {}", d.shader.address, &u[..16], words.join(" "));
+                    log::info!("[gpu-trace] cs {:#x} #{n} q{} user={:08x?} table {table:#x} ({ok}): {}", d.shader.address, d.packet.queue, &u[..16], words.join(" "));
                 }
                 let mut user = [0u32; 16];
                 user.copy_from_slice(&d.shader.user_data[..16]);
@@ -4728,10 +4734,28 @@ mod pipeline_policy {
     struct Window {
         start_ms: u64,
         idle_us: u64,
+        items: u64,
         strikes: u8,
         backoff_ms: u64,
     }
-    static WINDOW: Mutex<Window> = Mutex::new(Window { start_ms: 0, idle_us: 0, strikes: 0, backoff_ms: BACKOFF_MS });
+    static WINDOW: Mutex<Window> = Mutex::new(Window { start_ms: 0, idle_us: 0, items: 0, strikes: 0, backoff_ms: BACKOFF_MS });
+
+    /// Draws and dispatches handed to the executor (either route).
+    pub(super) static ITEMS: AtomicU64 = AtomicU64::new(0);
+    /// Fewer items per second than this: the window is not judged.
+    const QUIET_ITEMS_PER_S: u64 = 5000;
+
+    /// Whether a window in `state` that recorded `rate` items per second
+    /// decides anything (an on or probing thread is judged only when work
+    /// went through it).
+    pub(super) fn judged(state: u8, rate: u64) -> bool {
+        !matches!(state, ON | PROBE) || rate >= QUIET_ITEMS_PER_S
+    }
+
+    fn quiet_ignored() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| super::ab::switch_on("RPS5E_POLICY_QUIET"))
+    }
 
     fn now_ms() -> u64 {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -4775,6 +4799,18 @@ mod pipeline_policy {
             assert_eq!(decide(PROBE, 0.35, 0, BACKOFF_MAX_MS), (OFF, 0, BACKOFF_MAX_MS));
             assert_eq!(decide(PROBE, 0.10, 0, 4 * BACKOFF_MS), (ON, 0, BACKOFF_MS));
         }
+
+        /// Windows that recorded next to nothing do not turn the thread off
+        /// nor end a probe; an off thread still reaches its probe.
+        #[test]
+        fn quiet_windows_are_not_judged() {
+            assert!(!judged(ON, 300));
+            assert!(!judged(PROBE, 0));
+            assert!(judged(ON, 40_000));
+            assert!(judged(PROBE, QUIET_ITEMS_PER_S));
+            assert!(judged(OFF, 0));
+            assert!(judged(WARMUP, 0));
+        }
     }
 
     /// Called by the interpreter for every command it hands over or keeps:
@@ -4789,7 +4825,12 @@ mod pipeline_policy {
         let span_ms = now.saturating_sub(w.start_ms).max(1);
         let share = idle.saturating_sub(w.idle_us) as f64 / (span_ms * 1000) as f64;
         let state = STATE.load(Relaxed);
-        let (next, strikes, backoff) = decide(state, share, w.strikes, w.backoff_ms);
+        let items = ITEMS.load(Relaxed);
+        let rate = items.saturating_sub(w.items) * 1000 / span_ms;
+        // A window that recorded next to nothing (a loading pause) says
+        // nothing about the pipeline: an on thread stays on and a probe
+        // goes on (`RPS5E_POLICY_QUIET=0` judges it).
+        let (next, strikes, backoff) = if quiet_ignored() && !judged(state, rate) { (state, w.strikes, w.backoff_ms) } else { decide(state, share, w.strikes, w.backoff_ms) };
         w.strikes = strikes;
         w.backoff_ms = backoff;
         if next != state && next != PROBE {
@@ -4809,6 +4850,7 @@ mod pipeline_policy {
         STATE.store(next, Relaxed);
         w.start_ms = now;
         w.idle_us = super::PIPELINE_US[0].load(Relaxed);
+        w.items = ITEMS.load(Relaxed);
         NEXT_MS.store(
             now + match next {
                 OFF => w.backoff_ms,
@@ -5132,6 +5174,7 @@ impl QueuedExecutor {
 
 impl RenderExecutor for QueuedExecutor {
     fn draw(&self, draw: &ResolvedDraw) {
+        pipeline_policy::ITEMS.fetch_add(1, Ordering::Relaxed);
         if !pipeline_route() && !self.recording() {
             return GpuExecutor.draw(draw);
         }
@@ -5142,6 +5185,7 @@ impl RenderExecutor for QueuedExecutor {
     }
 
     fn dispatch(&self, dispatch: &ResolvedDispatch) {
+        pipeline_policy::ITEMS.fetch_add(1, Ordering::Relaxed);
         if !pipeline_route() && !self.recording() {
             return GpuExecutor.dispatch(dispatch);
         }
@@ -5338,6 +5382,8 @@ pub fn summary() -> Option<String> {
     if let Some(sl) = crate::slices::summary() {
         line = format!("{line} | {sl}");
     }
+    let q: Vec<u64> = QUEUE_DISPATCHES.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    line.push_str(&format!(" | dispatches by queue {q:?}"));
     Some(match shadow::summary() {
         Some(sh) => format!("{line} | {sh}"),
         None => line,
