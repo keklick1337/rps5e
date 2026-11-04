@@ -538,10 +538,69 @@ fn launch_batch_runs_the_record_kernels_before_the_run() {
         assert!(got == region_expected(counts[i]), "dispatch {i} {:?}", counts[i]);
     }
     // (A barrier recorded between two of them, such as the full barriers
-    // around write-throughs, starts a new batch.)
+    // around write-throughs, ends the batch; a batch that ended at its
+    // second member stops the run's batching, `RPS5E_LAUNCH_BATCH_SINGLES`.)
     let summary = b.pipelines.summary().unwrap_or_default();
-    let batched: u32 = summary.split("early/").nth(1).and_then(|r| r.split("batched").next()).and_then(|n| n.parse().ok()).unwrap_or(0);
-    assert!(batched >= 2, "the dispatches after the first one batched their kernels: {summary}");
+    let (batched, singles) = launch_counts(&summary);
+    assert!(batched >= 2 || (batched >= 1 && singles >= 1), "the dispatches after the first one batched their kernels: {summary}");
+    drop(b);
+    dev.wait_idle();
+}
+
+/// `(batched, single)` of the `cs-thread-dims=..gpu/..early/..batched/..single`
+/// field of the provider summary.
+fn launch_counts(summary: &str) -> (u32, u32) {
+    let field = summary.split("cs-thread-dims=").nth(1).and_then(|r| r.split_whitespace().next()).unwrap_or("");
+    let num = |tag: &str| field.split('/').find_map(|p| p.strip_suffix(tag)).and_then(|n| n.parse().ok()).unwrap_or(0);
+    (num("batched"), num("single"))
+}
+
+/// A run of thread-dimension dispatches with a barrier after each member
+/// (as the write-throughs of what each one wrote record): the batch begun
+/// at the run's second dispatch ends at the third, holding one kernel, and
+/// the rest of the run records its kernels next to the dispatches instead
+/// of beginning a batch (two buffer splits and two full barriers) at every
+/// other dispatch (`RPS5E_LAUNCH_BATCH_SINGLES`). Every dispatch stores
+/// what the direct dispatch of its counts stores.
+#[test]
+#[ignore]
+fn launch_batch_singles_stop_batching_the_run() {
+    let mut g = Guest::new(32 << 20);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(crate::shader::SpirvCompiler::for_device(&dev, g.mem));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    let cs = region_store_program(&mut g);
+    let copy = copy_program(&mut g);
+    let system = (1 << 7) | (1 << 8) | (1 << 9) | (2 << 11);
+    let counts: [[u32; 3]; 6] = [[13, 5, 3], [27, 13, 7], [16, 8, 4], [1, 1, 1], [9, 2, 2], [31, 1, 5]];
+    let src = g.alloc(&asm::bytes(&counts.concat()));
+    let records = g.alloc(&asm::bytes(&[REGION; 6].concat()));
+    let mut user = buffer_descriptor(src, 4, 18, 0x0101_6FAC).to_vec();
+    user.extend(buffer_descriptor(records, 4, 18, 0x0101_6FAC));
+    b.dispatch(&ResolvedDispatch {
+        packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() },
+        shader: stage(copy, &user),
+        rsrc3: 0,
+        threads: [18, 1, 1],
+        start: [0; 3],
+    });
+    let outs: Vec<u64> = counts.iter().map(|_| g.alloc(&asm::bytes(&vec![POISON; REGION_WORDS]))).collect();
+    for (i, &out) in outs.iter().enumerate() {
+        let mut shader = stage(cs, &buffer_descriptor(out, 4, REGION_WORDS as u32, 0x0101_6FAC));
+        shader.rsrc2 |= system;
+        let packet = DispatchPacket { indirect_address: records + 12 * i as u64, dispatch_initiator: 0x21, unsynced: i > 0, ..DispatchPacket::default() };
+        b.dispatch(&ResolvedDispatch { packet, shader, rsrc3: 0, threads: GROUP, start: [0; 3] });
+        b.sched.full_barrier();
+    }
+    for (i, &out) in outs.iter().enumerate() {
+        let got = words_at(&mut b, g.mem, out, REGION_WORDS);
+        assert!(got == region_expected(counts[i]), "dispatch {i} {:?}", counts[i]);
+    }
+    let summary = b.pipelines.summary().unwrap_or_default();
+    assert_eq!(launch_counts(&summary), (1, 1), "one batch (of the second dispatch), then kernels next to their dispatches: {summary}");
     drop(b);
     dev.wait_idle();
 }

@@ -286,6 +286,9 @@ pub struct ShaderResourceInfo {
     /// resident for the GPU): no buffer is bound. Set by hosts for stages
     /// that write no memory through buffers or addresses.
     pub buffers_in_guest_memory: bool,
+    /// Some `image_bvh_intersect_ray` reads BVH nodes (the host may prune
+    /// its box queries with its own acceleration structures).
+    pub uses_bvh: bool,
 }
 
 impl Default for ShaderResourceInfo {
@@ -304,6 +307,7 @@ impl Default for ShaderResourceInfo {
             has_bitwise_exclusive_or: false,
             uses_device_addresses: false,
             buffers_in_guest_memory: false,
+            uses_bvh: false,
         }
     }
 }

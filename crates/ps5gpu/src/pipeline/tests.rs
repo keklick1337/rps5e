@@ -2306,6 +2306,7 @@ mod pixel_inputs;
 mod pixel_lds;
 mod vertex_exec;
 mod unranged_reads;
+mod hw_rt;
 
 /// A 2x target drawn without PA_SC_MODE_CNTL_0.MSAA_ENABLE rasterizes both
 /// samples at the pixel center: a pixel whose center a triangle's edge

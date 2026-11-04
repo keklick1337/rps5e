@@ -517,6 +517,9 @@ pub struct Scheduler {
     /// Guest occlusion queries counted on the GPU (created on first use).
     occlusion: Option<Box<occlusion::Occlusion>>,
     gpu_timer: Option<Box<gpu_timer::GpuTimer>>,
+    /// Thread-dimension kernels put into launch batches of the open tick
+    /// (wait trace diagnostics).
+    launch_kernels: u32,
     /// Ended command buffers of the open tick, submitted after the
     /// prologue and before the recording buffer, in order: slice segments
     /// recorded on other threads and the seams between them (R7b,
@@ -599,6 +602,7 @@ impl Scheduler {
             occlusion: None,
             // Spliced segments split a tick into several buffers the timer
             // does not follow: no GPU timing with parallel slices.
+            launch_kernels: 0,
             gpu_timer: if crate::backend::profile::on() && crate::slices::configured() <= 1 && gpu_timer::wanted() { gpu_timer::GpuTimer::new(dev).map(Box::new) } else { None },
             chain: Vec::new(),
             seam: false,
@@ -653,6 +657,7 @@ impl Scheduler {
             shader_work: false,
             host_reads: false,
             occlusion: None,
+            launch_kernels: 0,
             gpu_timer: None,
             notes: Vec::new(),
             chain: Vec::new(),
@@ -828,6 +833,12 @@ impl Scheduler {
     /// The open launch batch's buffer (see [`Self::begin_launch_batch`]).
     pub fn launch_cmd(&self) -> Option<vk::CommandBuffer> {
         self.launch
+    }
+
+    /// A thread-dimension kernel went into the open launch batch (wait
+    /// trace diagnostics).
+    pub fn note_launch_kernel(&mut self) {
+        self.launch_kernels += 1;
     }
 
     /// End the open launch batch: its buffer is submitted before the
@@ -1419,6 +1430,7 @@ impl Scheduler {
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
         );
         let chain = std::mem::take(&mut self.chain);
+        gpu_timer::wait_trace::submitted(tick, chain.len(), std::mem::take(&mut self.launch_kernels));
         let cbis: Vec<vk::CommandBufferSubmitInfo> = prologue
             .iter()
             .chain(chain.iter().map(|(c, _)| c))
@@ -1499,11 +1511,18 @@ impl Scheduler {
         if self.slice_bail() {
             return;
         }
-        if tick >= self.current_tick() {
+        let trace = gpu_timer::wait_trace::threshold_ms().is_some() && crate::perf::sys::is_recorder();
+        let (started, completed, open) = (std::time::Instant::now(), self.timeline.completed_tick(), self.current_tick());
+        let target = if tick >= self.current_tick() {
             let t = self.flush();
             self.timeline.wait(t.min(tick));
+            t.min(tick)
         } else {
             self.timeline.wait(tick);
+            tick
+        };
+        if trace {
+            gpu_timer::wait_trace::waited(std::panic::Location::caller(), target, completed, open, started, started.elapsed().as_secs_f64() * 1e3);
         }
     }
 

@@ -22,6 +22,7 @@ pub mod denorm;
 pub mod exec_runs;
 pub mod fold;
 pub mod lanes;
+pub mod rt_loops;
 pub mod split_phis;
 pub mod uniform;
 pub mod wave64_masks;

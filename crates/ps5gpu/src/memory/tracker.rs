@@ -19,7 +19,8 @@ const DIRTY_LOG_SLOTS: usize = 4096;
 /// Ranges that became CPU-dirty, for consumers that must react to CPU
 /// writes without querying the tracker per use (the guest-memory import
 /// table points pages at mirrors only while they are current). Lock-free
-/// and allocation-free: written from the fault handler.
+/// and allocation-free: written from the fault handler. Each consumer
+/// ([`DirtyConsumer`]) reads the ring from its own tail.
 pub struct DirtyLog {
     on: std::sync::atomic::AtomicBool,
     head: AtomicU64,
@@ -28,6 +29,18 @@ pub struct DirtyLog {
     /// Sequence number + 1 of the entry a slot holds (published last).
     seqs: Box<[AtomicU64]>,
 }
+
+/// The readers of the [`DirtyLog`], each with its own tail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirtyConsumer {
+    /// The guest-memory import table of read-only stages (`RPS5E_BDA`).
+    Imports = 0,
+    /// The mirrors of work reading through unbounded device addresses
+    /// (`BufferCache::prepare_unranged_reads`).
+    Unranged = 1,
+}
+
+const DIRTY_CONSUMERS: usize = 2;
 
 /// What [`GuestPageTracker::drain_dirty_log`] found.
 pub enum DirtyDrain {
@@ -64,8 +77,8 @@ impl DirtyLog {
 pub struct GuestPageTracker {
     pages: Arc<PageGuard>,
     dirty_log: DirtyLog,
-    /// Next log entry the (single) consumer reads.
-    dirty_tail: AtomicU64,
+    /// Next log entry each consumer reads ([`DirtyConsumer`]).
+    dirty_tails: [AtomicU64; DIRTY_CONSUMERS],
     regions: Box<[AtomicPtr<TrackedRegion>]>,
     present: Box<[AtomicU64]>,
     summary: CpuDirtySummary,
@@ -107,7 +120,7 @@ impl GuestPageTracker {
         Self {
             pages,
             dirty_log: DirtyLog::new(),
-            dirty_tail: AtomicU64::new(0),
+            dirty_tails: [const { AtomicU64::new(0) }; DIRTY_CONSUMERS],
             regions: super::zeroed_slice(BLOCK_COUNT),
             present: super::zeroed_slice(BLOCK_COUNT.div_ceil(64)),
             summary: CpuDirtySummary::new(BLOCK_COUNT),
@@ -119,24 +132,28 @@ impl GuestPageTracker {
         &self.pages
     }
 
-    /// Log the ranges that become CPU-dirty from now on (see [`DirtyLog`]).
-    pub fn enable_dirty_log(&self) {
-        self.dirty_tail.store(self.dirty_log.head.load(Ordering::Acquire), Ordering::Release);
+    /// Log the ranges that become CPU-dirty from now on (see [`DirtyLog`]);
+    /// `consumer` reads them from now on (its earlier entries are skipped).
+    pub fn enable_dirty_log(&self, consumer: DirtyConsumer) {
+        // On before the tail is taken: an entry logged in between is read
+        // (a spurious range is harmless, a lost one is not).
         self.dirty_log.on.store(true, Ordering::Release);
+        self.dirty_tails[consumer as usize].store(self.dirty_log.head.load(Ordering::Acquire), Ordering::Release);
     }
 
-    /// Entries logged and not drained yet (lock-free check).
-    pub fn dirty_log_pending(&self) -> bool {
-        self.dirty_log.head.load(Ordering::Acquire) != self.dirty_tail.load(Ordering::Acquire)
+    /// Entries logged and not drained by `consumer` yet (lock-free check).
+    pub fn dirty_log_pending(&self, consumer: DirtyConsumer) -> bool {
+        self.dirty_log.head.load(Ordering::Acquire) != self.dirty_tails[consumer as usize].load(Ordering::Acquire)
     }
 
-    /// The ranges that became CPU-dirty since the previous drain (one
-    /// consumer).
-    pub fn drain_dirty_log(&self) -> DirtyDrain {
+    /// The ranges that became CPU-dirty since `consumer`'s previous drain
+    /// (one thread per consumer).
+    pub fn drain_dirty_log(&self, consumer: DirtyConsumer) -> DirtyDrain {
         let log = &self.dirty_log;
-        let tail = self.dirty_tail.load(Ordering::Acquire);
+        let tails = &self.dirty_tails[consumer as usize];
+        let tail = tails.load(Ordering::Acquire);
         let head = log.head.load(Ordering::Acquire);
-        self.dirty_tail.store(head, Ordering::Release);
+        tails.store(head, Ordering::Release);
         if head - tail > DIRTY_LOG_SLOTS as u64 {
             return DirtyDrain::Lost;
         }
@@ -572,6 +589,8 @@ impl GuestPageTracker {
                 if !is_written {
                     r.lock.unlock();
                 }
+                // The pages are CPU-dirty again (their upload failed).
+                self.dirty_log.push(a, s);
             }
         } else if let Some(through) = written {
             crate::backend::profile::note_gpu_write(addr, size);

@@ -8,6 +8,7 @@
 //! ps5shader-dis <hash>.bin                 disassemble one blob
 //! ps5shader-dis fused-<a>-<b>.json         disassemble a fused pair
 //! ps5shader-dis --analyses <file>          ... plus EXEC-full / half-mask / MOVREL results
+//! ps5shader-dis --rt [--ir] <file>         ... the hardware traversal copies of its BVH loops
 //! ps5shader-dis --stats <dir>              decode every blob, print opcode coverage
 //! ps5shader-dis --stats-mods <dir>         ... per opcode: modifiers, constants, memory flags
 //! ps5shader-dis --bench <dir>              compile every blob, print the time per phase/pass and the slowest
@@ -236,7 +237,7 @@ fn stats(dir: &Path) -> ExitCode {
     }
 }
 
-fn print_compiled(path: &Path, p: &Program, wave32: bool, cfg: bool, tree: bool, ir: bool, raw: bool) {
+fn print_compiled(path: &Path, p: &Program, wave32: bool, cfg: bool, tree: bool, ir: bool, raw: bool, rt: bool) {
     use ps5shader::ssa::Stage;
     use ps5shader::translate::{compile, TranslateOptions};
     let mut opts = TranslateOptions::with_user_data(if wave32 { 32 } else { 64 }, Stage::Unknown, 16);
@@ -246,7 +247,20 @@ fn print_compiled(path: &Path, p: &Program, wave32: bool, cfg: bool, tree: bool,
     let slice = bytes.as_deref().map(|b| CodeSlice::new(p.address, b));
     let source = slice.as_ref().map(|s| s as &dyn CodeSource);
     match compile(p, &opts, source) {
-        Ok(c) => {
+        Ok(mut c) => {
+            if rt {
+                // The hardware traversal copies (ps5shader::opt::rt_loops).
+                let out = ps5shader::opt::rt_loops::replace_traversals(&mut c.function);
+                println!("; rt: {} nests replaced, skipped {:?}", out.replaced, out.skipped);
+                if out.replaced > 0 {
+                    ps5shader::opt::fold::fold(&mut c.function);
+                    ps5shader::opt::fold::cse(&mut c.function);
+                    ps5shader::opt::dce::dce(&mut c.function);
+                    if let Err(e) = ps5shader::ssa::verify::verify(&c.function, true) {
+                        println!("; rt: invalid function: {e}");
+                    }
+                }
+            }
             if cfg {
                 print!("; cfg\n{}", c.structured.cfg);
             }
@@ -352,7 +366,8 @@ fn main() -> ExitCode {
     let show_tree = args.iter().any(|a| a == "--tree");
     let show_ir = args.iter().any(|a| a == "--ir");
     let show_raw = args.iter().any(|a| a == "--ir-raw");
-    let disasm = !(show_cfg || show_tree || show_ir || show_raw) || analyses;
+    let rt = args.iter().any(|a| a == "--rt");
+    let disasm = !(show_cfg || show_tree || show_ir || show_raw || rt) || analyses;
     args.retain(|a| !a.starts_with("--"));
     let mut status = ExitCode::SUCCESS;
     for a in &args {
@@ -366,8 +381,8 @@ fn main() -> ExitCode {
                 if analyses {
                     print_analyses(&p, wave32);
                 }
-                if show_cfg || show_tree || show_ir || show_raw {
-                    print_compiled(path, &p, wave32, show_cfg, show_tree, show_ir, show_raw);
+                if show_cfg || show_tree || show_ir || show_raw || rt {
+                    print_compiled(path, &p, wave32, show_cfg, show_tree, show_ir, show_raw, rt);
                 }
             }
             Err(e) => {

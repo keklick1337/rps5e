@@ -102,6 +102,46 @@ fn unranged_bvh_reads_see_cpu_writes_into_mirrors() {
     assert_eq!(rig.buffers.stats().uploads, uploads);
 }
 
+/// Two mirrored nodes in separate buffers: after the first pass, a CPU
+/// write to one of them makes the next pass look only at that buffer (the
+/// dirty log names it), and each query still reads the CPU's latest node.
+/// With `RPS5E_UNRANGED_LOG=0` every pass looks at every buffer.
+#[test]
+#[ignore]
+fn unranged_passes_after_cpu_writes_look_at_the_logged_buffers() {
+    let mut g = Guest::new(16 << 20);
+    let mut rig = spirv_rig(&g);
+    let cs = first_child_program(&mut g);
+    let a = g.alloc(&box_node([0x1000, 0x2000, 0x3000, 0x4000]));
+    g.zeroed(256 << 10);
+    let b = g.alloc(&box_node([0x9000, 0xA000, 0xB000, 0xC000]));
+    let out = g.zeroed(256);
+    let mem = g.mem;
+    rig.buffers.obtain(&mut rig.sched, a, 128, false).unwrap();
+    rig.buffers.obtain(&mut rig.sched, b, 128, false).unwrap();
+    assert_ne!(rig.buffers.find_containing(a, 128), rig.buffers.find_containing(b, 128), "one buffer holds both nodes");
+    assert_eq!(rig.dispatch(&query(cs, a, out)), DrawOutcome::Recorded);
+    assert_eq!(out_words(&mut rig, mem, out)[..4], [0x1000; 4]);
+
+    let synced = rig.buffers.stats().unranged_synced_buffers;
+    assert!(g.mem.write_backing(b, &box_node([0x5000, 0x6000, 0x7000, 0x8000])));
+    rig.buffers.tracker.mark_cpu_dirty_pages(b, 128);
+    assert_eq!(rig.dispatch(&query(cs, b, out)), DrawOutcome::Recorded);
+    assert_eq!(out_words(&mut rig, mem, out)[..4], [0x5000; 4], "the query read the mirror's old node");
+    assert_eq!(rig.buffers.stats().unranged_synced_buffers, synced + 1, "only the written buffer is synchronised");
+
+    assert!(g.mem.write_backing(a, &box_node([0xD000, 0xE000, 0xF000, 0x1100])));
+    rig.buffers.tracker.mark_cpu_dirty_pages(a, 128);
+    assert_eq!(rig.dispatch(&query(cs, a, out)), DrawOutcome::Recorded);
+    assert_eq!(out_words(&mut rig, mem, out)[..4], [0xD000; 4]);
+    let partial = rig.buffers.stats().unranged_partial;
+    if std::env::var("RPS5E_UNRANGED_LOG").is_ok_and(|v| v == "0") {
+        assert_eq!(partial, 0);
+    } else {
+        assert!(partial >= 2, "passes after CPU writes looked at every buffer ({partial} partial)");
+    }
+}
+
 /// A BVH node only the CPU wrote (no stage used its range, no mirror holds
 /// it): the query reads it in guest memory, not zeros (a zero leaf list has
 /// no end marker, and a traversal walking it never ends).
@@ -225,4 +265,63 @@ fn half_bits(x: f32) -> u16 {
     } else {
         sign | ((exp as u16) << 10) | mant
     }
+}
+
+/// The ray of [`all_results_program`] against triangle `v`: the distance
+/// (Möller–Trumbore, no culling), None when it misses.
+fn ray_triangle(v: [[f32; 3]; 3]) -> Option<f32> {
+    let (o, d) = ([0.25f32, 0.5, 0.125], [1.0f32, 1.0, 1.0]);
+    let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
+    let p = cross(d, e2);
+    let det = dot(e1, p);
+    let s = sub(o, v[0]);
+    let u = dot(s, p) / det;
+    let q = cross(s, e1);
+    let w = dot(d, q) / det;
+    let t = dot(e2, q) / det;
+    (u >= 0.0 && w >= 0.0 && u + w <= 1.0 && t >= 0.0).then_some(t)
+}
+
+/// Triangle node types 2 and 3 are triangles too (v2 v3 v4 and v2 v4 v0,
+/// as the guest's BVH builders lay them out): each of the four types tests
+/// its own vertex triple.
+#[test]
+#[ignore]
+fn bvh_triangle_types_pick_their_vertices() {
+    let v = [[3.0f32, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 3.0], [4.0, 4.0, -1.0], [-1.0, 4.0, 4.0]];
+    let slots = [[0usize, 1, 2], [1, 3, 2], [2, 3, 4], [2, 4, 0]];
+    let mut words: Vec<u32> = v.iter().flatten().map(|f| f.to_bits()).collect();
+    words.push(0);
+    let mut g = Guest::new(16 << 20);
+    let mut rig = spirv_rig(&g);
+    let mem = g.mem;
+    let mut node_bytes = asm::bytes(&words);
+    node_bytes.resize(128, 0);
+    let tri = g.alloc(&node_bytes);
+    let out = g.zeroed(1024);
+    let mut hits = 0;
+    for (ty, s) in slots.iter().enumerate() {
+        let cs = all_results_program(&mut g, ty as u32);
+        // The four result dwords land 256 bytes apart: a V# over all of them.
+        let mut d = query(cs, tri, out);
+        d.shader.user_data[..4].copy_from_slice(&raw_buffer_descriptor(out, 1024));
+        assert_eq!(rig.dispatch(&d), DrawOutcome::Recorded);
+        assert!(rig.buffers.download(&mut rig.sched, out, 1024));
+        let mut b = vec![0u8; 1024];
+        assert!(mem.read_backing(out, &mut b));
+        let w: Vec<u32> = b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let (t_num, t_denom) = (f32::from_bits(w[0]), f32::from_bits(w[64]));
+        match ray_triangle(s.map(|k| v[k])) {
+            Some(t) => {
+                hits += 1;
+                assert!((t_num / t_denom - t).abs() < 1e-4 * t.max(1.0), "type {ty}: t {} vs {t}", t_num / t_denom);
+                assert_eq!(w[192], 1, "type {ty}: no hit flag");
+            }
+            None => assert_eq!(t_num, f32::INFINITY, "type {ty}: hit a triangle the ray misses"),
+        }
+    }
+    assert!(hits >= 3, "the test triangles should mostly be hit ({hits})");
 }

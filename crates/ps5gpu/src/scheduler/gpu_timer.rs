@@ -30,6 +30,130 @@ pub fn wanted() -> bool {
     !std::env::var("RPS5E_GPU_TIMER").is_ok_and(|v| v == "0")
 }
 
+/// `RPS5E_WAIT_TRACE=<ms>` (diagnostics): every blocking GPU wait of the
+/// recording thread longer than this is logged with the ticks it waited
+/// for (how long ago each was submitted), and once their command buffers
+/// are read back (with the GPU profile's timer), each of those ticks with
+/// its GPU busy time and largest segment: whether the wait was GPU work
+/// queued before it or something else.
+pub mod wait_trace {
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    pub fn threshold_ms() -> Option<f64> {
+        static T: OnceLock<Option<f64>> = OnceLock::new();
+        *T.get_or_init(|| std::env::var("RPS5E_WAIT_TRACE").ok().and_then(|v| v.parse().ok()))
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// (tick, submitted at, chained buffers, launch kernels), oldest first.
+        submitted: VecDeque<(u64, Instant, usize, u32)>,
+        /// Ticks a traced wait waited for, still to be read back.
+        watched: BTreeSet<u64>,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
+        let mut g = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        f(g.get_or_insert_with(State::default))
+    }
+
+    /// `tick` was submitted now, with `chained` buffers before its
+    /// recording buffer and `kernels` thread-dimension kernels in launch
+    /// batches.
+    pub fn submitted(tick: u64, chained: usize, kernels: u32) {
+        if threshold_ms().is_none() {
+            return;
+        }
+        with(|s| {
+            if s.submitted.len() >= 8192 {
+                s.submitted.pop_front();
+            }
+            s.submitted.push_back((tick, Instant::now(), chained, kernels));
+        });
+    }
+
+    /// A wait for `tick` that started with `completed` done and `open` the
+    /// recording tick took `ms`.
+    pub fn waited(at: &std::panic::Location<'_>, tick: u64, completed: u64, open: u64, started: Instant, ms: f64) {
+        let Some(min) = threshold_ms() else { return };
+        if ms < min {
+            return;
+        }
+        let program = crate::backend::profile::preparing_program();
+        let line = with(|s| {
+            let pending: Vec<(u64, f64)> = s.submitted.iter().filter(|e| e.0 > completed && e.0 <= tick).map(|e| (e.0, started.saturating_duration_since(e.1).as_secs_f64() * 1e3)).collect();
+            for &(t, _) in &pending {
+                s.watched.insert(t);
+            }
+            if s.watched.len() > 4096 {
+                let keep: BTreeSet<u64> = s.watched.iter().rev().take(2048).copied().collect();
+                s.watched = keep;
+            }
+            let ages: Vec<String> = pending.iter().map(|(t, a)| format!("{t}:{a:.1}")).collect();
+            format!(
+                "[wait-trace] {ms:.2} ms at {}:{} program {program:#x} for tick {tick} (open {open}, completed {completed}); pending tick:submitted-ms-before [{}]",
+                at.file().rsplit('/').next().unwrap_or(""),
+                at.line(),
+                ages.join(" ")
+            )
+        });
+        log::info!("{line}");
+    }
+
+    /// `RPS5E_WAIT_TRACE_TICKS=1` (with `RPS5E_WAIT_TRACE`): every
+    /// command buffer read back is logged with its GPU time, its largest
+    /// segment and the GPU's idle time before it, waited for or not.
+    fn every_tick() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RPS5E_WAIT_TRACE_TICKS").is_ok_and(|v| v == "1"))
+    }
+
+    /// The command buffer of `tick` took `ns` of GPU time; log it when a
+    /// traced wait waited for it.
+    pub fn read_back(tick: u64, ns: u64, segments: usize, largest: (u64, u64), span: Option<(u64, u64)>, period_ns: f64) {
+        if threshold_ms().is_none() {
+            return;
+        }
+        // The GPU clock end of the previous buffer read back: the gap to
+        // this one's start is time the GPU spent on no timed buffer.
+        static LAST_END: Mutex<Option<u64>> = Mutex::new(None);
+        let gap = {
+            let mut last = LAST_END.lock().unwrap_or_else(|e| e.into_inner());
+            let gap = match (span, *last) {
+                (Some((s, _)), Some(prev)) if s >= prev => Some((s - prev) as f64 * period_ns / 1e6),
+                _ => None,
+            };
+            if let Some((_, e)) = span {
+                *last = Some(e);
+            }
+            gap
+        };
+        if every_tick() {
+            log::info!(
+                "[wait-trace] buffer {tick}: gap before {} ms, GPU {:.3} ms, largest {} {:.3} ms",
+                gap.map_or("-".to_string(), |g| format!("{g:.3}")),
+                ns as f64 / 1e6,
+                super::label_text(largest.1),
+                largest.0 as f64 / 1e6
+            );
+        }
+        let Some((chained, kernels)) = with(|s| s.watched.remove(&tick).then(|| s.submitted.iter().find(|e| e.0 == tick).map_or((0, 0), |e| (e.2, e.3)))) else {
+            return;
+        };
+        log::info!(
+            "[wait-trace] tick {tick}: GPU {:.2} ms in {segments} segments, largest {:.2} ms ({}), chained {chained}, launch kernels {kernels}, gap before {}",
+            ns as f64 / 1e6,
+            largest.0 as f64 / 1e6,
+            super::label_text(largest.1),
+            gap.map_or("-".to_string(), |g| format!("{g:.3} ms"))
+        );
+    }
+}
+
 /// `RPS5E_GPU_TIMER=buffers`: only whole command buffers are timed (busy
 /// time with the work inside a buffer overlapping as it would unprofiled);
 /// each buffer is charged to the label active when it ends.
@@ -94,6 +218,13 @@ pub mod label {
     pub const IMAGE_BARRIER: u64 = 24;
     /// Full barriers (every earlier command before every later one).
     pub const FULL_BARRIER: u64 = 25;
+    /// Buffers submitted between two recording buffers of one tick (the
+    /// launch batches of thread-dimension kernels): the GPU time from the
+    /// end of the first recording buffer to the start of the next.
+    pub const CHAINED: u64 = 26;
+    /// Upkeep of the host BVH mirrors (`RPS5E_HW_RT`: triangle and
+    /// instance kernels, acceleration-structure builds).
+    pub const HW_RT: u64 = 27;
     /// Labels below this are categories, not shader addresses.
     pub const CATEGORIES: u64 = 0x100;
     /// `RETILE_AT | address`: a refresh from newer aliases of the image at
@@ -136,6 +267,8 @@ pub fn label_name(l: u64) -> Option<&'static str> {
         BARRIER => "barrier",
         IMAGE_BARRIER => "image_barrier",
         FULL_BARRIER => "full_barrier",
+        CHAINED => "chained",
+        HW_RT => "hw_rt",
         _ => return None,
     })
 }
@@ -277,6 +410,17 @@ impl GpuTimer {
     /// The recording command buffer was begun: its start timestamp.
     pub fn begin(&mut self, cb: vk::CommandBuffer) {
         self.touched = false;
+        if self.open.as_ref().is_some_and(|o| o.start.is_some()) {
+            // A later recording buffer of the same tick (the earlier one was
+            // chained before a launch batch): the tick keeps its first
+            // start, and the time until this buffer begins (after the
+            // buffers chained between, which have no timestamps) is charged
+            // to them.
+            let Some(q) = self.take(2) else { return };
+            self.write(cb, vk::PipelineStageFlags2::ALL_COMMANDS, q);
+            self.open.as_mut().unwrap().marks.push((q, label::CHAINED));
+            return;
+        }
         let Some(q) = self.take(3) else { return };
         self.write(cb, vk::PipelineStageFlags2::TOP_OF_PIPE, q);
         self.open.get_or_insert_with(Open::default).start = Some(q);
@@ -395,16 +539,22 @@ impl GpuTimer {
             let at = |q: u32| ts.get((q.wrapping_sub(base) % QUERIES) as usize).copied().unwrap_or(0);
             let mut ns = 0u64;
             let mut largest = (0u64, 0u64);
+            // GPU clock span of the buffer (prologue included), for the
+            // wait trace's gaps between buffers.
+            let mut span: Option<(u64, u64)> = None;
             if let Some(start) = f.open.start.map(at).filter(|&s| s != 0) {
                 let marks: Vec<(u64, u64)> = f.open.marks.iter().map(|&(q, l)| (at(q), l)).filter(|m| m.0 != 0).collect();
+                span = Some((start, marks.iter().map(|m| m.0).max().unwrap_or(start)));
                 (ns, largest) = self.split.charge(start, &marks, self.period_ns);
             }
             if let Some((s, Some(e))) = f.open.prologue {
                 let (s, e) = (at(s), at(e));
                 if s != 0 && e != 0 {
+                    span = Some(span.map_or((s, e), |(a, b)| (a.min(s), b.max(e))));
                     ns += self.split.charge(s, &[(e, label::PROLOGUE)], self.period_ns).0;
                 }
             }
+            wait_trace::read_back(f.tick, ns, f.open.marks.len(), largest, span, self.period_ns);
             if ns == 0 {
                 continue;
             }

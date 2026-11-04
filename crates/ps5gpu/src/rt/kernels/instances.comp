@@ -1,0 +1,200 @@
+// RustPS5Emu (RPS5E)
+// Copyright (C) 2026 Vladislav Tislenko aka keklick1337
+// SPDX-License-Identifier: GPL-2.0-only
+
+// One thread per instance slot of a host TLAS: the guest TLAS's instance
+// record `i` (count at +112, array at +48, 128 bytes each: BLAS address
+// (8-byte units) in bits 53:0 of the qword at +48, the object-to-world
+// rows at +64) becomes a VkAccelerationStructureInstanceKHR whose BLAS is
+// the host mirror of the guest BLAS (looked up in the BLAS map). A guest
+// BVH without an instance array is a BLAS traced as the top level: one
+// identity instance of itself. Slots past the count are inactive. A record
+// whose BLAS the host does not mirror (or mirrors too small, or stale) is
+// replaced by a unit box scaled to its bounds, clears the entry's
+// COMPLETE flag and is reported in the request ring ({key, entries |
+// bytes << 32}: key = guest BLAS + 1, or bit 63 | entry << 32 | count
+// when the TLAS has more instances than slots); every BLAS used goes into
+// the entry's BLAS set (the shaders' test of a BLAS root).
+
+#version 460
+#include "guest.glsl"
+#extension GL_EXT_shader_atomic_int64 : require
+layout(local_size_x = 64) in;
+
+// The fault buffer; the ray-tracing table starts at word 1024.
+layout(set = 0, binding = 1, std430) buffer Table { uint table[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64s { uint64_t q[]; };
+
+layout(push_constant) uniform P {
+    uint64_t tlas;      // guest address of the TLAS
+    uint64_t out_inst;  // device address: capacity instances (64 bytes)
+    uint64_t map;       // device address: BLAS map slots {key, AS address, capacity, stale}
+    uint64_t set;       // device address: BLAS set slots {key}
+    uint64_t requests;  // device address: {count, pad, then {key, entries}[request_mask + 1]}
+    uint64_t used;      // device address: a word per map slot, set when an instance uses it
+    uint64_t proxy;     // AS address of the unit-box BLAS (procedural)
+    uint capacity;
+    uint map_mask;
+    uint set_mask;
+    uint request_mask;
+    uint flags_word;    // table word of the entry's flags
+    uint entry;         // table entry index
+    uint page_bits;
+    uint page_limit;
+    uint stats_word;    // table word of the proxy counters (no slot, too small, no structure, stale, format, instances)
+} pc;
+
+const uint VALID = 1u << 10;
+const uint COMPLETE = 1u << 11;
+
+uint hash(uint64_t key) {
+    uint lo = uint(key - 1ul) >> 0;
+    return (lo * 0x9E3779B1u) >> 12;
+}
+
+// The map slot of `key` (guest BLAS address + 1), or ~0u.
+uint find_blas(uint64_t key) {
+    U64s m = U64s(pc.map);
+    uint h = hash(key);
+    for (uint k = 0u; k < 32u; k++) {
+        uint s = (h + k) & pc.map_mask;
+        uint64_t v = m.q[s * 4u];
+        if (v == key) return s;
+        if (v == 0ul) return ~0u;
+    }
+    return ~0u;
+}
+
+void insert_set(uint64_t base_key) {
+    U64s s = U64s(pc.set);
+    uint lo = uint(base_key - 1ul);
+    uint h = (lo * 0x9E3779B1u) >> 12;
+    for (uint k = 0u; k < 16u; k++) {
+        uint i = (h + k) & pc.set_mask;
+        uint64_t old = atomicCompSwap(s.q[i], 0ul, base_key);
+        if (old == 0ul || old == base_key) return;
+    }
+}
+
+void request(uint64_t key, uint entries, uint bytes) {
+    U64s r = U64s(pc.requests);
+    uint n = atomicAdd(Words(pc.requests).w[0], 1u);
+    uint s = 1u + 2u * (n & pc.request_mask);
+    r.q[s] = key;
+    r.q[s + 1u] = uint64_t(entries) | uint64_t(bytes) << 32;
+}
+
+void inactive(uint i) {
+    U64s o = U64s(pc.out_inst);
+    for (uint k = 0u; k < 8u; k++) o.q[i * 8u + k] = 0ul;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.capacity) return;
+    uint array = GUEST_WORD(pc.tlas + 48ul);
+    bool single = array == 0u;
+    uint count = single ? 1u : GUEST_WORD(pc.tlas + 112ul);
+    if (i == 0u && (GUEST_WORD(pc.tlas + 252ul) != 9u || count > pc.capacity)) {
+        // Not the format the mirror knows, or more instances than slots.
+        atomicAnd(table[pc.flags_word], ~(VALID | COMPLETE));
+        if (count > pc.capacity) request((1ul << 63) | uint64_t(pc.entry) << 32 | uint64_t(count), 0u, 0u);
+    }
+    if (i >= count) {
+        inactive(i);
+        return;
+    }
+    uint64_t rec = pc.tlas + uint64_t(array) + uint64_t(i) * 128ul;
+    uint64_t blas = pc.tlas;
+    if (!single) {
+        uint64_t q = uint64_t(GUEST_WORD(rec + 48ul)) | uint64_t(GUEST_WORD(rec + 52ul)) << 32;
+        blas = (q & ((1ul << 54) - 1ul)) << 3;
+    }
+    if (blas == 0ul) {
+        inactive(i);
+        return;
+    }
+    uint64_t key = blas + 1ul;
+    uint slot = find_blas(key);
+    U64s m = U64s(pc.map);
+    // The host BLAS has room for every leaf entry the guest one now has,
+    // and its triangles are those of the guest's current entries (not
+    // stale: the guest's entry count is the one it was built with).
+    uint entries = slot == ~0u ? 0u : uint(m.q[slot * 4u + 2u]);
+    bool stale = slot != ~0u && m.q[slot * 4u + 3u] != 0ul;
+    uint leaf_start = GUEST_WORD(blas + 88ul) * 64u;
+    uint leaf_end = GUEST_WORD(blas + 40ul);
+    bool format = GUEST_WORD(blas) == 0x5F525350u && GUEST_WORD(blas + 4ul) == 0x4C485642u && GUEST_WORD(blas + 252ul) == 9u
+        && GUEST_WORD(blas + 48ul) == 0u && leaf_start <= leaf_end && leaf_end <= GUEST_WORD(blas + 16ul);
+    atomicAdd(table[pc.stats_word + 5u], 1u);
+    if (!format) {
+        atomicAdd(table[pc.stats_word + 4u], 1u);
+        // Not a bottom level of the format: the host cannot mirror it.
+        atomicAnd(table[pc.flags_word], ~(VALID | COMPLETE));
+        inactive(i);
+        return;
+    }
+    uint guest_entries = (leaf_end - leaf_start) / 8u;
+    insert_set(blas / 256ul + 1ul);
+    Floats o = Floats(pc.out_inst + uint64_t(i) * 64ul);
+    Words ow = Words(pc.out_inst + uint64_t(i) * 64ul);
+    U64s oq = U64s(pc.out_inst + uint64_t(i) * 64ul);
+    // Row-major 3x4 object-to-world transform.
+    float t[12];
+    for (uint k = 0u; k < 12u; k++) t[k] = single ? ((k == 0u || k == 5u || k == 10u) ? 1.0 : 0.0) : GUEST_FLOAT(rec + 64ul + uint64_t(k) * 4ul);
+    // Mask = the guest's mask byte (the
+    // traversals cull with the guest ray's mask); the SBT offset carries the
+    // BLAS's leaf-entry base (64-byte units: a candidate's leaf entry lies
+    // at 64 * base + 8 * primitive).
+    uint guest_mask = single ? 0xFFu : GUEST_WORD(rec + 60ul) >> 24;
+    // (The record index is the instance's index, its custom index the
+    // BLAS's map slot: the traversals find its list starts there.)
+    ow.w[12] = (slot & 0xFFFFFFu) | (guest_mask << 24);
+    // Flags (VkGeometryInstanceFlagBitsKHR) from the guest's (bits 63:54
+    // of the qword at +48: force opaque, force non-opaque, cull disable,
+    // flip facing; the same semantics).
+    uint gf = single ? 0u : GUEST_WORD(rec + 52ul) >> 22;
+    uint vf = ((gf & 1u) != 0u ? 0x4u : 0u) | ((gf & 2u) != 0u ? 0x8u : 0u) | ((gf & 4u) != 0u ? 0x1u : 0u) | ((gf & 8u) != 0u ? 0x2u : 0u);
+    ow.w[13] = (GUEST_WORD(blas + 88ul) & 0xFFFFFFu) | (vf << 24);
+    if (slot == ~0u || guest_entries > entries || m.q[slot * 4u + 1u] == 0ul || stale) {
+        // Not mirrored (yet): the unit box scaled to the BLAS's bounds (the
+        // root node's four child boxes) stands in for it; a ray through
+        // it is not pruned, and no traversal runs on the host alone.
+        uint why = slot == ~0u ? 0u : (stale ? 3u : (guest_entries > entries ? 1u : 2u));
+        atomicAdd(table[pc.stats_word + why], 1u);
+        if (!stale) request(key, guest_entries, GUEST_WORD(blas + 16ul));
+        atomicAnd(table[pc.flags_word], ~COMPLETE);
+        vec3 lo = vec3(1e30), hi = vec3(-1e30);
+        for (uint c = 0u; c < 4u; c++) {
+            uint64_t b = blas + 272ul + uint64_t(c) * 24ul;
+            vec3 a = vec3(GUEST_FLOAT(b), GUEST_FLOAT(b + 4ul), GUEST_FLOAT(b + 8ul));
+            vec3 z = vec3(GUEST_FLOAT(b + 12ul), GUEST_FLOAT(b + 16ul), GUEST_FLOAT(b + 20ul));
+            if (all(lessThanEqual(a, z)) && all(lessThan(abs(a), vec3(1e30))) && all(lessThan(abs(z), vec3(1e30)))) {
+                lo = min(lo, a);
+                hi = max(hi, z);
+            }
+        }
+        if (any(greaterThan(lo, hi))) {
+            inactive(i);
+            return;
+        }
+        // Slightly larger than the guest's box.
+        vec3 pad = (hi - lo) * (1.0 / 1024.0) + vec3(1.0 / 1024.0);
+        lo -= pad;
+        hi += pad;
+        vec3 size = hi - lo;
+        for (uint r = 0u; r < 3u; r++) {
+            vec3 row = vec3(t[r * 4u], t[r * 4u + 1u], t[r * 4u + 2u]);
+            o.f[r * 4u + 0u] = row.x * size.x;
+            o.f[r * 4u + 1u] = row.y * size.y;
+            o.f[r * 4u + 2u] = row.z * size.z;
+            o.f[r * 4u + 3u] = dot(row, lo) + t[r * 4u + 3u];
+        }
+        oq.q[7] = pc.proxy;
+        return;
+    }
+    // In use (the host frees BLASes no entry uses for a while).
+    Words(pc.used).w[slot] = 1u;
+    for (uint k = 0u; k < 12u; k++) o.f[k] = t[k];
+    oq.q[7] = m.q[slot * 4u + 1u];
+}

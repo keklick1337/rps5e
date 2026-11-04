@@ -23,6 +23,14 @@ pub struct Resources {
     pub flat_table: Option<Word>,
     pub page_table: Option<Word>,
     pub fault: Option<Word>,
+    /// The per-lane-half traversal state of [`super::bvh`] (hit interval
+    /// low, high, extent bits, entry + 1).
+    pub rt_state: [Option<[Word; 4]>; 2],
+    /// Per hardware traversal slot (`RtOp`): the ray query and its state
+    /// variables ([`super::bvh::emit_rt`]).
+    pub rt_slots: HashMap<u16, [Word; 14]>,
+    /// The module reads the host BVH mirrors (`ShaderReflection::host_bvh`).
+    pub host_bvh: bool,
     pub gds: Option<Word>,
     pub samplers: Option<Word>,
     pub images: HashMap<u32, (Word, Word)>,
@@ -659,6 +667,18 @@ impl Emitter<'_, '_> {
             });
         }
         Ok((dev, resident))
+    }
+
+    /// The buffer holding the ray-tracing table ([`crate::rt::table`]: the
+    /// fault buffer, from word [`crate::rt::table::BASE`] on), if the
+    /// layout has it.
+    pub(super) fn rt_table(&mut self) -> Option<Word> {
+        self.fault_buffer()
+    }
+
+    /// A physical-storage-buffer pointer to the u32 at device address `dev`.
+    pub(super) fn device_word_ptr(&mut self, dev: Word) -> Word {
+        self.phys_ptr(dev)
     }
 
     /// The fault buffer (bound with the page table), if the layout has it.
@@ -3247,6 +3267,75 @@ fn ds_float_min_max(e: &mut Emitter, old: Word, src: Word, max: bool) -> Word {
     e.select(tu, lsig, oq, r)
 }
 
+/// DS_MIN_F32 / DS_MAX_F32 on `ptr` with the LDS integer atomics
+/// (`RPS5E_DS_INT_MIN_MAX`); returns the old value.
+///
+/// A source that is +0, ±inf or a normal number has a compare key no other
+/// bit pattern shares ([`ds_float_min_max`]), so against any memory value
+/// that is not a NaN the replacement is the IEEE order of the two, which
+/// the integer atomics give: a signed min/max for a positive source (as
+/// signed integers the bits of positive floats keep their order and every
+/// negative pattern is below them), an unsigned max/min for a negative one
+/// (larger patterns are smaller negative floats; every positive pattern is
+/// below them). Other sources (NaNs, denormals, -0) take the
+/// compare-exchange loop. When the old value was a NaN the integer atomic
+/// either left the memory as it was (the operation then runs as the loop,
+/// after whatever else was applied since) or stored the source: what the
+/// loop stores for a quiet NaN; over a signalling one (its quieted bits are
+/// due) one compare-exchange puts those in place, unless another operation
+/// changed the word in between.
+fn ds_float_min_max_atomic(e: &mut Emitter, ptr: Word, v: Word, max: bool, scope: u32) -> Word {
+    let tu = e.t_u32();
+    let (sc, sem) = (e.cu(scope), e.cu(0));
+    let abs_mask = e.cu(0x7FFF_FFFF);
+    let abs = e.band(v, abs_mask);
+    let smallest_normal = e.cu(0x0080_0000);
+    let inf = e.cu(0x7F80_0000);
+    let normal = e.ule(smallest_normal, abs);
+    let not_nan = e.ule(abs, inf);
+    let normal = e.land(normal, not_nan);
+    let zero = e.cu(0);
+    let positive_zero = e.ieq(v, zero);
+    let unique = e.lor(normal, positive_zero);
+    let negative = e.ult(abs_mask, v);
+    let loop_op = move |e: &mut Emitter| cas_loop(e, ptr, scope, |e, old| ds_float_min_max(e, old, v, max));
+    e.if_else_value(
+        unique,
+        tu,
+        |e| {
+            let (pos_op, neg_op) = if max { (S::AtomicSMax, S::AtomicUMin) } else { (S::AtomicSMin, S::AtomicUMax) };
+            let old = e.if_else_value(negative, tu, |e| e.ins(neg_op, tu, &[ptr, sc, sem, v]), |e| e.ins(pos_op, tu, &[ptr, sc, sem, v]));
+            let old_abs = e.band(old, abs_mask);
+            let old_nan = e.ult(inf, old_abs);
+            e.if_value(old_nan, tu, old, |e| {
+                // What the integer atomic stored over the NaN.
+                let tb = e.t_bool();
+                let source_first = if max {
+                    let signed = e.ins(S::SGreaterThan, tb, &[v, old]);
+                    let unsigned = e.ult(v, old);
+                    e.select(tb, negative, unsigned, signed)
+                } else {
+                    let signed = e.ins(S::SLessThan, tb, &[v, old]);
+                    let unsigned = e.ult(old, v);
+                    e.select(tb, negative, unsigned, signed)
+                };
+                let stored = e.select(tu, source_first, v, old);
+                let unchanged = e.ieq(stored, old);
+                e.if_else_value(unchanged, tu, loop_op, |e| {
+                    let due = ds_float_min_max(e, old, v, max);
+                    let wrong = e.ine(due, stored);
+                    e.if_then(wrong, |e| {
+                        let (sc, sem) = (e.cu(scope), e.cu(0));
+                        e.ins(S::AtomicCompareExchange, tu, &[ptr, sc, sem, sem, due, stored]);
+                    });
+                    old
+                })
+            })
+        },
+        loop_op,
+    )
+}
+
 /// One atomic on `ptr` (u32); returns the old value.
 pub fn atomic(e: &mut Emitter, ptr: Word, op: AtomicOp, data: Word, cmp: Option<Word>, scope: u32) -> Word {
     let tu = e.t_u32();
@@ -3267,6 +3356,7 @@ pub fn atomic(e: &mut Emitter, ptr: Word, op: AtomicOp, data: Word, cmp: Option<
             let c = cmp.unwrap_or(data);
             e.ins(S::AtomicCompareExchange, tu, &[ptr, sc, sem, sem, data, c])
         }
+        AtomicOp::DsFMin | AtomicOp::DsFMax if e.feat.emit.ds_int_min_max => ds_float_min_max_atomic(e, ptr, data, op == AtomicOp::DsFMax, scope),
         other => cas_loop(e, ptr, scope, |e, old| atomic_next(e, other, old, data, cmp)),
     }
 }

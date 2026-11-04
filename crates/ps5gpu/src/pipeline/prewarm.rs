@@ -53,7 +53,11 @@ fn journal_enabled() -> bool {
 
 /// The signature line of every list file (the device, driver and
 /// translator are named by the stamp inside).
-const SIGNATURE: &str = "rps5ePW4\n";
+const SIGNATURE: &str = "rps5ePW5\n";
+
+/// The previous format: the same records without `ShaderReflection::host_bvh`
+/// (read with it false; its modules are translated again).
+const SIGNATURE_PW4: &str = "rps5ePW4\n";
 
 #[derive(Clone)]
 pub struct ModuleRecord {
@@ -423,6 +427,11 @@ impl PrewarmList {
         }
     }
 
+    /// The guest inputs of module `key`, when the list holds them.
+    pub fn source_of(&self, key: u64) -> Option<Arc<ModuleSource>> {
+        self.module_index.get(&key).and_then(|&i| self.modules[i].source.clone())
+    }
+
     /// Forget a stale module that could not be translated again.
     pub fn remove_module(&mut self, key: u64) {
         let Some(i) = self.module_index.remove(&key) else { return };
@@ -723,7 +732,7 @@ fn get_variables(r: &mut Reader) -> Option<Vec<ReflectedVariable>> {
     (0..n).map(|_| Some(ReflectedVariable { location: r.u()?, components: r.u()?, kind: kind_of(r.u()?)?, flat: r.b()? })).collect()
 }
 
-fn put_reflection(w: &mut Writer, x: &ShaderReflection) {
+fn put_reflection(w: &mut Writer, x: &ShaderReflection, pw4: bool) {
     w.string(&x.entry_point);
     w.u(x.bindings.len() as u32);
     for b in &x.bindings {
@@ -751,9 +760,12 @@ fn put_reflection(w: &mut Writer, x: &ShaderReflection) {
     w.u(x.private_lds_bytes);
     w.u(x.required_subgroup_size);
     w.b(x.own_buffer_checks);
+    if !pw4 {
+        w.b(x.host_bvh);
+    }
 }
 
-fn get_reflection(r: &mut Reader) -> Option<ShaderReflection> {
+fn get_reflection(r: &mut Reader, pw4: bool) -> Option<ShaderReflection> {
     let entry_point = r.string()?;
     let n = r.len(1024)?;
     let bindings = (0..n).map(|_| Some(ReflectedBinding { binding: r.u()?, descriptor_type: vk::DescriptorType::from_raw(r.i()?), count: r.u()? })).collect::<Option<Vec<_>>>()?;
@@ -772,6 +784,7 @@ fn get_reflection(r: &mut Reader) -> Option<ShaderReflection> {
         private_lds_bytes: r.u()?,
         required_subgroup_size: r.u()?,
         own_buffer_checks: r.b()?,
+        host_bvh: if pw4 { false } else { r.b()? },
     })
 }
 
@@ -921,6 +934,11 @@ const MAGIC: u32 = 0x5057_3450; // "P4WP"
 pub(super) type Decoded = (u64, Vec<ModuleRecord>, Vec<GraphicsRecord>, Vec<ComputeRecord>);
 
 pub(super) fn encode(stamp: u64, modules: &[ModuleRecord], graphics: &[GraphicsRecord], compute: &[ComputeRecord]) -> Vec<u8> {
+    encode_as(stamp, modules, graphics, compute, false)
+}
+
+/// `pw4`: in the previous format (tests).
+fn encode_as(stamp: u64, modules: &[ModuleRecord], graphics: &[GraphicsRecord], compute: &[ComputeRecord], pw4: bool) -> Vec<u8> {
     let mut w = Writer(Vec::new());
     w.u(MAGIC);
     w.q(stamp);
@@ -949,7 +967,7 @@ pub(super) fn encode(stamp: u64, modules: &[ModuleRecord], graphics: &[GraphicsR
         w.u(m.stage as u32);
         w.b(m.fresh);
         w.words(if m.fresh { &m.spirv[..] } else { &[] });
-        put_reflection(&mut w, &m.reflection);
+        put_reflection(&mut w, &m.reflection, pw4);
         match &m.source {
             Some(src) => {
                 w.u(1);
@@ -976,11 +994,14 @@ pub(super) fn encode(stamp: u64, modules: &[ModuleRecord], graphics: &[GraphicsR
         w.b(c.subgroup32);
     }
     let payload: Vec<u8> = w.0.iter().flat_map(|v| v.to_le_bytes()).collect();
-    super::cache::encode(SIGNATURE, &payload)
+    super::cache::encode(if pw4 { SIGNATURE_PW4 } else { SIGNATURE }, &payload)
 }
 
 pub(super) fn decode(file: &[u8]) -> Option<Decoded> {
-    let payload = super::cache::decode(SIGNATURE, file)?;
+    let (payload, pw4) = match super::cache::decode(SIGNATURE, file) {
+        Some(p) => (p, false),
+        None => (super::cache::decode(SIGNATURE_PW4, file)?, true),
+    };
     if payload.len() % 4 != 0 {
         return None;
     }
@@ -999,7 +1020,7 @@ pub(super) fn decode(file: &[u8]) -> Option<Decoded> {
         let stage = u8::try_from(r.u()?).ok()?;
         let fresh = r.b()?;
         let spirv: Arc<[u32]> = r.words()?.into();
-        let reflection = get_reflection(&mut r)?;
+        let reflection = get_reflection(&mut r, pw4)?;
         let source = if r.b()? {
             let program = programs.get(r.u()? as usize)?.clone();
             let request: Arc<[u32]> = r.words()?.into();
@@ -1016,6 +1037,8 @@ pub(super) fn decode(file: &[u8]) -> Option<Decoded> {
         .collect::<Option<Vec<_>>>()?;
     let n = r.len(1 << 22)?;
     let compute = (0..n).map(|_| Some(ComputeRecord { cs: r.q()?, layout: get_layout(&mut r)?, subgroup32: r.b()? })).collect::<Option<Vec<_>>>()?;
+    // A PW4 module's reflection lacks `host_bvh`: translate it again.
+    let stamp = if pw4 { NO_TRANSLATOR } else { stamp };
     r.0.is_empty().then_some((stamp, modules, graphics, compute))
 }
 
@@ -1067,6 +1090,7 @@ mod tests {
             private_lds_bytes: 512,
             required_subgroup_size: 0,
             own_buffer_checks: true,
+            host_bvh: false,
         };
         let program = Arc::new(ProgramSource {
             address: 0x1000,
@@ -1109,7 +1133,14 @@ mod tests {
         let mut bad = file.clone();
         *bad.last_mut().unwrap() ^= 1;
         assert!(decode(&bad).is_none());
-        // A list of the previous format is not read.
+        // A PW4 list is read: host_bvh false, every module to be translated again.
+        let mut with_bvh = modules.clone();
+        with_bvh[0].reflection.host_bvh = true;
+        let (s4, m4, g4, c4) = decode(&encode_as(7, &with_bvh, &graphics, &compute, true)).unwrap();
+        assert_eq!(s4, NO_TRANSLATOR);
+        assert!(!m4[0].reflection.host_bvh && m4[0].source.is_some());
+        assert!(g4 == graphics && c4 == compute);
+        // An older format is not read.
         assert!(decode(&super::super::cache::encode("rps5ePW3:x\n", &file[SIGNATURE.len() + 8..])).is_none());
     }
 

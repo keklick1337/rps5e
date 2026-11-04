@@ -1040,7 +1040,7 @@ impl<'a> Translator<'a> {
             args.push(exec);
             let attr = ImageAttr {
                 pc: ins.pc,
-                op: ImageOp::BvhIntersect { bvh64 },
+                op: ImageOp::BvhIntersect { bvh64, boxes: true },
                 flags: SampleFlags::default(),
                 dim: 0,
                 dmask: 0xF,

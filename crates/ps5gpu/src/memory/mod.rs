@@ -946,8 +946,15 @@ impl GuestGpuMemory {
         // again (a page found unregistered may be the registry's "cannot
         // tell" for a block this thread holds locked).
         let all = |it: &mut dyn Iterator<Item = layout_memo::Piece>| Iterator::all(&mut &mut *it, |(_, _, aliased, registered)| aliased && registered);
+        // A wholly registered range (the common case: the lock-free block
+        // check) needs no memo lookup (`RPS5E_REGISTERED_FIRST=0`: the memo
+        // is asked first).
+        let first = registered_first_enabled() && self.pages.is_registered(addr, size);
+        if first {
+            return true;
+        }
         let Some(st) = self.layout_memo_stamp(addr, size) else { return self.is_watchable_uncached(addr, size) };
-        if layout_memo::with_pieces(self.id, st, addr, size, all) == Some(true) || self.pages.is_registered(addr, size) {
+        if layout_memo::with_pieces(self.id, st, addr, size, all) == Some(true) || (!registered_first_enabled() && self.pages.is_registered(addr, size)) {
             return true;
         }
         self.walk_layout(st, addr, size, all) || self.is_watchable_uncached(addr, size)
@@ -1463,4 +1470,15 @@ pub mod pending {
             assert!(p.overlaps(0x12F, 1) && !p.overlaps(0x130, 0xD0) && p.overlaps(0x6F, 0x92));
         }
     }
+}
+
+/// `RPS5E_REGISTERED_FIRST=0`: [`GuestGpuMemory::is_watchable`] asks the
+/// layout memo before the page registry. By default the registry's
+/// lock-free answer for wholly registered blocks comes first (the same
+/// answer: either one saying "watchable" decides), so the per-thread memo
+/// is searched only for ranges with unregistered pages. A/B scope
+/// `release` toggles it.
+fn registered_first_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_REGISTERED_FIRST")) && crate::backend::ab::release_fast("RPS5E_REGISTERED_FIRST")
 }

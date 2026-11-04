@@ -1632,10 +1632,13 @@ impl ShaderFrontend {
                             );
                         }
                     }
-                    let t0 = std::time::Instant::now();
+                    // Timed only for the wait report (the clock is not free).
+                    let t0 = crate::backend::profile::desc_wait_why().then(std::time::Instant::now);
                     let before = crate::backend::profile::desc_wait_why().then(|| b.cache().describe_word(a, s.current_tick()));
                     crate::backend::profile::preparing(shader_base, || b.download_window(s, a));
-                    note_slow_word_wait(shader_base, a, t0.elapsed(), before.as_deref());
+                    if let Some(t0) = t0 {
+                        note_slow_word_wait(shader_base, a, t0.elapsed(), before.as_deref());
+                    }
                     forget_page(a);
                     waited.set(true);
                 } else {

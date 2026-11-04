@@ -95,6 +95,8 @@ pub fn translator_stamp(features: &super::Features) -> u64 {
     super::vertex_wave_info_enabled().hash(&mut h);
     super::image::const_texel_offsets_enabled().hash(&mut h);
     super::emit::data_cache_invalidate_enabled().hash(&mut h);
+    super::hw_traversals_enabled().hash(&mut h);
+    std::env::var("RPS5E_HW_RT_CLOSEST").ok().hash(&mut h);
     (features.subgroup64_compute, features.max_compute_workgroup_subgroups, features.max_shared_bytes, super::wave_split::enabled(), super::wave_split::min_vgprs(), super::wave_split::lane_slots_enabled(), super::wave_split::ballot_riders_enabled()).hash(&mut h);
     VERSION.hash(&mut h);
     h.finish()
@@ -172,7 +174,7 @@ fn encode(spirv: &[u32], r: &ShaderReflection, reads: &[(u64, u32)]) -> Vec<u32>
     w.0.extend(r.local_size);
     w.u(r.private_lds_bytes);
     w.u(r.required_subgroup_size);
-    w.u(r.own_buffer_checks as u32);
+    w.u(r.own_buffer_checks as u32 | (r.host_bvh as u32) << 1);
     w.u(reads.len() as u32);
     for &(a, v) in reads {
         w.0.extend([a as u32, (a >> 32) as u32, v]);
@@ -211,7 +213,8 @@ fn decode(words: &[u32]) -> Option<Entry> {
     let local_size = [r.u()?, r.u()?, r.u()?];
     let private_lds_bytes = r.u()?;
     let required_subgroup_size = r.u()?;
-    let own_buffer_checks = r.u()? != 0;
+    let flags = r.u()?;
+    let (own_buffer_checks, host_bvh) = (flags & 1 != 0, flags & 2 != 0);
     let n = r.u()? as usize;
     if n > r.0.len() / 3 {
         return None;
@@ -235,6 +238,7 @@ fn decode(words: &[u32]) -> Option<Entry> {
         private_lds_bytes,
         required_subgroup_size,
         own_buffer_checks,
+        host_bvh,
     };
     Some((r.0.to_vec(), reflection, reads))
 }
@@ -316,6 +320,7 @@ mod tests {
             private_lds_bytes: 12,
             required_subgroup_size: 64,
             own_buffer_checks: true,
+            host_bvh: true,
         };
         let spirv = vec![0x0723_0203, 1, 2, 3];
         let reads = vec![(0x1_0000_0040, 7), (0x1_0000_0044, 9)];

@@ -256,7 +256,9 @@ pub enum ImageOp {
     GetLod,
     Atomic(AtomicOp),
     /// BVH ray intersection (`bvh64` when the node pointer is 64-bit).
-    BvhIntersect { bvh64: bool },
+    /// `boxes` false: a box node returns no children (only triangle nodes
+    /// are intersected; [`crate::opt::rt_loops`]).
+    BvhIntersect { bvh64: bool, boxes: bool },
 }
 
 /// Image sample / gather address modifiers (the instruction suffixes).
@@ -608,6 +610,67 @@ pub enum Op {
     /// one invocation (shader clock, or the constant-rate real-time clock
     /// when `realtime`). Never merged or removed.
     Clock { realtime: bool },
+    /// A step of a hardware traversal that replaces a guest BVH loop
+    /// ([`crate::opt::rt_loops`]); never merged or removed.
+    RtQuery(RtOp),
+}
+
+/// The steps of a hardware traversal ([`crate::opt::rt_loops`]): each
+/// invocation runs a host ray query over the host's mirror of the guest
+/// BVH, which hands the guest's (unchanged, wave-wide) loop the nodes to
+/// visit in place of its node stack: one candidate at a time per
+/// invocation, the wave's pops taking the node of the first invocation
+/// with one pending and every invocation sharing it. `slot` names the
+/// traversal (its private query state).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RtOp {
+    /// `(base_lo: u32, base_hi: u32)` -> u32: the host mirror (1-based
+    /// entry of the ray-tracing table) of the guest BVH whose T# words 0
+    /// and 1 are given, when it is complete and has `levels` levels (2: a
+    /// top level of instances, 1: a bottom level traced alone); 0
+    /// otherwise. The same in every invocation of the wave.
+    Lookup { levels: u8 },
+    /// `(entry, origin x, y, z, direction x, y, z, extent: u32 bits, cull
+    /// mask, active: bool, ray flags: u32 (cull back faces 0x10, end at
+    /// the first hit 0x4))`: start the query of
+    /// `slot` over the mirror `entry` (from `Lookup`); instances whose mask
+    /// byte shares no bit with the cull mask are skipped; an inactive
+    /// invocation has no candidates. Opaque triangles (by their leaf entry
+    /// and instance flags) are the query's to commit: the invocation's
+    /// candidates are the others, then the closest opaque hit.
+    Begin { slot: u8 },
+    /// `()`: an invocation with no candidate pending (neither for the top
+    /// nor the bottom level) fetches its query's next one. At `level` 1 only
+    /// invocations inside the instance the top level popped fetch, and a
+    /// candidate in that instance waits for the bottom level at once.
+    Fetch { slot: u8, level: u8 },
+    /// `() -> value`: the invocation's pending candidate: `Ready` (bool, for
+    /// the top level), `Leaf` (bool, for the bottom level), `Instance`
+    /// (u32, its instance record index), `Entry` (u32, the first entry of
+    /// its leaf list: byte offset in the BLAS, type 0).
+    Get { slot: u8, what: RtGet },
+    /// `(take: bool[, guest: u32])`: the wave popped the invocation's
+    /// candidate at `level` (0: the top) when `take`; at the top of a
+    /// two-level traversal its leaf then waits for the bottom level (the
+    /// leaves of the others are dropped), unless `guest` (nonzero: the
+    /// popped instance's BLAS has no host mirror) says the bottom level
+    /// walks the guest's own stack for this instance.
+    Take { slot: u8, level: u8, levels: u8 },
+}
+
+/// What [`RtOp::Get`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RtGet {
+    Ready,
+    Leaf,
+    Instance,
+    Entry,
+    /// (bool) The pending candidate is an instance whose BLAS the host
+    /// does not mirror (a box stands for it).
+    Proxy,
+    /// (bool) The bottom level walks the guest's stack (the popped instance
+    /// was such a proxy).
+    InGuest,
 }
 
 impl Op {
@@ -631,7 +694,8 @@ impl Op {
             | Op::SubgroupLdsBarrier
             | Op::DataCacheInvalidate
             | Op::SendMessage { .. }
-            | Op::Clock { .. } => true,
+            | Op::Clock { .. }
+            | Op::RtQuery(_) => true,
             Op::Image(a) => matches!(a.op, ImageOp::Store | ImageOp::Atomic(_)),
             _ => false,
         }

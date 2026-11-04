@@ -23,6 +23,9 @@ pub fn uniform_values(func: &Function) -> Vec<bool> {
         | Op::LdsLoad { .. }
         | Op::LdsAtomic { .. }
         | Op::Image(_) => true,
+        // A hardware traversal's candidates differ per invocation (its
+        // lookup is the wave's).
+        Op::RtQuery(r) => matches!(r, RtOp::Get { .. }),
         _ => false,
     };
     let always_uniform = |op: Op| matches!(op, Op::Ballot | Op::ReadLane | Op::LdsAppend { .. } | Op::GdsAppend { .. });

@@ -1,0 +1,146 @@
+// RustPS5Emu (RPS5E)
+// Copyright (C) 2026 Vladislav Tislenko aka keklick1337
+// SPDX-License-Identifier: GPL-2.0-only
+
+// The triangles of guest BLASes for host BLAS builds: one thread per leaf
+// entry slot of a host BLAS (its capacity). A guest BLAS keeps its leaf
+// entries (8 bytes: triangle-node pointer, primitive info) in one array
+// from 64 * [+88] to [+40]; the pointer's low 3 bits pick the triangle of
+// the 64-byte node (five float3 vertices: type 0 = v0 v1 v2, 1 = v1 v3 v2,
+// 2 = v2 v3 v4, 3 = v2 v4 v0), its other bits the node (8-byte units of 8
+// bytes). Each workgroup takes 64 entries of one job (`chunks`: job, first
+// entry). The host BLAS has two geometries of `capacity` triangles each:
+// entry j is triangle j of the opaque one (its primitive info has bit 30)
+// or of the other, and inactive (NaN) in the second. A triangle with a
+// vertex the guest marks unused (beyond +-1e30, NaN), an empty entry (all
+// ones), or past the entry count of the host BLAS's last full build, is
+// inactive in both. An entry of another type (procedural boxes) clears the
+// job's map slot: the host cannot mirror the BLAS.
+//
+// After the two geometries the host BLAS's buffer holds the list starts:
+// per entry, the index of the first entry of its leaf list (lists end at
+// an entry whose primitive info has bit 31).
+//
+// Per map slot the kernel keeps the entry count of the last full build and
+// reports to the host (flags of the update's bank): CHANGED when a
+// triangle differs from the last update's, REBUILD when the guest's entry
+// count is no longer the built one or a triangle inactive in the last
+// build would become active (an entry changed its opacity: a refit cannot
+// do that); such a BLAS is also marked stale in the map until the host
+// builds it again (its instances then stand in as boxes).
+
+#version 460
+#include "guest.glsl"
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64s { uint64_t q[]; };
+
+layout(push_constant) uniform P {
+    uint64_t chunks;    // {job, first entry}
+    uint64_t jobs;      // {guest base, vertices out, capacity, map slot}
+    uint64_t map;       // BLAS map slots {key, AS address, capacity, stale}
+    uint64_t status;    // per map slot {built count, flags of banks 0-3, 0, 0, 0}
+    uint64_t full;      // a bit per map slot: built in full by this update
+    uint page_bits;
+    uint page_limit;
+    uint bank;
+} pc;
+
+const uint CHANGED = 1u;
+const uint REBUILD = 2u;
+
+vec3 vertex(uint64_t node, uint k) {
+    uint64_t a = node + uint64_t(k) * 12ul;
+    return vec3(GUEST_FLOAT(a), GUEST_FLOAT(a + 4ul), GUEST_FLOAT(a + 8ul));
+}
+
+bool usable(vec3 v) {
+    return all(lessThan(abs(v), vec3(1e30)));
+}
+
+void main() {
+    uvec2 chunk = uvec2(Words(pc.chunks).w[gl_WorkGroupID.x * 2u], Words(pc.chunks).w[gl_WorkGroupID.x * 2u + 1u]);
+    uint64_t job = pc.jobs + uint64_t(chunk.x) * 32ul;
+    uint64_t base = U64s(job).q[0];
+    uint64_t out_v = U64s(job).q[1];
+    uint capacity = Words(job).w[4];
+    uint slot = Words(job).w[5];
+    uint j = chunk.y + gl_LocalInvocationID.x;
+    Words st = Words(pc.status + uint64_t(slot) * 32ul);
+    uint leaf_start = GUEST_WORD(base + 88ul) * 64u;
+    uint leaf_end = GUEST_WORD(base + 40ul);
+    uint count = leaf_end > leaf_start ? (leaf_end - leaf_start) / 8u : 0u;
+    bool full = ((Words(pc.full).w[slot >> 5u] >> (slot & 31u)) & 1u) != 0u;
+    uint built = full ? count : st.w[0];
+    if (j == 0u) {
+        if (full) {
+            st.w[0] = count;
+        } else if (count != built) {
+            atomicOr(st.w[1u + pc.bank], REBUILD);
+            U64s(pc.map).q[slot * 4u + 3u] = 1ul;
+        }
+    }
+    bool changed = false;
+    bool woken = false;
+    if (j < capacity) {
+        uint64_t leaf = base + uint64_t(leaf_start) + uint64_t(j) * 8ul;
+        uint ptr = GUEST_WORD(leaf);
+        bool opaque = (GUEST_WORD(leaf + 4ul) & (1u << 30)) != 0u;
+        uint type = ptr & 7u;
+        uint64_t node = base + uint64_t(ptr & ~7u) * 8ul;
+        vec3 a, b, c;
+        bool ok = true;
+        bool live = j < min(built, capacity);
+        if (type == 0u) { a = vertex(node, 0u); b = vertex(node, 1u); c = vertex(node, 2u); }
+        else if (type == 1u) { a = vertex(node, 1u); b = vertex(node, 3u); c = vertex(node, 2u); }
+        else if (type == 2u) { a = vertex(node, 2u); b = vertex(node, 3u); c = vertex(node, 4u); }
+        else if (type == 3u) { a = vertex(node, 2u); b = vertex(node, 4u); c = vertex(node, 0u); }
+        else if (ptr == 0xFFFFFFFFu) { live = false; a = vec3(0.0); b = a; c = a; }
+        else { ok = false; }
+        if (!ok && live) {
+            U64s(pc.map).q[slot * 4u + 1u] = 0ul;
+        }
+        if (!live || !ok || !usable(a) || !usable(b) || !usable(c)) {
+            float n = uintBitsToFloat(0x7FC00000u);
+            a = vec3(n); b = vec3(n); c = vec3(n);
+        }
+        uint w[9] = uint[9](floatBitsToUint(a.x), floatBitsToUint(a.y), floatBitsToUint(a.z),
+                            floatBitsToUint(b.x), floatBitsToUint(b.y), floatBitsToUint(b.z),
+                            floatBitsToUint(c.x), floatBitsToUint(c.y), floatBitsToUint(c.z));
+        uint nan = 0x7FC00000u;
+        for (uint g = 0u; g < 2u; g++) {
+            bool mine = (g == 0u) == opaque;
+            Words o = Words(out_v + (uint64_t(g) * uint64_t(capacity) + uint64_t(j)) * 36ul);
+            bool was_off = isnan(uintBitsToFloat(o.w[0]));
+            bool differs = false;
+            for (uint k = 0u; k < 9u; k++) {
+                differs = differs || o.w[k] != (mine ? w[k] : nan);
+            }
+            if (differs) {
+                for (uint k = 0u; k < 9u; k++) o.w[k] = mine ? w[k] : nan;
+            }
+            changed = changed || differs;
+            woken = woken || (differs && was_off && mine && !isnan(a.x));
+        }
+    }
+    if (j < capacity) {
+        uint k = j;
+        for (uint n = 0u; n < 256u && k > 0u && k <= count; n++) {
+            uint info = GUEST_WORD(base + uint64_t(leaf_start) + uint64_t(k - 1u) * 8ul + 4ul);
+            if ((info & 0x80000000u) != 0u) break;
+            k--;
+        }
+        Words(out_v + uint64_t(capacity) * 72ul).w[j] = k;
+    }
+    if (woken && !full) {
+        // A refit cannot make an inactive triangle active.
+        atomicOr(st.w[1u + pc.bank], REBUILD);
+        U64s(pc.map).q[slot * 4u + 3u] = 1ul;
+    }
+    // One flag per subgroup (a workgroup's entries are one job's).
+    if (subgroupAny(changed) && subgroupElect()) {
+        atomicOr(st.w[1u + pc.bank], CHANGED);
+    }
+}

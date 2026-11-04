@@ -59,6 +59,7 @@ fn main() {
         dir.join("../ps5shader/src"),
         dir.join("../ps5shader/Cargo.toml"),
         dir.join("src/shader"),
+        dir.join("src/rt"),
         dir.join("src/pipeline/compiler.rs"),
         dir.join("src/pipeline/frontend.rs"),
         dir.join("src/pipeline/sharps.rs"),

@@ -1640,6 +1640,71 @@ fn cp_occlusion_dumps_queued_without_waiting() {
     assert!(sum > 0, "the object stays visible");
 }
 
+/// `RPS5E_LABELS_AT_EOP=cpu` (opt-in; the test runs with that set): an end-of-pipe label reaches
+/// guest memory only once the GPU finished the work before it, while the
+/// command processor's own wait on it is satisfied as soon as the label
+/// was recorded (the executor shows it to the interpreter's reads).
+#[test]
+fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
+    type Landing = Box<dyn FnOnce() + Send>;
+    #[derive(Default)]
+    struct Gpu {
+        done: Mutex<Vec<Landing>>,
+        labels: Mutex<Vec<(u64, Vec<u8>)>>,
+    }
+    impl ps5gpu::render::RenderExecutor for Gpu {
+        fn draw(&self, _: &ps5gpu::render::ResolvedDraw) {}
+        fn dispatch(&self, _: &ps5gpu::render::ResolvedDispatch) {}
+        fn after_pipe(&self, done: Landing) {
+            self.done.lock().unwrap().push(done);
+        }
+        fn label_after_gpu(&self, addr: u64, data: &[u8], write: Landing) {
+            self.labels.lock().unwrap().push((addr, data.to_vec()));
+            self.after_pipe(write);
+        }
+        fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
+            if !read(out) {
+                return false;
+            }
+            for (a, d) in self.labels.lock().unwrap().iter() {
+                for (i, b) in out.iter_mut().enumerate() {
+                    let at = addr + i as u64;
+                    if at >= *a && at < a + d.len() as u64 {
+                        *b = d[(at - a) as usize];
+                    }
+                }
+            }
+            true
+        }
+    }
+    if std::env::var("RPS5E_LABELS_AT_EOP").as_deref() != Ok("cpu") {
+        return;
+    }
+    let e = Env::new();
+    let label = e.a(LABELS + 0x60);
+    let out = e.a(LABELS + 0x70);
+    mem::w32(label, 0);
+    mem::w32(out, 0);
+    let seven = e.a(DATA + 0x40);
+    mem::w32(seven, 7);
+    e.call("sceAgcCbReleaseMem", &[e.cb(), 0x28, 0, 0, 0, label], &[1, 1, 0, 0, 0, 0]);
+    e.call("sceAgcDcbWaitRegMem", &[e.cb(), 0, 3, 0, 0, label], &[1, 0xFFFF_FFFF, 16]);
+    e.call("sceAgcDcbWriteData", &[e.cb(), 5, 0, out, seven, 1], &[0, 0]);
+    let rec = std::sync::Arc::new(Gpu::default());
+    let q = GpuQueue::new(1);
+    let ex: std::sync::Arc<dyn ps5gpu::render::RenderExecutor> = rec.clone();
+    q.with_interpreter(0, |i| i.executor = Some(ex));
+    submit_cb(&e, &q);
+    run_queue(&q);
+    assert_eq!(q.pending(), 0, "the wait saw the recorded label");
+    assert_eq!(mem::r32(out), Some(7));
+    assert_eq!(mem::r32(label), Some(0), "the CPU sees the label only after the GPU");
+    for f in std::mem::take(&mut *rec.done.lock().unwrap()) {
+        f();
+    }
+    assert_eq!(mem::r32(label), Some(1));
+}
+
 /// The private RELEASE_MEM uses the native dword layout.
 #[test]
 fn cp_private_release_mem_follows_the_native_layout() {
@@ -2309,6 +2374,7 @@ fn label_modes_parse() {
     assert_eq!(parse_label_mode(Some("1"), false), LabelMode::AfterGpu);
     assert_eq!(parse_label_mode(Some("0"), true), LabelMode::Recorded);
     assert_eq!(parse_label_mode(Some(" through "), false), LabelMode::AfterWriteThroughs);
+    assert_eq!(parse_label_mode(Some("cpu"), false), LabelMode::AfterGpuForCpu);
     assert_eq!(parse_label_mode(Some("yes"), false), LabelMode::Recorded);
 }
 

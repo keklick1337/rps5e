@@ -440,3 +440,63 @@ fn dispatch_sync_reads_an_unwritten_word_next_to_gpu_results_without_waiting() {
         assert!(waits > 0, "the V# was read after the page came back");
     }
 }
+
+/// A run of writing dispatches gets the copies of their written ranges
+/// after the run (`RPS5E_THROUGH_RUNS`): one barrier from the compute
+/// writes to the copies instead of one per dispatch, and a range whose
+/// pages an earlier copy of the batch covered is not copied again
+/// (`RPS5E_THROUGH_DEDUPE`). Every output still lands in guest memory with
+/// the bytes of its dispatch.
+#[test]
+#[ignore]
+fn dispatch_sync_write_throughs_follow_the_run() {
+    let mut g = Guest::new(16 << 20);
+    let st = asm::buffer_store_dword(1, 0, 0);
+    let cs = g.program(&[asm::v_mov_from_sgpr(1, 4), st[0], st[1], asm::S_ENDPGM]);
+    let n = 8u64;
+    let out = g.zeroed((n * 4096) as usize);
+    let dev = GpuDevice::create(false).expect("device");
+    let mut b = Backend::new(&dev, g.mem).unwrap();
+    crate::backend::attach_faults(&b, g.mem);
+    let compiler: Arc<dyn ShaderCompiler> = Arc::new(TestCompiler::new().with(cs, TestProgram::StoreCompute { local_size: 64 }));
+    let mut p = ShaderPipelines::new(&dev, g.mem, Some(compiler), None).unwrap();
+    p.set_async_compile(false);
+    b.pipelines = Box::new(p);
+    // Each output is 256 bytes; two dispatches write each page (its two
+    // halves), so the copies of a page's second writer are shared.
+    let round = |b: &mut Backend, k: u32| {
+        for i in 0..n {
+            let mut d = store(cs, out + (i / 2) * 4096 + (i % 2) * 2048, k + i as u32 * 1000);
+            d.packet.dispatch_initiator |= 1 << 15;
+            b.dispatch(&d);
+        }
+        b.flush();
+    };
+    // Warm: buffers, pipelines.
+    round(&mut b, 1);
+    b.sched.finish();
+    let s0 = (b.sched.stats().transfer_read_barriers, b.buffers.through_copies(), b.stats.through_runs);
+    round(&mut b, 7);
+    let s1 = (b.sched.stats().transfer_read_barriers, b.buffers.through_copies(), b.stats.through_runs);
+    let runs = !std::env::var("RPS5E_THROUGH_RUNS").is_ok_and(|v| v == "0");
+    let dedupe = !std::env::var("RPS5E_THROUGH_DEDUPE").is_ok_and(|v| v == "0");
+    if runs {
+        assert_eq!(s1.0 - s0.0, 1, "one barrier before the run's copies");
+        assert_eq!(s1.2 - s0.2, 1, "one run");
+        assert_eq!(s1.1 - s0.1, if dedupe { n / 2 } else { n }, "copies of the run");
+    } else {
+        assert_eq!(s1.0 - s0.0, n, "a barrier before each dispatch's copy");
+        assert_eq!(s1.1 - s0.1, n, "a copy per dispatch");
+    }
+    b.sched.finish();
+    for i in 0..n {
+        let region = out + (i / 2) * 4096 + (i % 2) * 2048;
+        let landed = b.tracker.landing(region);
+        assert!(landed != 0 && landed <= b.sched.timeline.completed_tick(), "dispatch {i} written through");
+        for w in [0u64, 17, 63] {
+            // SAFETY: a guest page of the test view (readable: written through).
+            let v = unsafe { std::ptr::read_volatile((region + w * 4) as *const u32) };
+            assert_eq!(v, 7 + i as u32 * 1000 + w as u32, "dispatch {i} word {w}");
+        }
+    }
+}

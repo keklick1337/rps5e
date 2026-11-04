@@ -258,6 +258,27 @@ pub struct EmitOptions {
     /// (`Emitter::max_with_positive_zero`), not the general NaN and
     /// signed-zero selects. Exact.
     pub zero_max: bool,
+    /// `RPS5E_DS_INT_MIN_MAX`: DS_MIN_F32 / DS_MAX_F32 with a source that
+    /// is +0, ±inf or normal are one LDS integer atomic (signed for a
+    /// positive source, unsigned for a negative one) instead of a
+    /// compare-exchange loop; other sources keep the loop
+    /// (`memory::ds_float_min_max_atomic`). Exact.
+    pub ds_int_min_max: bool,
+    /// `RPS5E_HW_RT`: box queries of a BVH the host mirrors drop the
+    /// children a host ray query found no hit triangle under
+    /// ([`crate::rt`]). Needs ray queries on the device.
+    pub hw_rt: bool,
+    /// `RPS5E_HW_RT=2`: the pruning and the hardware traversals count
+    /// their work ([`crate::rt::table::STATS`]).
+    pub hw_rt_stats: bool,
+    /// `RPS5E_HW_RT_PRUNE=1`: box queries of traversals that keep the
+    /// guest loop (not replaced by a host ray-query copy) drop the
+    /// children a root ray query found no hit triangle under.
+    pub hw_rt_prune: bool,
+    /// `RPS5E_HW_RT_PROBE=1` (diagnostics): the traversal copies run their
+    /// host queries to the end and hand the guest loop no node (the cost
+    /// of the queries alone; the frames lose their ray-traced effects).
+    pub hw_rt_probe: bool,
 }
 
 impl EmitOptions {
@@ -291,6 +312,11 @@ impl EmitOptions {
         bvh_vector_loads: true,
         nan_once: true,
         zero_max: true,
+        ds_int_min_max: true,
+        hw_rt: false,
+        hw_rt_stats: false,
+        hw_rt_prune: false,
+        hw_rt_probe: false,
     };
     /// Every exact switch on, on a device with every feature they use
     /// (tests).
@@ -324,6 +350,11 @@ impl EmitOptions {
         bvh_vector_loads: false,
         nan_once: false,
         zero_max: false,
+        ds_int_min_max: false,
+        hw_rt: false,
+        hw_rt_stats: false,
+        hw_rt_prune: false,
+        hw_rt_probe: false,
     };
 
     /// The switches from the environment (read once).
@@ -364,6 +395,11 @@ impl EmitOptions {
                 bvh_vector_loads: on("RPS5E_BVH_VECTOR_LOADS"),
                 nan_once: on("RPS5E_NAN_ONCE"),
                 zero_max: on("RPS5E_ZERO_MAX"),
+                ds_int_min_max: on("RPS5E_DS_INT_MIN_MAX"),
+                hw_rt: crate::rt::requested(),
+                hw_rt_stats: crate::rt::level() >= 2,
+                hw_rt_prune: opt_in("RPS5E_HW_RT_PRUNE"),
+                hw_rt_probe: opt_in("RPS5E_HW_RT_PROBE"),
             };
             if o.no_f32_flush {
                 log::warn!("[shader] RPS5E_NO_F32_FLUSH=1: f32 denormals are not flushed as the guest's FLOAT_MODE asks (the host's own behaviour)");
@@ -385,6 +421,7 @@ impl EmitOptions {
             shuffle_relative: dev.caps.subgroup_shuffle_relative,
             lane_reductions: o.lane_reductions && dev.caps.subgroup_arithmetic,
             guarded_loads: o.guarded_loads && dev.caps.pipeline_robustness,
+            hw_rt: o.hw_rt && dev.caps.ray_query,
             ..o
         }
     }
@@ -635,6 +672,39 @@ pub fn translate_options(stage: ShaderStage, r: &ShaderCompileRequest<'_>, mesh:
         native_ftz: false,
         host_float: ps5shader::opt::denorm::HostFloat::NONE,
     }
+}
+
+thread_local! {
+    static HOST_FLUSH_WITHHELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` (translations on this thread) with the emulated f32 flush kept
+/// where the host's own arithmetic would flush ([`EmitOptions::host_flush`]
+/// off for these translations only). Both forms are exact; the host
+/// compiler can allocate one of them better (see
+/// `pipeline::provider::spill_variants_enabled`).
+pub fn without_host_flush<R>(f: impl FnOnce() -> R) -> R {
+    let before = HOST_FLUSH_WITHHELD.with(|c| c.replace(true));
+    let r = f();
+    HOST_FLUSH_WITHHELD.with(|c| c.set(before));
+    r
+}
+
+fn host_flush_withheld() -> bool {
+    HOST_FLUSH_WITHHELD.with(|c| c.get())
+}
+
+#[cfg(test)]
+#[test]
+fn host_flush_is_withheld_only_inside() {
+    assert!(!host_flush_withheld());
+    let inner = without_host_flush(|| {
+        let nested = without_host_flush(host_flush_withheld);
+        (host_flush_withheld(), nested)
+    });
+    assert_eq!(inner, (true, true));
+    assert!(!host_flush_withheld(), "restored after the translation");
+    assert!(!std::thread::spawn(|| without_host_flush(|| std::thread::spawn(host_flush_withheld).join().unwrap())).join().unwrap(), "per thread");
 }
 
 /// Whether the translation of `program` may use f16 types (f16 / packed /
@@ -932,7 +1002,7 @@ impl SpirvCompiler {
         // the program; a module that turns out to declare it after all is
         // translated again with the 16-bit rules.
         let regimes = feats.host_float != feats.host_float16 && !feats.f16_denormals_kept;
-        let host_flush = feats.emit.host_flush && !native_ftz && (feats.host_float.any() || feats.host_float16.any());
+        let host_flush = feats.emit.host_flush && !native_ftz && !host_flush_withheld() && (feats.host_float.any() || feats.host_float16.any());
         let wide = wide || host_flush && regimes && may_use_f16(r.program());
         let host_float = match (host_flush, wide) {
             (false, _) => ps5shader::opt::denorm::HostFloat::NONE,
@@ -976,6 +1046,21 @@ impl SpirvCompiler {
                 compiled.stats.opt.elided_flushes += n;
             }
             stats::PASS_NS[9].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Guest BVH traversal loops get a copy whose nodes come from the
+        // host's ray queries.
+        if feats.emit.hw_rt && stage == ShaderStage::Compute && mesh.is_none() && hw_traversals_enabled() {
+            let out = ps5shader::opt::rt_loops::replace_traversals(&mut compiled.function);
+            for (b, why) in &out.skipped {
+                log::debug!("[shader] cs {:#x}: BVH loop b{} keeps the guest traversal: {why}", r.program().address, b.0);
+            }
+            if out.replaced > 0 {
+                ps5shader::opt::fold::fold(&mut compiled.function);
+                ps5shader::opt::fold::cse(&mut compiled.function);
+                ps5shader::opt::dce::dce(&mut compiled.function);
+                log::info!("[shader] cs {:#x}: {} BVH traversal loops run on host ray queries", r.program().address, out.replaced);
+            }
         }
 
         let mut last = [0u64; 10];
@@ -1145,6 +1230,14 @@ impl ShaderCompiler for SpirvCompiler {
     }
 }
 
+/// `RPS5E_HW_RT_LOOPS=0` (diagnostics): with `RPS5E_HW_RT` on, guest BVH
+/// traversal loops keep the guest traversal (no host ray-query copy,
+/// `ps5shader::opt::rt_loops`). Part of the disk-cache key.
+pub fn hw_traversals_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_HW_RT_LOOPS").is_ok_and(|v| v == "0"))
+}
+
 /// How far past its entry a 64-bit constant counts as derived from a
 /// relocatable program's code address (code and the tables after it).
 pub const RELOCATION_SPAN: u64 = 4 << 20;
@@ -1243,6 +1336,7 @@ pub fn emit_module(input: &EmitInput<'_, '_>) -> Result<(Vec<u32>, ShaderReflect
         reflection.push_constants = Some((0, ps5shader::resources::push_data::BYTE_SIZE));
     }
     reflection.own_buffer_checks = e.feat.emit.guarded_loads && !e.unchecked_buffers;
+    reflection.host_bvh = e.res.host_bvh;
     if e.feat.no_float64 && e.caps.contains_key(&(spirv::Capability::Float64 as u32)) {
         return Err("the program computes in 64-bit floats and the device lacks shaderFloat64".into());
     }

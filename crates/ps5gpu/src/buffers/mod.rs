@@ -39,7 +39,9 @@ use std::sync::Arc;
 pub const CACHING_PAGE_BITS: u32 = 14;
 pub const CACHING_PAGE: u64 = 1 << CACHING_PAGE_BITS;
 /// Owner of each caching page over the 1 TiB guest space.
-type BufferPageTable = crate::page_table::MultiLevelPageTable<u64, CACHING_PAGE_BITS, 40, 14>;
+/// Per caching page: the start (key) and end of the buffer holding it
+/// ((0, 0): none).
+type BufferPageTable = crate::page_table::MultiLevelPageTable<(u64, u64), CACHING_PAGE_BITS, 40, 14>;
 /// Entries of the BDA page table (1 TiB / 16 KiB).
 pub const BDA_PAGE_COUNT: u64 = 1 << (40 - CACHING_PAGE_BITS);
 const STAGING_BYTES: u64 = 64 << 20;
@@ -177,6 +179,10 @@ pub struct BufferStats {
     pub gpu_copies: u64,
     pub gpu_fills: u64,
     pub gpu_writes: u64,
+    /// Write-through copies recorded (GPU results copied to guest memory),
+    /// and write-throughs whose pages an earlier copy of their batch carried.
+    pub through_copies: u64,
+    pub through_copies_shared: u64,
     /// Guest ranges imported as buffers, and downloads copied straight
     /// into them.
     pub host_imports: u64,
@@ -235,6 +241,10 @@ pub struct BufferStats {
     /// them ([`BufferCache::prepare_unranged_reads`]).
     pub unranged_syncs: u64,
     pub unranged_synced_buffers: u64,
+    /// Passes that looked only at the buffers the dirty log named, and
+    /// logs lost (whole passes instead).
+    pub unranged_partial: u64,
+    pub unranged_log_lost: u64,
 }
 
 pub struct BufferCache {
@@ -278,6 +288,8 @@ pub struct BufferCache {
     /// GPU-written ranges to write through at the next submit (or CPU
     /// access), after the work writing them.
     pending_through: Vec<(u64, u64)>,
+    /// Page spans copied by the write-through batch being recorded.
+    batch_copied: Vec<(u64, u64)>,
     /// A command-processor copy, fill or write is obtaining its
     /// destination: it is written through right after the operation, so
     /// its pages stay readable whatever `RPS5E_READ_THROUGHS` decides.
@@ -324,6 +336,14 @@ pub struct BufferCache {
     /// ([`Self::prepare_unranged_reads`]; made on first use).
     unranged: Option<guest::GuestImports>,
     unranged_tried: bool,
+    /// `(layout epoch, map events)` of the last pass of
+    /// [`Self::prepare_unranged_reads`] after which the dirty log alone
+    /// names the buffers that can need work (`RPS5E_UNRANGED_LOG`).
+    unranged_full: Option<(u64, u64)>,
+    /// Buffers that pass left with CPU-dirty pages.
+    unranged_carry: Vec<u64>,
+    /// Bytes of all buffers.
+    total_bytes: u64,
 }
 
 /// Guest ranges (tracker-page aligned) whose mirrors work recorded in the
@@ -578,6 +598,26 @@ const READ_THROUGHS_MIN_BYTES: u64 = 16 << 10;
 /// scope release `read-throughs`. Opt-in: GTA V's GPU time drops ~10 %
 /// with it, but ASTRO BOT stalls for 1-3 s several times a run (its CPU
 /// reads of the skipped pages fault and wait).
+/// `RPS5E_TABLE_BARRIER_MERGE=0`: when a new buffer's pages are written
+/// into several device-address page tables, each table write gets its own
+/// full barrier. Otherwise one barrier after the last orders them all:
+/// nothing recorded between them reads a table. A/B scope release
+/// `table-barrier-merge`.
+fn table_barrier_merge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_TABLE_BARRIER_MERGE")) && crate::backend::ab::release_fast("table-barrier-merge")
+}
+
+/// `RPS5E_THROUGH_DEDUPE=0`: every write-through of a batch records its
+/// own copy. Otherwise a range whose pages an earlier copy of the same
+/// batch covered records none: the batch's copies all follow the same
+/// writes, so that copy carried the bytes. A/B scope release
+/// `through-dedupe`.
+fn through_dedupe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_THROUGH_DEDUPE")) && crate::backend::ab::release_fast("through-dedupe")
+}
+
 pub(crate) fn read_throughs_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !crate::backend::ab::safe() && std::env::var("RPS5E_READ_THROUGHS").is_ok_and(|v| v == "1")) && crate::backend::ab::release_fast("read-throughs")
@@ -789,6 +829,27 @@ pub fn unranged_sync_enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("RPS5E_UNRANGED_SYNC").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
 }
 
+/// `RPS5E_UNRANGED_LOG=0`: every [`BufferCache::prepare_unranged_reads`]
+/// after a CPU write looks at every buffer. By default a pass after which
+/// only CPU writes happened (no buffer made or dropped, no mapping change)
+/// looks only at the buffers the tracker's dirty log names and those the
+/// previous pass left CPU-dirty: no other page can have become CPU-dirty
+/// or lost its import entry. A lost log entry falls back to the whole pass.
+fn unranged_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_UNRANGED_LOG")) && crate::backend::ab::release_fast("RPS5E_UNRANGED_LOG")
+}
+
+/// `RPS5E_INDEX_EXTENTS=0`: [`BufferCache::find_containing`] checks the
+/// range against the buffer found in the buffer map (a tree of thousands of
+/// buffers, a cache miss per level on the recording thread). By default
+/// the page index holds each buffer's extent with its key and answers
+/// alone (the same answer: buffers are disjoint and never resized).
+fn index_extents_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_INDEX_EXTENTS")) && crate::backend::ab::release_fast("RPS5E_INDEX_EXTENTS")
+}
+
 /// `RPS5E_UNRANGED_IMPORTS=0`: work reading through unbounded device
 /// addresses reads zeros where no mirror is (no import of guest memory).
 fn unranged_imports_enabled() -> bool {
@@ -850,6 +911,7 @@ impl BufferCache {
             known_fills: BTreeMap::new(),
             last_through_tick: 0,
             pending_through: Vec::new(),
+            batch_copied: Vec::new(),
             cp_write: false,
             unpublished_through: Vec::new(),
             readback: Default::default(),
@@ -867,6 +929,9 @@ impl BufferCache {
             mirrors_current: None,
             unranged: None,
             unranged_tried: false,
+            unranged_full: None,
+            unranged_carry: Vec::new(),
+            total_bytes: 0,
         })
     }
 
@@ -882,8 +947,13 @@ impl BufferCache {
         self.zero_copy = on;
     }
 
+    /// Write-through copies recorded so far.
+    pub fn through_copies(&self) -> u64 {
+        self.stats.through_copies
+    }
+
     pub fn stats(&self) -> BufferStats {
-        BufferStats { buffers: self.buffers.len(), bytes: self.buffers.values().map(|b| b.size).sum(), ..self.stats }
+        BufferStats { buffers: self.buffers.len(), bytes: self.total_bytes, ..self.stats }
     }
 
     /// Changes whenever GPU work may write guest memory (a use with
@@ -911,8 +981,16 @@ impl BufferCache {
     pub fn find_containing(&self, addr: u64, size: u64) -> Option<u64> {
         // Buffers are disjoint and cover whole caching pages: the page of
         // `addr` names the only candidate.
-        let k = *self.page_index.find(addr >> CACHING_PAGE_BITS)?;
-        (k != 0 && self.buffers.get(&k).is_some_and(|b| b.contains(addr, size))).then_some(k)
+        let (k, end) = *self.page_index.find(addr >> CACHING_PAGE_BITS)?;
+        if k == 0 {
+            return None;
+        }
+        // The index holds the buffer's extent (buffers never change size):
+        // no lookup in the buffer map (`RPS5E_INDEX_EXTENTS=0`: looked up).
+        if index_extents_enabled() {
+            return (addr >= k && addr.checked_add(size).is_some_and(|e| e <= end)).then_some(k);
+        }
+        self.buffers.get(&k).is_some_and(|b| b.contains(addr, size)).then_some(k)
     }
 
     /// The end of the run of buffers that mirror guest memory from `addr`
@@ -940,13 +1018,13 @@ impl BufferCache {
             match key {
                 Some(k) => {
                     if let Some(e) = self.page_index.get_or_create(p) {
-                        *e = k;
+                        *e = (k, addr + size);
                     }
                 }
                 None => {
                     if self.page_index.find(p).is_some() {
                         if let Some(e) = self.page_index.get_or_create(p) {
-                            *e = 0;
+                            *e = (0, 0);
                         }
                     }
                 }
@@ -1012,6 +1090,7 @@ impl BufferCache {
             self.stats.merges += 1;
             for k in &old {
                 let o = self.buffers.remove(k).unwrap();
+                self.total_bytes -= o.size;
                 self.layout_epoch += 1;
                 let region = vk::BufferCopy { src_offset: 0, dst_offset: o.addr - start, size: o.size };
                 // SAFETY: recording buffer; both buffers are alive.
@@ -1025,6 +1104,7 @@ impl BufferCache {
         if self.bda.is_some() || self.guest.is_some() || self.unranged.is_some() {
             self.write_bda_entries(sched, b.addr, b.size, b.buf.address);
         }
+        self.total_bytes += b.size;
         self.buffers.insert(start, b);
         self.layout_epoch += 1;
         crate::slice_shadow::changed(start, end - start);
@@ -1185,6 +1265,7 @@ impl BufferCache {
         if written {
             crate::slice_shadow::hole(crate::slice_shadow::Hole::WrittenRange);
             crate::slice_shadow::changed(addr, size);
+            crate::rt::watch::written(addr, size);
             self.stats.written_uses += 1;
         } else {
             self.stats.read_uses += 1;
@@ -1289,7 +1370,7 @@ impl BufferCache {
         if written {
             self.gpu_write_epoch += 1;
         }
-        let t0 = crate::backend::profile::on().then(std::time::Instant::now);
+        let t0 = crate::backend::profile::on().then(crate::backend::profile::span_now);
         // Stale GPU data of pages a CPU write touched must not be lost: the
         // tracker never has both, so uploading is enough.
         let key = self.find_or_create(sched, addr, size)?;
@@ -1348,7 +1429,7 @@ impl BufferCache {
             }
         }
         if let Some(t0) = t0 {
-            self.stats.upload_us += t0.elapsed().as_micros() as u64;
+            self.stats.upload_us += crate::backend::profile::micros_since(t0);
         }
         let tick = sched.current_tick();
         let b = self.buffers.get_mut(&key).unwrap();
@@ -1409,29 +1490,82 @@ impl BufferCache {
         if !changed && self.mirrors_current == Some(self.mirror_stamp()) {
             return 0;
         }
+        // Since the last pass only the CPU dirtied pages (no buffer made or
+        // dropped, no mapping change): the buffers to look at are the ones
+        // the dirty log names and the ones that pass left CPU-dirty.
+        let maps = self.unranged.as_ref().map_or(0, |g| g.stats.map_events);
+        let log = crate::memory::tracker::DirtyConsumer::Unranged;
+        let mut part: Option<Vec<u64>> = None;
+        if !changed && unranged_log_enabled() && self.unranged_full == Some((self.layout_epoch, maps)) {
+            if let crate::memory::tracker::DirtyDrain::Ranges(ranges) = self.tracker.drain_dirty_log(log) {
+                let mut keys = std::mem::take(&mut self.unranged_carry);
+                for (a, n) in ranges {
+                    keys.extend(self.overlapping(a, a + n));
+                }
+                keys.sort_unstable();
+                keys.dedup();
+                part = Some(keys);
+            } else {
+                self.stats.unranged_log_lost += 1;
+            }
+        }
+        if part.is_none() && unranged_log_enabled() {
+            // A whole pass reads the log from here on (writes before it are
+            // in the page states the pass reads).
+            self.tracker.enable_dirty_log(log);
+        }
         let tracker = &self.tracker;
-        let dirty: Vec<(u64, u64, u64)> = self.buffers.iter().filter(|(_, b)| tracker.has_cpu_dirty_pages(b.addr, b.size)).map(|(&k, b)| (k, b.addr, b.size)).collect();
+        let dirty: Vec<(u64, u64, u64)> = match &part {
+            Some(keys) => keys.iter().filter_map(|k| self.buffers.get(k).map(|b| (*k, b))).filter(|(_, b)| tracker.has_cpu_dirty_pages(b.addr, b.size)).map(|(k, b)| (k, b.addr, b.size)).collect(),
+            None => self.buffers.iter().filter(|(_, b)| tracker.has_cpu_dirty_pages(b.addr, b.size)).map(|(&k, b)| (k, b.addr, b.size)).collect(),
+        };
+        let mut failed = false;
         for &(key, addr, size) in &dirty {
             if !self.synchronize(sched, key, addr, size, None) {
                 log::warn!("ps5gpu: buffer upload of {addr:#x}+{size:#x} failed");
+                failed = true;
             }
         }
         if !dirty.is_empty() {
             self.stats.unranged_syncs += 1;
             self.stats.unranged_synced_buffers += dirty.len() as u64;
         }
+        if part.is_some() {
+            self.stats.unranged_partial += 1;
+        }
         // Every mirrored page with an import entry reads its mirror (now
-        // current): it holds GPU results guest memory may not have.
+        // current): it holds GPU results guest memory may not have. Only
+        // pages that were CPU-dirty at a pass can lack the entry (the rest
+        // were made resident then and stay so until the layout or the
+        // mappings change).
         if let Some(g) = self.unranged.as_mut() {
             let tracker = &self.tracker;
             let mut wrote = false;
-            for b in self.buffers.values() {
+            let mut visit = |b: &GpuBuffer| {
                 let (base, device) = (b.addr, b.buf.address);
                 wrote |= g.make_resident(sched, b.addr, b.addr + b.size, |page| device + (page - base), |page| !tracker.has_cpu_dirty_pages(page, CACHING_PAGE));
+            };
+            match &part {
+                Some(keys) => keys.iter().filter_map(|k| self.buffers.get(k)).for_each(&mut visit),
+                None => self.buffers.values().for_each(&mut visit),
             }
             if wrote {
                 sched.full_barrier();
             }
+        }
+        // The buffers still holding CPU-dirty pages (pages written during
+        // the pass, unwatched pages) are looked at again next time.
+        self.unranged_carry.clear();
+        if unranged_log_enabled() && !failed {
+            let tracker = &self.tracker;
+            let carry: Vec<u64> = match &part {
+                Some(keys) => keys.iter().copied().filter(|k| self.buffers.get(k).is_some_and(|b| tracker.has_cpu_dirty_pages(b.addr, b.size))).collect(),
+                None => self.buffers.iter().filter(|(_, b)| tracker.has_cpu_dirty_pages(b.addr, b.size)).map(|(&k, _)| k).collect(),
+            };
+            self.unranged_carry = carry;
+            self.unranged_full = Some((self.layout_epoch, self.unranged.as_ref().map_or(0, |g| g.stats.map_events)));
+        } else {
+            self.unranged_full = None;
         }
         self.mirrors_current = Some(self.mirror_stamp());
         dirty.len()
@@ -1599,7 +1733,7 @@ impl BufferCache {
         let _site = crate::backend::profile::DownloadSite::new(std::panic::Location::caller(), addr);
         self.remember_readback(&runs, false);
         self.flush_write_through(sched);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::backend::profile::span_now();
         log::trace!("ps5gpu: download {addr:#x}+{size:#x} on {:?}: {runs:x?}", std::thread::current().name());
         // Runs a command-processor write already wrote through: wait for it.
         let mut through: Vec<(u64, u64)> = Vec::new();
@@ -1621,8 +1755,9 @@ impl BufferCache {
         }
         let (staged, through_n, through_tick, current) = (runs.len(), through.len(), tick, sched.current_tick());
         let ok = runs.is_empty() || self.download_runs(sched, runs);
-        self.stats.download_us += t0.elapsed().as_micros() as u64;
-        log::trace!("ps5gpu: sync download {addr:#x}+{size:#x}: {staged} run(s) copied, {through_n} written through (tick {through_tick}, current {current}), {} us", t0.elapsed().as_micros());
+        let us = crate::backend::profile::micros_since(t0);
+        self.stats.download_us += us;
+        log::trace!("ps5gpu: sync download {addr:#x}+{size:#x}: {staged} run(s) copied, {through_n} written through (tick {through_tick}, current {current}), {us} us");
         ok
     }
 
@@ -1672,11 +1807,13 @@ impl BufferCache {
             sched.full_barrier();
         }
         self.batch_through = true;
+        self.batch_copied.clear();
         let mut copied = false;
         for (a, n) in ranges {
             copied |= self.write_through(sched, a, n);
         }
         self.batch_through = false;
+        self.batch_copied.clear();
         if self.guest.is_some() {
             host_read_barrier(&self.dev, sched);
             sched.full_barrier();
@@ -1709,6 +1846,7 @@ impl BufferCache {
             };
             let (src, base) = (self.buffers[&key].buf.buffer, self.buffers[&key].addr);
             let complete = self.guest.as_mut().is_some_and(|g| g.write_through(sched, src, base, start, end));
+            self.stats.through_copies += 1;
             crate::memory::history::note(crate::memory::history::Event::Through, start, end - start, sched.current_tick());
             if !self.batch_through {
                 host_read_barrier(&self.dev, sched);
@@ -1737,7 +1875,12 @@ impl BufferCache {
         let b = &self.buffers[&key];
         let region = vk::BufferCopy { src_offset: start - b.addr, dst_offset: start - b.addr + host.base, size: end - start };
         let host = host.buffer;
-        if crate::scheduler::hazard::range_barriers_enabled() {
+        // A range of a batch whose pages an earlier copy of the batch
+        // covered: that copy (after the same writes) carries its bytes.
+        let copied = self.batch_through && through_dedupe_enabled() && self.batch_copied.iter().any(|&(s, e)| s <= start && end <= e);
+        if copied {
+            self.stats.through_copies_shared += 1;
+        } else if crate::scheduler::hazard::range_barriers_enabled() {
             // The copy only reads the mirror (nothing on the GPU reads the
             // import): it waits for the compute writes of the range, later
             // writers of the range wait for it.
@@ -1746,6 +1889,8 @@ impl BufferCache {
             unsafe { self.dev.device.cmd_copy_buffer(cb, b.buf.buffer, host, &[region]) };
             if !self.batch_through {
                 sched.host_read_barrier();
+            } else if through_dedupe_enabled() {
+                self.batch_copied.push((start, end));
             }
         } else {
             // SAFETY: recording buffer; the device buffer and its import are alive until the tick completes.
@@ -1753,6 +1898,9 @@ impl BufferCache {
             host_read_barrier(&self.dev, sched);
         }
         crate::memory::history::note(crate::memory::history::Event::Through, start, end - start, sched.current_tick());
+        if !copied {
+            self.stats.through_copies += 1;
+        }
         self.written_through.push(ThroughSpan { start, end, tick: sched.current_tick(), staged: None });
         self.written_words.lock().written_through(start, end, addr, size, sched.current_tick());
         self.note_landing(start, end - start, sched.current_tick());
@@ -1842,7 +1990,7 @@ impl BufferCache {
         }
         crate::slice_shadow::hole(crate::slice_shadow::Hole::Download);
         crate::slice_shadow::changed(addr, size);
-        let t0 = std::time::Instant::now();
+        let t0 = crate::backend::profile::span_now();
         self.remember_readback(&runs, cpu);
         self.flush_write_through(sched);
         let done = sched.timeline.refresh();
@@ -1869,7 +2017,7 @@ impl BufferCache {
             // Spans recorded into the open command buffer: submit them.
             sched.flush();
         }
-        self.stats.download_us += t0.elapsed().as_micros() as u64;
+        self.stats.download_us += crate::backend::profile::micros_since(t0);
         if wait > done {
             DownloadStep::Wait(wait)
         } else {
@@ -2020,10 +2168,10 @@ impl BufferCache {
             if let Some(word_tick) = self.written_words.lock().landed(addr & !3, 4) {
                 let page_tick = self.written_through_tick(first, page);
                 if page_tick.map_or(word_landed_alone_enabled(), |p| word_tick <= p) {
-                    let t0 = std::time::Instant::now();
+                    let t0 = crate::backend::profile::span_now();
                     sched.wait(word_tick);
                     self.stats.word_landings += 1;
-                    self.stats.word_landing_us += t0.elapsed().as_micros() as u64;
+                    self.stats.word_landing_us += crate::backend::profile::micros_since(t0);
                     return true;
                 }
             }
@@ -2365,6 +2513,7 @@ impl BufferCache {
         self.readback.remove(addr, size);
         for k in self.overlapping(addr, addr + size) {
             let b = self.buffers.remove(&k).unwrap();
+            self.total_bytes -= b.size;
             self.layout_epoch += 1;
             self.index_pages(b.addr, b.size, None);
             self.tracker.untrack_memory(b.addr, b.size);
@@ -2469,7 +2618,9 @@ impl BufferCache {
     pub fn collect(&mut self, sched: &mut Scheduler, idle_before: u64) {
         let done = sched.timeline.refresh();
         self.finish_settled(done);
-        let total: u64 = self.buffers.values().map(|b| b.size).sum();
+        // The bytes of all buffers, kept as they are made and dropped.
+        let total = self.total_bytes;
+        debug_assert_eq!(total, self.buffers.values().map(|b| b.size).sum::<u64>());
         if total <= self.idle_threshold {
             return;
         }
@@ -2517,6 +2668,7 @@ impl BufferCache {
     /// Drop buffer `k` (its pages are no longer mirrored). Returns its size.
     fn release(&mut self, sched: &mut Scheduler, k: u64) -> u64 {
         let Some(b) = self.buffers.remove(&k) else { return 0 };
+        self.total_bytes -= b.size;
         self.layout_epoch += 1;
         self.index_pages(b.addr, b.size, None);
         self.tracker.untrack_memory(b.addr, b.size);
@@ -2540,7 +2692,7 @@ impl BufferCache {
     /// `frame_cutoff(frames)`: the scheduler tick before which entries have
     /// been idle for that many presented frames (see [`crate::gc::idle_frames`]).
     pub fn collect_pressure(&mut self, sched: &mut Scheduler, usage: Option<u64>, t: &crate::gc::Thresholds, ticks: &crate::gc::CollectionTicks, frame_cutoff: impl Fn(usize) -> u64) {
-        let usage = usage.unwrap_or_else(|| self.buffers.values().map(|b| b.size).sum());
+        let usage = usage.unwrap_or(self.total_bytes);
         if usage < t.trigger {
             return;
         }
@@ -2596,22 +2748,42 @@ impl BufferCache {
 
 
     fn write_bda_entries(&mut self, sched: &mut Scheduler, addr: u64, size: u64, device_address: u64) {
+        // One full barrier after the last table written orders all of them
+        // (nothing between reads a table; `RPS5E_TABLE_BARRIER_MERGE=0`: a
+        // barrier after each).
+        let merge = table_barrier_merge_enabled();
+        let mut owed = false;
         if let Some(g) = self.guest.as_mut() {
             if g.mirror_entries(sched, addr, size, device_address) {
-                sched.full_barrier();
+                owed = true;
             }
+        }
+        if owed && !merge {
+            sched.full_barrier();
+            owed = false;
         }
         if let Some(g) = self.unranged.as_mut().filter(|g| g.started()) {
             if g.mirror_entries(sched, addr, size, device_address) {
-                sched.full_barrier();
+                owed = true;
             }
         }
-        let Some(table) = &self.bda else { return };
+        let Some(table) = &self.bda else {
+            if owed {
+                sched.full_barrier();
+            }
+            return;
+        };
+        if owed && !merge {
+            sched.full_barrier();
+        }
         let first = addr >> CACHING_PAGE_BITS;
         // The table covers the low 1 TiB; buffers above it (guest stacks
         // and TLS high in the address space) have no entries. Writing them
         // landed past the table and faulted the GPU.
         if first >= BDA_PAGE_COUNT {
+            if owed && merge {
+                sched.full_barrier();
+            }
             return;
         }
         let count = (size >> CACHING_PAGE_BITS).min(BDA_PAGE_COUNT - first);
@@ -2663,7 +2835,7 @@ impl BufferCache {
                     Err(e) => log::warn!("ps5gpu: guest memory import table: {e:?}"),
                 }
                 if self.guest.is_some() {
-                    self.tracker.enable_dirty_log();
+                    self.tracker.enable_dirty_log(crate::memory::tracker::DirtyConsumer::Imports);
                     // Mirrors made before point the table at themselves
                     // where guest memory has no import.
                     let list: Vec<(u64, u64, u64)> = self.buffers.values().map(|b| (b.addr, b.size, b.buf.address)).collect();
@@ -2724,12 +2896,12 @@ impl BufferCache {
     /// The import-table pages that CPU writes made stale in their mirrors
     /// read guest memory again.
     fn evict_dirty(&mut self, sched: &mut Scheduler) {
-        if !self.tracker.dirty_log_pending() || self.guest.is_none() {
+        if !self.tracker.dirty_log_pending(crate::memory::tracker::DirtyConsumer::Imports) || self.guest.is_none() {
             return;
         }
         // Resident pages that may hold CPU writes now (16 KiB pages).
         let mut stale: Vec<u64> = Vec::new();
-        match self.tracker.drain_dirty_log() {
+        match self.tracker.drain_dirty_log(crate::memory::tracker::DirtyConsumer::Imports) {
             crate::memory::tracker::DirtyDrain::Ranges(ranges) => {
                 let g = self.guest.as_ref().unwrap();
                 for (a, n) in ranges {
@@ -2814,6 +2986,7 @@ impl BufferCache {
         }
         sched.full_barrier();
         self.batch_through = true;
+        self.batch_copied.clear();
         for (a, n) in runs {
             self.stats.lazy_throughs += 1;
             self.write_through(sched, a, n);
@@ -2958,6 +3131,11 @@ impl BufferCache {
     }
 
     /// GPU-written ranges wait to be written through ([`Self::flush_write_through`]).
+    /// Ranges waiting for their write-through.
+    pub fn pending_through_len(&self) -> usize {
+        self.pending_through.len()
+    }
+
     pub fn has_pending_through(&self) -> bool {
         !self.pending_through.is_empty()
     }

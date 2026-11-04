@@ -53,6 +53,7 @@ pub mod menu;
 pub mod page_table;
 pub mod pipeline;
 pub mod render;
+pub mod rt;
 pub mod scheduler;
 pub mod slice_shadow;
 pub mod slices;

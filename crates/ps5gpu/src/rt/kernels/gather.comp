@@ -1,0 +1,24 @@
+// RustPS5Emu (RPS5E)
+// Copyright (C) 2026 Vladislav Tislenko aka keklick1337
+// SPDX-License-Identifier: GPL-2.0-only
+
+// Copy `count` dwords of guest memory at `src` (through the page table) to
+// the device address `dst` (diagnostics: dumps of guest BVHs as the GPU
+// sees them).
+
+#version 460
+#include "guest.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P {
+    uint64_t src;
+    uint64_t dst;
+    uint count;
+    uint page_bits;
+    uint page_limit;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    Words(pc.dst).w[i] = GUEST_WORD(pc.src + uint64_t(i) * 4ul);
+}

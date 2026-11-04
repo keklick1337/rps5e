@@ -74,6 +74,7 @@ fn with(mut o: EmitOptions, name: &str, dev: &GpuDevice) -> EmitOptions {
         "half_fma_fast" => o.half_fma_fast = true,
         "nan_once" => o.nan_once = true,
         "zero_max" => o.zero_max = true,
+        "ds_int_min_max" => o.ds_int_min_max = true,
         _ => panic!("no switch {name}"),
     }
     o
@@ -97,6 +98,7 @@ fn without(mut o: EmitOptions, name: &str) -> EmitOptions {
         "half_fma_fast" => o.half_fma_fast = false,
         "nan_once" => o.nan_once = false,
         "zero_max" => o.zero_max = false,
+        "ds_int_min_max" => o.ds_int_min_max = false,
         _ => panic!("no switch {name}"),
     }
     o
@@ -913,6 +915,79 @@ fn emit_opt_half_fma_rounding_is_exact() {
                     }
                 }
             }
+        }
+    }
+    report(fails);
+}
+
+/// v1 = tid*8; v[2:3] = input[tid*2..] (memory value, source); the memory
+/// value is written to LDS at tid*4 + 0/512/1024/1536, then ds_min_rtn_f32
+/// v5 (+0), ds_max_rtn_f32 v6 (+512), ds_min_f32 (+1024), ds_max_f32
+/// (+1536) with the source; v[7:10] = the four words read back; stores
+/// v[5:8] and v[9:10] at tid*32 (s[4:7]). One lane per address.
+const DS_MIN_MAX_LANES: [u32; 38] = [
+    0x34020083, 0xe0341000, 0x80000201, 0x34080082, 0xbf8c3f70, 0xd8340000, 0x00000204, 0xd8340200, 0x00000204, 0xd8340400, 0x00000204, 0xd8340600,
+    0x00000204, 0xbf8cc07f, 0xd8c80000, 0x05000304, 0xd8cc0200, 0x06000304, 0xd8480400, 0x00000304, 0xd84c0600, 0x00000304, 0xbf8cc07f, 0xd8d80000,
+    0x07000004, 0xd8d80200, 0x08000004, 0xd8d80400, 0x09000004, 0xd8d80600, 0x0a000004, 0xbf8cc07f, 0x34160085, 0xe0781000, 0x8001050b, 0xe0741010,
+    0x8001090b, 0xbf810000,
+];
+
+/// v[2:3] = input[tid*2..]; LDS words 0, 4 and 8 = s8; every lane:
+/// ds_min_f32 at 0 and ds_max_f32 at 4 with v3, ds_min_rtn_f32 at 8 with
+/// v2; s_barrier; the three words read back are stored at tid*16. Every
+/// lane on the same addresses.
+const DS_MIN_MAX_SHARED: [u32; 32] = [
+    0x34020083, 0xe0341000, 0x80000201, 0x7e080280, 0xbf8c3f70, 0x7e0a0208, 0xd8340000, 0x00000504, 0xd8340004, 0x00000504, 0xd8340008, 0x00000504,
+    0xbf8cc07f, 0xd8480000, 0x00000304, 0xd84c0004, 0x00000304, 0xd8c80008, 0x06000204, 0xbf8cc07f, 0xbf8a0000, 0xd8d80000, 0x07000004, 0xd8d80004,
+    0x08000004, 0xd8d80008, 0x09000004, 0xbf8cc07f, 0x34160084, 0xe07c1000, 0x8001070b, 0xbf810000,
+];
+
+/// DS_MIN/MAX_F32 through the LDS integer atomics (`RPS5E_DS_INT_MIN_MAX`)
+/// give the words of the compare-exchange loop bit for bit (NaN payloads
+/// and quieting included): every pair of memory value and source among
+/// zeros, normals, infinities, quiet and signalling NaNs of both signs and
+/// denormals, one lane per address; and with every lane of the wave on one
+/// address, the sources with a key of their own over each kind of starting
+/// value. Both match the interpreter (NaNs alike).
+#[test]
+#[ignore]
+fn emit_opt_ds_float_min_max_matches_the_loop() {
+    let _devices = DevicesScope;
+    let values: [u32; 20] = [
+        0x0000_0000, 0x8000_0000, 0x3F80_0000, 0xBF80_0000, 0x4020_0000, 0xC040_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000, 0xFFC0_0000,
+        0x7F80_0001, 0xFF80_0001, 0x0000_0005, 0x8000_0005, 0x0000_0003, 0x7F7F_FFFF, 0xFF7F_FFFF, 0x0080_0000, 0x8080_0000, 0x7FC1_2345,
+    ];
+    let pairs: Vec<(u32, u32)> = values.iter().flat_map(|&m| values.iter().map(move |&v| (m, v))).collect();
+    let mut fails = Vec::new();
+    let compare = |tag: &str, r: &Run, fails: &mut Vec<String>| {
+        let (looped, want) = r.device(Emit::Without("ds_int_min_max"));
+        fails.extend(differences(tag, Emit::Without("ds_int_min_max"), &looped, &want));
+        for emit in [Emit::Default, Emit::New] {
+            let (got, _) = r.device(emit);
+            for (i, (a, b)) in got.iter().zip(&looped).enumerate() {
+                if a != b {
+                    fails.push(format!("{tag} {emit:?} word {i}: {a:#010x}, loop {b:#010x} (input {:08x?})", &r.input[(i / 8) * 2..(i / 8) * 2 + 2]));
+                }
+            }
+        }
+    };
+    for wave in [32u32, 64] {
+        for (k, chunk) in pairs.chunks(wave as usize).enumerate() {
+            if k % 8 == 0 {
+                reset_devices();
+            }
+            let input: Vec<u32> = chunk.iter().flat_map(|&(m, v)| [m, v]).collect();
+            let lanes = chunk.len() as u32;
+            let r = Run::new(&DS_MIN_MAX_LANES, wave, lanes, input, lanes as usize * 8);
+            compare(&format!("lanes w{wave} chunk {k}"), &r, &mut fails);
+        }
+        let unique: Vec<u32> = values.iter().copied().filter(|&v| v == 0 || ((v & 0x7FFF_FFFF) >= 0x0080_0000 && (v & 0x7FFF_FFFF) <= 0x7F80_0000)).collect();
+        reset_devices();
+        for start in [0x7FC0_0000u32, 0xFFC0_0000, 0x7F80_0000, 0xFF80_0000, 0, 0x8000_0000, 0x0000_0005, 0x3F80_0000] {
+            let input: Vec<u32> = (0..wave as usize).flat_map(|i| [unique[(i * 7 + 3) % unique.len()], unique[(i * 5 + 1) % unique.len()]]).collect();
+            let mut r = Run::new(&DS_MIN_MAX_SHARED, wave, wave, input, wave as usize * 4);
+            r.user = vec![start];
+            compare(&format!("shared w{wave} start {start:#010x}"), &r, &mut fails);
         }
     }
     report(fails);

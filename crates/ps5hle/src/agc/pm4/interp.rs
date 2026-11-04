@@ -175,6 +175,18 @@ pub(crate) fn is_gpu_label(addr: u64) -> bool {
 /// (write-throughs of read-through pages) wait for the GPU; the others are
 /// written once recorded. Without it, a label the CPU sees can come before
 /// those results, and the CPU reads the older bytes it was told are done.
+///
+/// `RPS5E_LABELS_AT_EOP=cpu`: end-of-pipe labels reach guest memory (the
+/// guest's CPU threads) once the GPU finished the work before them, as on
+/// the console, while the command processor's own reads (waits,
+/// conditions) see them as soon as the work before them is recorded: the
+/// GPU runs that work in recording order, so a queue waiting on such a
+/// label is recorded behind it. A CPU read of GPU results after such a
+/// label then finds them in guest memory instead of waiting for the GPU
+/// while holding the back-end (GTA V's main thread reads a 1x1 target
+/// after its label every frame). Opt-in: Demon's Souls and Minecraft
+/// freeze with it (a late label lands over command-buffer memory the game
+/// already reused: `dropped: bad packet header 0x00000001`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LabelMode {
     /// Written once the work before them is recorded.
@@ -183,6 +195,8 @@ pub(crate) enum LabelMode {
     AfterGpu,
     /// After the GPU only while write-throughs are pending.
     AfterWriteThroughs,
+    /// In guest memory after the GPU, to the command processor at once.
+    AfterGpuForCpu,
 }
 
 pub(crate) fn parse_label_mode(v: Option<&str>, bda: bool) -> LabelMode {
@@ -190,14 +204,20 @@ pub(crate) fn parse_label_mode(v: Option<&str>, bda: bool) -> LabelMode {
         Some("1") => LabelMode::AfterGpu,
         Some("0") => LabelMode::Recorded,
         Some("through") => LabelMode::AfterWriteThroughs,
+        Some("cpu") => LabelMode::AfterGpuForCpu,
         _ if bda => LabelMode::AfterGpu,
         _ => LabelMode::Recorded,
     }
 }
 
+/// The label mode now: `cpu` labels follow `RPS5E_AB_SCOPE=release
+/// RPS5E_AB_ONLY=cpu-labels` (slow periods write them when recorded).
 fn label_mode() -> LabelMode {
     static MODE: std::sync::OnceLock<LabelMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref(), ps5gpu::buffers::guest::bda_configured()))
+    match *MODE.get_or_init(|| parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref(), ps5gpu::buffers::guest::bda_configured())) {
+        LabelMode::AfterGpuForCpu if !ps5gpu::backend::ab::release_fast("cpu-labels") => LabelMode::Recorded,
+        m => m,
+    }
 }
 
 /// Whether an end-of-pipe label is written after the GPU finished the work
@@ -212,7 +232,7 @@ fn label_after_gpu(ex: &dyn RenderExecutor) -> bool {
 
 pub(crate) fn defer_in_mode(mode: LabelMode, ex: &dyn RenderExecutor) -> bool {
     match mode {
-        LabelMode::Recorded => false,
+        LabelMode::Recorded | LabelMode::AfterGpuForCpu => false,
         LabelMode::AfterGpu => true,
         LabelMode::AfterWriteThroughs => DEFERRED_LABELS.load(Ordering::Acquire) != 0 || ex.writes_through_pending(),
     }
@@ -231,6 +251,18 @@ pub(crate) fn defer_label(ex: &dyn RenderExecutor, write: impl FnOnce() + Send +
         // Queues waiting on the label poll it again.
         super::queue::global().retry_blocked();
     }))
+}
+
+/// The landing of a label written after the GPU (`RPS5E_LABELS_AT_EOP=cpu`):
+/// `write` stores it into guest memory; queues waiting on it poll again
+/// (the guest's reads now see it).
+fn landed_label(write: impl FnOnce() -> bool + Send + 'static) -> Box<dyn FnOnce() + Send> {
+    Box::new(move || {
+        if !write() && rare_warning(&WRITE_WARNINGS) {
+            log::warn!("[pm4] cannot write a label after the GPU");
+        }
+        super::queue::global().retry_blocked();
+    })
 }
 
 /// 100 MHz reference clock (EOP / COPY_DATA timestamps): the clock shaders
@@ -1148,6 +1180,10 @@ impl Interpreter {
     fn label32(&self, addr: u64, v: u32) {
         LABEL_WRITES.fetch_add(1, Ordering::Relaxed);
         match &self.executor {
+            Some(ex) if label_mode() == LabelMode::AfterGpuForCpu => {
+                note_gpu_label(addr);
+                ex.label_after_gpu(addr, &v.to_le_bytes(), landed_label(move || mem::write(addr, &v.to_le_bytes())));
+            }
             Some(ex) if label_after_gpu(ex.as_ref()) => {
                 note_gpu_label(addr);
                 defer_label(ex.as_ref(), move || {
@@ -1204,6 +1240,16 @@ impl Interpreter {
                 }
             };
             match &self.executor {
+                Some(ex) if label_mode() == LabelMode::AfterGpuForCpu => {
+                    // The command processor sees the value (the clock as the
+                    // packet is processed); guest memory gets it, with the
+                    // clock when the pipe drained, after the GPU.
+                    let bytes = v.unwrap_or_else(reference_clock).to_le_bytes();
+                    ex.label_after_gpu(dst, &bytes[..len], landed_label(move || {
+                        write();
+                        true
+                    }));
+                }
                 Some(ex) if label_after_gpu(ex.as_ref()) => defer_label(ex.as_ref(), write),
                 Some(ex) => {
                     // Written behind the work queued before it (the clock

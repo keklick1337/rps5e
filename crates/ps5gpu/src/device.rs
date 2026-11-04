@@ -181,8 +181,9 @@ pub struct DeviceCaps {
     /// [0, 1] are taken as the guest sets them (`RPS5E_DEPTH_UNRESTRICTED=0`
     /// clamps them).
     pub depth_range_unrestricted: bool,
-    /// VK_KHR_pipeline_executable_properties enabled (`RPS5E_PIPELINE_STATS=1`):
-    /// compute pipelines log the driver's statistics (registers, ...).
+    /// VK_KHR_pipeline_executable_properties enabled (`RPS5E_PIPELINE_STATS=1`
+    /// or `RPS5E_SPILL_VARIANTS`): compute pipelines capture the driver's
+    /// statistics (registers, spills, ...).
     pub pipeline_executable_info: bool,
     /// The host driver is AMD's proprietary Vulkan driver
     /// (VkPhysicalDeviceDriverProperties): its compiler turns a
@@ -192,6 +193,10 @@ pub struct DeviceCaps {
     /// instead (and its workgroup-scope memory fences do not order LDS
     /// updates).
     pub amd_proprietary: bool,
+    /// VK_KHR_acceleration_structure + VK_KHR_ray_query (with
+    /// VK_KHR_deferred_host_operations): host acceleration structures and
+    /// ray queries in compute shaders (`RPS5E_HW_RT`, [`crate::rt`]).
+    pub ray_query: bool,
 }
 
 /// The process-wide (or test-local) Vulkan device.
@@ -220,6 +225,8 @@ pub struct GpuDevice {
     raw_queue: vk::Queue,
     /// Conditional rendering commands (when `caps.conditional_rendering`).
     pub conditional: Option<ash::ext::conditional_rendering::Device>,
+    /// Acceleration-structure commands (when `caps.ray_query`).
+    pub accel: Option<ash::khr::acceleration_structure::Device>,
     fault_reported: std::sync::atomic::AtomicBool,
     /// Blocks device-local buffers are placed in (see [`crate::suballoc`]).
     pub arena: crate::suballoc::Arena,
@@ -663,8 +670,11 @@ impl GpuDevice {
         let mut robustf = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default();
         let mut execf = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
         let mut gplf = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default();
+        let want_rt = has(ash::khr::acceleration_structure::NAME) && has(ash::khr::ray_query::NAME) && has(ash::khr::deferred_host_operations::NAME) && crate::rt::requested();
+        let mut asf = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut rqf = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
         let want_gpl = has(ash::ext::graphics_pipeline_library::NAME) && has(ash::khr::pipeline_library::NAME) && crate::pipeline::library::requested();
-        let want_exec = std::env::var("RPS5E_PIPELINE_STATS").is_ok_and(|v| v == "1") && has(ash::khr::pipeline_executable_properties::NAME);
+        let want_exec = (std::env::var("RPS5E_PIPELINE_STATS").is_ok_and(|v| v == "1") || crate::pipeline::provider::spill_variants_enabled()) && has(ash::khr::pipeline_executable_properties::NAME);
         let mut maint8 = Maintenance8Features {
             s_type: vk::StructureType::from_raw(STRUCTURE_TYPE_MAINTENANCE8_FEATURES),
             p_next: std::ptr::null_mut(),
@@ -731,6 +741,9 @@ impl GpuDevice {
             }
             if want_gpl {
                 q = q.push_next(&mut gplf);
+            }
+            if want_rt {
+                q = q.push_next(&mut asf).push_next(&mut rqf);
             }
             if has(MAINTENANCE8_NAME) {
                 maint8.p_next = q.p_next;
@@ -838,6 +851,7 @@ impl GpuDevice {
             depth_range_unrestricted: has(ash::ext::depth_range_unrestricted::NAME) && !std::env::var("RPS5E_DEPTH_UNRESTRICTED").is_ok_and(|v| v == "0"),
             pipeline_executable_info: want_exec && execf.pipeline_executable_info != 0,
             amd_proprietary: false,
+            ray_query: want_rt && asf.acceleration_structure != 0 && rqf.ray_query != 0,
         };
         if has(ash::ext::sample_locations::NAME) {
             caps.sample_location_counts = sample_location_counts(&entry, &instance, phys);
@@ -940,7 +954,10 @@ impl GpuDevice {
             caps.swapchain = false;
         }
         crate::pipeline::state::set_depth_range_unrestricted(caps.depth_range_unrestricted);
-        let optional: [(bool, &CStr); 30] = [
+        let optional: [(bool, &CStr); 33] = [
+            (caps.ray_query, ash::khr::deferred_host_operations::NAME),
+            (caps.ray_query, ash::khr::acceleration_structure::NAME),
+            (caps.ray_query, ash::khr::ray_query::NAME),
             (caps.graphics_pipeline_library, ash::khr::pipeline_library::NAME),
             (caps.graphics_pipeline_library, ash::ext::graphics_pipeline_library::NAME),
             (!caps.sample_location_counts.is_empty(), ash::ext::sample_locations::NAME),
@@ -1054,6 +1071,8 @@ impl GpuDevice {
         let mut erobust = vk::PhysicalDevicePipelineRobustnessFeaturesEXT::default().pipeline_robustness(true);
         let mut eexec = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
         let mut egpl = vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT::default().graphics_pipeline_library(true);
+        let mut eas = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
+        let mut erq = vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
         let mut er2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default()
             .robust_buffer_access2(caps.robust_buffer_access2)
             .robust_image_access2(caps.robust_image_access2)
@@ -1145,6 +1164,9 @@ impl GpuDevice {
         if caps.graphics_pipeline_library {
             features2 = features2.push_next(&mut egpl);
         }
+        if caps.ray_query {
+            features2 = features2.push_next(&mut eas).push_next(&mut erq);
+        }
         if caps.maintenance8 {
             em8.p_next = features2.p_next;
             features2.p_next = &mut em8 as *mut _ as *mut c_void;
@@ -1164,6 +1186,7 @@ impl GpuDevice {
         let fault = caps.device_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device));
         let checkpoints = caps.diagnostic_checkpoints.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device));
         let conditional = caps.conditional_rendering.then(|| ash::ext::conditional_rendering::Device::new(&instance, &device));
+        let accel = caps.ray_query.then(|| ash::khr::acceleration_structure::Device::new(&instance, &device));
         Ok(GpuDevice {
             entry,
             instance,
@@ -1182,6 +1205,7 @@ impl GpuDevice {
             checkpoints,
             raw_queue: queue,
             conditional,
+            accel,
             fault_reported: std::sync::atomic::AtomicBool::new(false),
             arena: crate::suballoc::Arena::default(),
             image_arena: crate::suballoc::Arena::default(),

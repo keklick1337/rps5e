@@ -1169,3 +1169,47 @@ fn captured_gpu_results_are_not_recorded_as_cpu_writes() {
     shared.lock().unwrap().sched.flush_and_wait();
     dev.wait_idle();
 }
+
+/// A buffer made while two device-address page tables are kept (the BDA
+/// table and the table of unranged reads) has its pages written into both,
+/// behind one full barrier (`RPS5E_TABLE_BARRIER_MERGE`), and both point
+/// at it: stages reading either table after the barrier see the new
+/// mirror.
+#[test]
+#[ignore]
+fn new_buffers_reach_both_page_tables_behind_one_barrier() {
+    let (view, dev, shared, _tracker) = setup(0x22);
+    let mut g = shared.lock().unwrap();
+    let Shared { sched, cache } = &mut *g;
+    cache.bda_page_table(sched).unwrap();
+    cache.prepare_unranged_reads(sched);
+    let Some(unranged) = cache.unranged_table() else {
+        // No import table (RPS5E_UNRANGED_IMPORTS=0): nothing to merge.
+        return;
+    };
+    sched.full_barrier();
+    let before = sched.stats().full_barriers;
+    let addr = view + (1 << 20);
+    let key = cache.find_or_create(sched, addr, CACHING_PAGE).unwrap();
+    let barriers = sched.stats().full_barriers - before;
+    let page = addr >> CACHING_PAGE_BITS;
+    let unr = u64::from_le_bytes(read_device(&dev, sched, unranged, page * 8, 8).try_into().unwrap());
+    let device = cache.get(key).unwrap().buf.address + (addr - key);
+    // Pages imported from guest memory keep their import entry until the
+    // mirror is current; pages without one point at the mirror at once.
+    let both = unr == device;
+    if std::env::var("RPS5E_TABLE_BARRIER_MERGE").is_ok_and(|v| v == "0") {
+        assert_eq!(barriers, 1 + both as u64, "a barrier after each table");
+    } else {
+        assert_eq!(barriers, 1, "one barrier after the tables");
+    }
+    let (table, _) = cache.bda_page_table(sched).unwrap();
+    let bda = u64::from_le_bytes(read_device(&dev, sched, table, page * 8, 8).try_into().unwrap());
+    assert_eq!(bda, device, "BDA table entry");
+    // Made current, the page reads its mirror through the unranged table.
+    cache.prepare_unranged_reads(sched);
+    let unr = u64::from_le_bytes(read_device(&dev, sched, unranged, page * 8, 8).try_into().unwrap());
+    assert_eq!(unr, device, "unranged table entry");
+    drop(g);
+    dev.wait_idle();
+}

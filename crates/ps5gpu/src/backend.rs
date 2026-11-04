@@ -279,6 +279,9 @@ pub struct BackendStats {
     /// Ticks submitted early only for the write-throughs of ranges a CPU
     /// access waited for before (`RPS5E_EAGER_HOT_THROUGH`).
     pub hot_eager_throughs: u64,
+    /// Runs of writing dispatches whose write-throughs were recorded
+    /// together after the run (`RPS5E_THROUGH_RUNS`).
+    pub through_runs: u64,
 }
 
 /// Work recorded into the open tick since its first draw or dispatch.
@@ -287,7 +290,8 @@ struct EarlySubmit {
     tick: u64,
     draws: u32,
     dispatches: u32,
-    since: Option<std::time::Instant>,
+    /// [`profile::span_now`] at the tick's first item.
+    since: Option<u64>,
 }
 
 /// When the open tick is submitted before the end of its slice
@@ -398,6 +402,27 @@ fn eager_through_enabled() -> bool {
     ab::new_fast() && *ON.get_or_init(|| !ab::safe() && !std::env::var("RPS5E_EAGER_THROUGH").is_ok_and(|v| v == "0")) && ab::release_fast("eager-through")
 }
 
+/// `RPS5E_THROUGH_RUNS=0`: with eager write-throughs, the copies of a
+/// dispatch's written ranges follow that dispatch at once. Otherwise they
+/// follow the run of dispatches it belongs to: they are recorded before the
+/// next item that is not a dispatch (or at the next submit, CPU access or
+/// end of pipe, as before), once for the whole run. Every copy needs the
+/// compute writes before it finished (a barrier from the compute stage), so
+/// a copy after each dispatch drains the GPU between dispatches the hazard
+/// ranges leave unordered (GTA V's BVH refit chain: ~2000 small dispatches
+/// a frame, each with its copy); after the run one barrier orders them all.
+/// Both ways are exact: the copies read the mirrors after the writes, and
+/// pages wait for their copy to land before the CPU reads them, as with
+/// `RPS5E_EAGER_THROUGH=0`. A/B scope release `through-runs`.
+fn through_runs_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| ab::switch_on("RPS5E_THROUGH_RUNS")) && ab::release_fast("through-runs")
+}
+
+/// Pending write-through ranges at most before a run's copies are recorded
+/// anyway (the pending list is searched linearly when ranges are added).
+const THROUGH_RUN_MAX: usize = 256;
+
 /// `RPS5E_WHOLE_METADATA_WRITES=0`: a compute write of any size at a colour
 /// target's fast-clear metadata address is decided as a clear right away
 /// (default: only writes covering a whole metadata slice).
@@ -456,6 +481,9 @@ pub struct Backend {
     /// The last draw or dispatch was given up for a pending compile
     /// ([`Backend::take_compile_pending`]).
     compile_pending: bool,
+    /// Write-throughs of the dispatches recorded since the last other item
+    /// wait for the end of that run ([`through_runs_enabled`]).
+    through_run: bool,
     snapshots: Vec<Arc<Snapshot>>,
     trace_left: u32,
     housekeeping: u64,
@@ -917,6 +945,7 @@ impl Backend {
             pipelines: crate::pipeline::default_provider(dev, memory),
             stats: BackendStats::default(),
             compile_pending: false,
+            through_run: false,
             snapshots: Vec::new(),
             trace_left: trace_budget(),
             housekeeping: 0,
@@ -1714,7 +1743,15 @@ impl Backend {
         crate::capture::around(mem, || self.draw_inner(d), |_| Event::Draw(Box::new(d.clone())))
     }
 
+    /// The run of dispatches whose write-throughs wait ended: record them.
+    fn end_through_run(&mut self) {
+        if std::mem::take(&mut self.through_run) {
+            self.buffers.flush_write_through(&mut self.sched);
+        }
+    }
+
     fn draw_inner(&mut self, d: &ResolvedDraw) {
+        self.end_through_run();
         prefetch_value(d);
         self.stats.draws += 1;
         crate::perf::DRAWS.fetch_add(1, Ordering::Relaxed);
@@ -1858,7 +1895,7 @@ impl Backend {
             return;
         }
         let tick = self.sched.current_tick();
-        let now = std::time::Instant::now();
+        let now = profile::span_now();
         if self.early.tick != tick || self.early.since.is_none() {
             self.early = EarlySubmit { tick, draws: 0, dispatches: 0, since: Some(now) };
         }
@@ -1867,7 +1904,7 @@ impl Backend {
         } else {
             self.early.draws += 1;
         }
-        let micros = self.early.since.map_or(0, |t| now.duration_since(t).as_micros() as u64);
+        let micros = self.early.since.map_or(0, |t| profile::span_ns(t, now) / 1000);
         let scope_open = self.sched.rendering_scope().is_some();
         // Write-throughs waiting for the submit: CPU accesses wait for them.
         let through = self.buffers.has_pending_through();
@@ -2253,6 +2290,12 @@ impl Backend {
         Some(r)
     }
 
+    /// Commands recorded so far ([`crate::perf::items::COMMAND_NAMES`]).
+    fn command_counts(&self) -> crate::perf::items::Commands {
+        let s = self.sched.stats();
+        [s.full_barriers, s.compute_barriers, s.transfer_read_barriers, s.staging_read_barriers, s.image_barriers, s.submits, self.buffers.through_copies()]
+    }
+
     pub fn dispatch(&mut self, d: &ResolvedDispatch) {
         let mem = self.memory;
         crate::capture::around(mem, || self.dispatch_inner(d), |_| Event::Dispatch(Box::new(*d)))
@@ -2362,9 +2405,18 @@ impl Backend {
                 if submit_each() {
                     self.submit_isolated();
                 } else if eager_through_enabled() && self.buffers.has_pending_through() {
-                    // The copies of the ranges it wrote follow it now.
                     self.stats.eager_throughs += 1;
-                    self.buffers.flush_write_through(&mut self.sched);
+                    if through_runs_enabled() && self.buffers.pending_through_len() < THROUGH_RUN_MAX {
+                        // The copies follow the run of dispatches.
+                        if !self.through_run {
+                            self.stats.through_runs += 1;
+                        }
+                        self.through_run = true;
+                    } else {
+                        // The copies of the ranges it wrote follow it now.
+                        self.through_run = false;
+                        self.buffers.flush_write_through(&mut self.sched);
+                    }
                 } else if eager_hot_through_enabled() && self.buffers.has_hot_pending_through() {
                     // Only the ranges a CPU access waited for before: their
                     // copies follow the writer at once, and the submit lets
@@ -2616,6 +2668,7 @@ impl Backend {
             mem,
             || {
                 self.stats.end_of_pipe += 1;
+                self.through_run = false;
                 self.buffers.flush_write_through(&mut self.sched);
                 self.sched.queue_priority(done);
                 self.sched.flush();
@@ -2634,6 +2687,7 @@ impl Backend {
     }
 
     fn after_pipe_inner(&mut self, done: Box<dyn FnOnce() + Send>) {
+        self.through_run = false;
         self.buffers.flush_write_through(&mut self.sched);
         if self.sched.is_recording() {
             self.sched.queue_priority(done);
@@ -2669,6 +2723,7 @@ impl Backend {
     }
 
     fn flush_inner(&mut self) {
+        self.through_run = false;
         self.buffers.flush_write_through(&mut self.sched);
         if self.sched.is_recording() {
             self.sched.flush();
@@ -3793,6 +3848,16 @@ pub mod ab {
         CPU_NS[m].fetch_add(cpu_ns, Ordering::Relaxed);
     }
 
+    /// Dispatches recorded and their recording CPU nanoseconds, fast mode
+    /// then slow.
+    pub static DISPATCHES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    pub static DISPATCH_CPU_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    pub fn note_dispatch(fast: bool, cpu_ns: u64) {
+        let m = !fast as usize;
+        DISPATCHES[m].fetch_add(1, Ordering::Relaxed);
+        DISPATCH_CPU_NS[m].fetch_add(cpu_ns, Ordering::Relaxed);
+    }
+
     /// Flips, fast mode then slow: frames per mode, the game's own speed.
     pub static FLIPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     /// Flips longer than 100 ms after the one before (freezes), per mode.
@@ -3828,7 +3893,16 @@ pub mod ab {
             return String::new();
         }
         let g = |a: &[AtomicU64; 2]| [a[0].load(Ordering::Relaxed), a[1].load(Ordering::Relaxed)];
-        format!(" ab_draws={:?} ab_cpu_ms={:?} ab_flips={:?} ab_freezes={:?} ab_gpu_ms={:?}", g(&DRAWS), g(&CPU_NS).map(|n| n / 1_000_000), g(&FLIPS), g(&FREEZES), g(&GPU_NS).map(|n| n / 1_000_000))
+        format!(
+            " ab_draws={:?} ab_cpu_ms={:?} ab_dispatches={:?} ab_dispatch_cpu_ms={:?} ab_flips={:?} ab_freezes={:?} ab_gpu_ms={:?}",
+            g(&DRAWS),
+            g(&CPU_NS).map(|n| n / 1_000_000),
+            g(&DISPATCHES),
+            g(&DISPATCH_CPU_NS).map(|n| n / 1_000_000),
+            g(&FLIPS),
+            g(&FREEZES),
+            g(&GPU_NS).map(|n| n / 1_000_000)
+        )
     }
 }
 
@@ -3861,18 +3935,98 @@ pub(crate) mod profile {
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
         ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
+    /// Draws per thread CPU measurement of [`time_cpu`]
+    /// (`RPS5E_PROFILE_CPU_EVERY`, default 8; `1`: every draw).
+    fn cpu_every() -> u32 {
+        static N: OnceLock<u32> = OnceLock::new();
+        *N.get_or_init(|| std::env::var("RPS5E_PROFILE_CPU_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(8))
+    }
+    thread_local! {
+        static CPU_SAMPLE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
     /// `draw_cpu`: the thread CPU time of `f`; `cmd_cpu`: the total CPU
-    /// time of the command thread (the thread that records draws).
+    /// time of the command thread (the thread that records draws). The
+    /// thread clock is a system call: one draw in [`cpu_every`] is
+    /// measured and counts for all of them.
     pub fn time_cpu<R>(f: impl FnOnce() -> R) -> R {
         if !on() {
+            return f();
+        }
+        let every = cpu_every();
+        let sampled = CPU_SAMPLE.try_with(|c| {
+            let n = c.get();
+            c.set(if n + 1 >= every { 0 } else { n + 1 });
+            n == 0
+        });
+        if !sampled.unwrap_or(true) {
             return f();
         }
         let t = thread_cpu();
         let r = f();
         let now = thread_cpu();
-        add(33, now - t);
+        add(33, (now - t) * every as u64);
         NANOS[34].store(now, Ordering::Relaxed);
         r
+    }
+    /// The clock of the profile's spans: the time stamp counter where it
+    /// runs at a constant rate (one instruction, no shared clock page the
+    /// cache-bound recording thread would miss on), otherwise the
+    /// monotonic clock. [`span_now`] reads it, [`span_ns`] turns a
+    /// difference into nanoseconds.
+    #[cfg(target_arch = "x86_64")]
+    fn tsc_ns_per_tick() -> f64 {
+        static R: OnceLock<f64> = OnceLock::new();
+        *R.get_or_init(|| {
+            // CPUID 0x8000_0007 EDX bit 8: invariant TSC.
+            let invariant = {
+                let max = std::arch::x86_64::__cpuid(0x8000_0000).eax;
+                max >= 0x8000_0007 && std::arch::x86_64::__cpuid(0x8000_0007).edx & (1 << 8) != 0
+            };
+            if !invariant || std::env::var("RPS5E_PROFILE_TSC").is_ok_and(|v| v == "0") {
+                return 0.0;
+            }
+            // SAFETY: rdtsc has no side effects.
+            let (t0, c0) = (std::time::Instant::now(), unsafe { std::arch::x86_64::_rdtsc() });
+            while t0.elapsed() < std::time::Duration::from_millis(5) {
+                std::hint::spin_loop();
+            }
+            // SAFETY: as above.
+            let (ns, c1) = (t0.elapsed().as_nanos() as f64, unsafe { std::arch::x86_64::_rdtsc() });
+            if c1 > c0 { ns / (c1 - c0) as f64 } else { 0.0 }
+        })
+    }
+    fn span_start() -> std::time::Instant {
+        static S: OnceLock<std::time::Instant> = OnceLock::new();
+        *S.get_or_init(std::time::Instant::now)
+    }
+    /// The span clock now (see [`tsc_ns_per_tick`]).
+    #[inline]
+    pub fn span_now() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        if tsc_ns_per_tick() > 0.0 {
+            // SAFETY: rdtsc has no side effects.
+            return unsafe { std::arch::x86_64::_rdtsc() };
+        }
+        span_start().elapsed().as_nanos() as u64
+    }
+    /// Nanoseconds between two [`span_now`] readings.
+    #[inline]
+    /// Microseconds since `from` (a [`span_now`] reading): the cheap
+    /// clock of the recording thread's own statistics (the system clock
+    /// was ~2 % of its time).
+    pub fn micros_since(from: u64) -> u64 {
+        span_ns(from, span_now()) / 1000
+    }
+    pub fn span_ns(from: u64, to: u64) -> u64 {
+        let d = to.saturating_sub(from);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r = tsc_ns_per_tick();
+            if r > 0.0 {
+                return (d as f64 * r) as u64;
+            }
+        }
+        d
     }
     /// `RPS5E_PROFILE_LOCAL=0`: every span is added to the shared counters
     /// at once (two threads recording contend on their cache lines).
@@ -3943,6 +4097,17 @@ pub(crate) mod profile {
         use super::*;
 
         #[test]
+        fn span_clock_counts_nanoseconds() {
+            // The first reading calibrates the clock (a few milliseconds).
+            span_now();
+            let (t, c) = (std::time::Instant::now(), span_now());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let (wall, span) = (t.elapsed().as_nanos() as f64, span_ns(c, span_now()) as f64);
+            assert!((span - wall).abs() < wall * 0.02 + 50_000.0, "span clock {span} ns vs monotonic {wall} ns");
+            assert_eq!(span_ns(10, 5), 0, "a reading before the start counts nothing");
+        }
+
+        #[test]
         fn thread_local_spans_reach_the_shared_counters() {
             let before = NANOS[30].load(Ordering::Relaxed);
             add(30, 5);
@@ -3974,15 +4139,15 @@ pub(crate) mod profile {
 
     /// Consecutive spans of one function: `lap(k)` charges the time since
     /// the previous lap (or creation) to span `k`.
-    pub struct Lap(Option<std::time::Instant>);
+    pub struct Lap(Option<u64>);
     impl Lap {
         pub fn start() -> Lap {
-            Lap(on().then(std::time::Instant::now))
+            Lap(on().then(span_now))
         }
         pub fn lap(&mut self, k: usize) {
             if let Some(t) = &mut self.0 {
-                let now = std::time::Instant::now();
-                add(k, (now - *t).as_nanos() as u64);
+                let now = span_now();
+                add(k, span_ns(*t, now));
                 *t = now;
             }
         }
@@ -4003,9 +4168,9 @@ pub(crate) mod profile {
         if !on() {
             return f();
         }
-        let t = std::time::Instant::now();
+        let t = span_now();
         let r = f();
-        add(k, t.elapsed().as_nanos() as u64);
+        add(k, span_ns(t, span_now()));
         r
     }
     /// [`Self::time`] for the sub-phase spans (>= [`BASE_SPANS`]):
@@ -4014,9 +4179,9 @@ pub(crate) mod profile {
         if !detailed() {
             return f();
         }
-        let t = std::time::Instant::now();
+        let t = span_now();
         let r = f();
-        add(k, t.elapsed().as_nanos() as u64);
+        add(k, span_ns(t, span_now()));
         r
     }
     /// Fault downloads per 1 MiB window (open addressing, no allocation:
@@ -4179,6 +4344,10 @@ pub(crate) mod profile {
         /// this thread (0: none): synchronous downloads name it.
         static PREPARING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
+    /// The program whose preparation runs on this thread (0: none).
+    pub fn preparing_program() -> u64 {
+        PREPARING.with(|c| c.get())
+    }
     /// Run `f` with `program` noted as the program being prepared.
     pub fn preparing<T>(program: u64, f: impl FnOnce() -> T) -> T {
         let old = PREPARING.with(|c| c.replace(program));
@@ -4206,8 +4375,8 @@ pub(crate) mod profile {
             }
         }
     }
-    /// Full barriers by call site: count.
-    static BARRIERS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32), u64>>> = std::sync::Mutex::new(None);
+    /// Full barriers by call site and program being recorded: count.
+    static BARRIERS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32, u64), u64>>> = std::sync::Mutex::new(None);
     /// `RPS5E_BARRIER_SITES=1` (with the profile): full barriers counted by
     /// call site in the summary.
     fn barrier_sites() -> bool {
@@ -4220,7 +4389,8 @@ pub(crate) mod profile {
         }
         let file = at.file().rsplit('/').next().unwrap_or("");
         let mut g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
-        *g.get_or_insert_with(Default::default).entry((file, at.line())).or_default() += 1;
+        let program = WORK.load(Ordering::Relaxed) & ((1 << 56) - 1);
+        *g.get_or_insert_with(Default::default).entry((file, at.line(), program)).or_default() += 1;
     }
     /// Blocking GPU waits by call site: count and wall nanoseconds.
     static WAITS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32, u64), (u64, u64)>>> = std::sync::Mutex::new(None);
@@ -4274,9 +4444,9 @@ pub(crate) mod profile {
     fn barrier_line() -> String {
         let g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(m) = g.as_ref() else { return String::new() };
-        let mut v: Vec<(&(&str, u32), &u64)> = m.iter().collect();
+        let mut v: Vec<(&(&str, u32, u64), &u64)> = m.iter().collect();
         v.sort_unstable_by(|a, b| b.1.cmp(a.1));
-        v.iter().take(8).map(|((f, l), n)| format!("{f}:{l}:{n}")).collect::<Vec<_>>().join(" ")
+        v.iter().take(12).map(|((f, l, p), n)| if *p != 0 { format!("{f}:{l}<-p{p:#x}:{n}") } else { format!("{f}:{l}:{n}") }).collect::<Vec<_>>().join(" ")
     }
     fn download_line() -> String {
         let g = DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
@@ -4461,6 +4631,14 @@ fn recent_key<T: PartialEq + Copy>(memo: &mut Vec<(T, crate::images::ImageKey)>,
 /// The [`RenderExecutor`] the PM4 interpreter uses.
 pub struct GpuExecutor;
 
+/// End-of-pipe labels of the direct path waiting for the GPU work before
+/// them ([`RenderExecutor::label_after_gpu`]): the interpreter's reads see
+/// their bytes over guest memory until they land.
+fn direct_labels() -> &'static Arc<crate::slices::pending::PendingEvents> {
+    static LABELS: OnceLock<Arc<crate::slices::pending::PendingEvents>> = OnceLock::new();
+    LABELS.get_or_init(Default::default)
+}
+
 /// Device memory in use at the last memory-pressure collection (MiB).
 static GC_USAGE_MIB: AtomicU64 = AtomicU64::new(0);
 
@@ -4502,7 +4680,14 @@ impl RenderExecutor for GpuExecutor {
             // unlocked (CPU faults on GPU-written pages need it meanwhile).
             let program = if draw.shaders.ps.address != 0 { draw.shaders.ps.address } else { draw.shaders.vertex_program_address() };
             let ran = crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
-                let r = crate::perf::items::measure(crate::perf::items::DRAW, program, || profile::time_cpu(|| profile::time(0, || with_backend(|b| (b.draw(draw), b.take_compile_pending()).1))));
+                let r = crate::perf::items::measure(crate::perf::items::DRAW, program, || profile::time_cpu(|| profile::time(0, || with_backend(|b| {
+                    let c0 = crate::perf::items::enabled().then(|| b.command_counts());
+                    let r = (b.draw(draw), b.take_compile_pending()).1;
+                    if let Some(c0) = c0 {
+                        crate::perf::items::note_commands(c0, b.command_counts());
+                    }
+                    r
+                }))));
                 (r.is_some(), r == Some(true))
             });
             if !ran {
@@ -4517,10 +4702,21 @@ impl RenderExecutor for GpuExecutor {
     fn dispatch(&self, dispatch: &ResolvedDispatch) {
         shadow::item(shadow::Kind::Dispatch, 0, || {
             profile::set_work(profile::WORK_DISPATCH, dispatch.shader.address);
+            let measured = ab::enabled().then(|| (ab::mode_fast(), profile::thread_cpu()));
             crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
-                let r = crate::perf::items::measure(crate::perf::items::DISPATCH, dispatch.shader.address, || profile::time(1, || with_backend(|b| (b.dispatch(dispatch), b.take_compile_pending()).1)));
+                let r = crate::perf::items::measure(crate::perf::items::DISPATCH, dispatch.shader.address, || profile::time(1, || with_backend(|b| {
+                    let c0 = crate::perf::items::enabled().then(|| b.command_counts());
+                    let r = (b.dispatch(dispatch), b.take_compile_pending()).1;
+                    if let Some(c0) = c0 {
+                        crate::perf::items::note_commands(c0, b.command_counts());
+                    }
+                    r
+                })));
                 ((), r == Some(true))
             });
+            if let Some((fast, t)) = measured {
+                ab::note_dispatch(fast, profile::thread_cpu() - t);
+            }
         })
     }
 
@@ -4538,6 +4734,19 @@ impl RenderExecutor for GpuExecutor {
 
     fn write_ordered(&self, addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
         ordered_cp_write(addr, data, write);
+    }
+
+    fn label_after_gpu(&self, addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        let labels = direct_labels().clone();
+        let serial = labels.add(addr, data.len() as u64, Some(crate::slices::pending::EventData::Bytes(data.to_vec())));
+        self.after_pipe(Box::new(move || {
+            write();
+            labels.remove(serial);
+        }));
+    }
+
+    fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
+        direct_labels().compose(addr, out, read).unwrap_or_else(|| read(out))
     }
 
     fn memory_filled(&self, addr: u64, size: u64, value: u32) {
@@ -5352,10 +5561,29 @@ impl RenderExecutor for QueuedExecutor {
         })));
     }
 
+    fn label_after_gpu(&self, addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        // Kept with the queued transfers (in queue order) until it landed:
+        // the interpreter's reads see it from now on.
+        let transfers = self.transfers.clone();
+        let serial = transfers.add(addr, data.len() as u64, Some(crate::slices::pending::EventData::Bytes(data.to_vec())));
+        let land: Box<dyn FnOnce() + Send> = Box::new(move || {
+            write();
+            transfers.remove(serial);
+        });
+        if !self.recording() {
+            return GpuExecutor.after_pipe(land);
+        }
+        self.send(Recorded::AfterPipe(land));
+    }
+
     fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
         if !pipeline_route() {
             self.drain();
-            return read(out);
+            // Labels waiting for the GPU stay among the transfers.
+            return match self.transfers.compose(addr, out, read) {
+                Some(ok) => ok,
+                None => read(out),
+            };
         }
         // Queued transfers over the range, in queue order, taken before
         // memory is read: one that runs meanwhile writes the same bytes.
@@ -5404,7 +5632,7 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | refills by caller: {}", b.images.refill_callers_top(24)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB, chunk-views {}) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, fault-runs {}/{}p of {} heated, premarked {}/{}p, sync points {} ticks={} eager={}/{}hot req={} scopes={} merged={} ends={:?} barriers={}/{}img clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB, chunk-views {}) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, fault-runs {}/{}p of {} heated, premarked {}/{}p, sync points {} ticks={} eager={}/{}hot/{}runs req={} scopes={} merged={} ends={:?} barriers={}/{}cs/{}xfer/{}img through-copies={} clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -5492,12 +5720,16 @@ fn summary_locked() -> Option<String> {
             // (only the ranges a CPU access waited for before):
             s.eager_throughs,
             s.hot_eager_throughs,
+            s.through_runs,
             s.submit_requests,
             b.sched.stats().rendering_scopes,
             b.sched.stats().merged_draws,
             b.sched.stats().scope_ends,
             b.sched.stats().full_barriers,
+            b.sched.stats().compute_barriers,
+            b.sched.stats().transfer_read_barriers,
             b.sched.stats().image_barriers,
+            bf.through_copies,
             bf.clean_skips,
             bf.memo_reads,
             bf.read_uses,
@@ -5517,7 +5749,7 @@ fn summary_locked() -> Option<String> {
             b.dev.arena.stats().live,
             b.dev.arena.stats().used_bytes >> 20,
             provider
-        ) + &format!(" unranged-syncs={}/{}buf", bf.unranged_syncs, bf.unranged_synced_buffers) + &format!(" watch-index-misses={}", crate::images::WATCH_INDEX_MISSES.load(Ordering::Relaxed))
+        ) + &format!(" unranged-syncs={}/{}buf/{}part/{}lost", bf.unranged_syncs, bf.unranged_synced_buffers, bf.unranged_partial, bf.unranged_log_lost) + &format!(" watch-index-misses={}", crate::images::WATCH_INDEX_MISSES.load(Ordering::Relaxed))
             + &format!(" unwritten-words={} landed-words={}", crate::buffers::UNWRITTEN_WORD_READS.load(Ordering::Relaxed), crate::buffers::LANDED_WORD_READS.load(Ordering::Relaxed))
             + &format!(" scope-breakers=[{}]", crate::scheduler::scope_breakers_line())
             + &gpu_time_line(b.sched.stats().gpu, &b.sched.gpu_top(gpu_top_count()))

@@ -137,10 +137,16 @@ fn cb_get_event(ctx: &mut CpuContext) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     let n = local_user_count();
-    let next = LOGIN_EVENTS_SENT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| (s < n).then_some(s + 1));
-    let Ok(index) = next else {
-        return ERR_NO_EVENT;
-    };
+    let mut index = LOGIN_EVENTS_SENT.load(Ordering::SeqCst);
+    loop {
+        if index >= n {
+            return ERR_NO_EVENT;
+        }
+        match LOGIN_EVENTS_SENT.compare_exchange_weak(index, index + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(now) => index = now,
+        }
+    }
     let mut ev = [0u8; 8];
     ev[4..8].copy_from_slice(&user_id(index).to_le_bytes());
     if ctx.write_bytes(out, &ev) { OK } else { ERR_INVALID_ARGUMENT }

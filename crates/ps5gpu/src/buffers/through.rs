@@ -9,7 +9,10 @@
 //! compute-heavy frames bind written buffers thousands of times while up
 //! to [`ThroughSpans::MAX`] spans are remembered. Spans are kept by start
 //! address with the largest span length, so a lookup visits only the spans
-//! that start within that length before its range. Each span carries its
+//! that start within that length before its range. Spans longer than
+//! [`LONG`] are also listed apart and looked at one by one: one long span
+//! would otherwise widen every lookup to all spans within its length
+//! (`RPS5E_THROUGH_LONG=0`: the bound covers them too). Each span carries its
 //! insertion number: overlapping spans answer newest first, and the oldest
 //! half is dropped when the list is full. `RPS5E_THROUGH_INDEX=0` (or a
 //! slow period of A/B scope `release`) answers every lookup by a scan of
@@ -24,14 +27,26 @@ pub(super) struct ThroughSpans {
     map: BTreeMap<(u64, u64), ThroughSpan>,
     /// Insertion numbers handed out.
     seq: u64,
-    /// No span is longer (recomputed when the list is trimmed).
+    /// No span outside `long` is longer (recomputed when the list is
+    /// trimmed).
     max_len: u64,
+    /// Keys of the spans longer than [`LONG`] (with `RPS5E_THROUGH_LONG`).
+    long: std::collections::BTreeSet<(u64, u64)>,
 }
+
+/// Spans longer than this are listed apart (see the module comment).
+pub(super) const LONG: u64 = 64 << 10;
 
 /// Lookups use the index now.
 fn indexed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_THROUGH_INDEX")) && crate::backend::ab::release_fast("RPS5E_THROUGH_INDEX")
+}
+
+/// Long spans are listed apart (read once: the lists are built by it).
+fn long_listed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_THROUGH_LONG"))
 }
 
 impl ThroughSpans {
@@ -40,7 +55,31 @@ impl ThroughSpans {
 
     pub fn clear(&mut self) {
         self.map.clear();
+        self.long.clear();
         self.max_len = 0;
+    }
+
+    fn is_long(span: &ThroughSpan) -> bool {
+        long_listed() && span.end - span.start > LONG
+    }
+
+    /// Insert span `span` under key `k`.
+    fn put(&mut self, k: (u64, u64), span: ThroughSpan) {
+        if Self::is_long(&span) {
+            self.long.insert(k);
+        } else {
+            self.max_len = self.max_len.max(span.end - span.start);
+        }
+        self.map.insert(k, span);
+    }
+
+    /// Take the span under key `k` out.
+    fn take(&mut self, k: &(u64, u64)) -> ThroughSpan {
+        let sp = self.map.remove(k).expect("listed span");
+        if Self::is_long(&sp) {
+            self.long.remove(k);
+        }
+        sp
     }
 
     /// Remember a span (the newest). A full list drops its oldest half.
@@ -49,8 +88,7 @@ impl ThroughSpans {
             self.trim(Self::MAX / 2);
         }
         self.seq += 1;
-        self.max_len = self.max_len.max(span.end - span.start);
-        self.map.insert((span.start, self.seq), span);
+        self.put((span.start, self.seq), span);
     }
 
     /// Drop the `n` oldest spans.
@@ -62,7 +100,8 @@ impl ThroughSpans {
         }
         let (_, &mut cutoff, _) = seqs.select_nth_unstable(n);
         self.map.retain(|k, _| k.1 >= cutoff);
-        self.max_len = self.map.values().map(|s| s.end - s.start).max().unwrap_or(0);
+        self.long.retain(|k| k.1 >= cutoff);
+        self.max_len = self.map.values().filter(|s| !Self::is_long(s)).map(|s| s.end - s.start).max().unwrap_or(0);
     }
 
     /// Keys of the spans overlapping `[start, end)`, in no particular order.
@@ -71,21 +110,20 @@ impl ThroughSpans {
     }
 
     /// The spans overlapping `[start, end)` with their keys, in no
-    /// particular order.
+    /// particular order: the ones starting within the short spans' length
+    /// before it, then the long ones starting before that.
     fn overlapping(&self, start: u64, end: u64) -> impl Iterator<Item = (&(u64, u64), &ThroughSpan)> + '_ {
-        let (from, to) = if indexed() { ((start.saturating_sub(self.max_len), 0), (end, 0)) } else { ((0, 0), (u64::MAX, u64::MAX)) };
-        self.map.range(from..to).filter(move |(_, s)| s.start < end && start < s.end)
+        let indexed = indexed();
+        let from = start.saturating_sub(self.max_len);
+        let (lo, hi) = if indexed { ((from, 0), (end, 0)) } else { ((0, 0), (u64::MAX, u64::MAX)) };
+        let near = self.map.range(lo..hi);
+        let far = self.long.range(..(if indexed { from } else { 0 }, 0)).map(|k| (k, &self.map[k]));
+        near.chain(far).filter(move |(_, s)| s.start < end && start < s.end)
     }
 
     /// Whether a span overlaps `[start, end)`.
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
-        let hit = |s: &ThroughSpan| s.start < end && start < s.end;
-        if indexed() {
-            let from = start.saturating_sub(self.max_len);
-            self.map.range((from, 0)..(end, 0)).any(|(_, s)| hit(s))
-        } else {
-            self.map.values().any(hit)
-        }
+        self.overlapping(start, end).next().is_some()
     }
 
     /// The spans overlapping `[start, end)`, oldest first (the parts of
@@ -105,12 +143,12 @@ impl ThroughSpans {
     /// their age).
     pub fn cut(&mut self, start: u64, end: u64) {
         for k in self.overlapping_keys(start, end) {
-            let sp = self.map.remove(&k).expect("listed span");
+            let sp = self.take(&k);
             if sp.start < start {
-                self.map.insert((sp.start, k.1), sp.part(sp.start, start));
+                self.put((sp.start, k.1), sp.part(sp.start, start));
             }
             if sp.end > end {
-                self.map.insert((end, k.1), sp.part(end, sp.end));
+                self.put((end, k.1), sp.part(end, sp.end));
             }
         }
     }
@@ -119,7 +157,7 @@ impl ThroughSpans {
     pub fn remove_inside(&mut self, start: u64, end: u64) {
         for k in self.overlapping_keys(start, end) {
             if self.map[&k].start >= start && self.map[&k].end <= end {
-                self.map.remove(&k);
+                self.take(&k);
             }
         }
     }
@@ -159,7 +197,7 @@ mod tests {
         for step in 0..20_000u64 {
             let r = next();
             let a = (r % 4096) * page;
-            let n = [1, 2, 16, 300, 2000][(r >> 20) as usize % 5] * page;
+            let n = [1, 2, 16, 300, 2000, 17, 64][(r >> 20) as usize % 7] * page;
             match (r >> 40) % 8 {
                 0..=3 => {
                     if model.len() >= ThroughSpans::MAX {

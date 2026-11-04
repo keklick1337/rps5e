@@ -1111,6 +1111,13 @@ pub trait RenderExecutor: Send + Sync {
     fn write_ordered(&self, _addr: u64, _data: &[u8], write: Box<dyn FnOnce() + Send>) {
         write();
     }
+    /// An end-of-pipe label (`addr`, `data`) the guest CPU sees once the
+    /// GPU finished the work recorded before it, while the interpreter's
+    /// own reads ([`Self::read_ordered`]) see it at once: `write` stores it
+    /// into guest memory after that work (`RPS5E_LABELS_AT_EOP=cpu`).
+    fn label_after_gpu(&self, _addr: u64, _data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        self.after_pipe(write);
+    }
     /// A CPU read of the interpreter: what `read` finds in guest memory
     /// with the transfers queued over the range applied.
     fn read_ordered(&self, _addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {

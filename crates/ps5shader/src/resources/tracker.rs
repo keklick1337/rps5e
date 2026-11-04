@@ -637,6 +637,7 @@ impl Tracker<'_> {
         if memory.opcode.is_ray_intersect() {
             // BVH nodes are read through the device-address page table.
             self.info.uses_device_addresses = true;
+            self.info.uses_bvh = true;
             return Ok(());
         }
         if !is_buffer && !is_address && !is_image {

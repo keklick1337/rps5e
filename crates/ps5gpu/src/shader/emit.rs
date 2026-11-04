@@ -867,6 +867,22 @@ impl<'a, 'p> Emitter<'a, 'p> {
         v
     }
 
+    /// Add a module-scope variable made by hand to the entry point's
+    /// interface.
+    pub fn note_global(&mut self, v: Word) {
+        self.globals.push(v);
+    }
+
+    /// A module-scope variable of `ty` starting at the constant `init`.
+    pub fn global_init(&mut self, ty: Word, class: SC, init: Word) -> Word {
+        let p = self.ptr(class, ty);
+        let v = self.b.id();
+        let inst = Instruction::new(S::Variable, Some(p), Some(v), vec![Operand::StorageClass(class), Operand::IdRef(init)]);
+        self.b.module_mut().types_global_values.push(inst);
+        self.globals.push(v);
+        v
+    }
+
     /// A built-in input variable of `ty` (created once).
     pub fn builtin_input(&mut self, builtin: spirv::BuiltIn, ty: Word) -> Word {
         if let Some(&v) = self.builtins.get(&(builtin as u32, 0)) {
@@ -1564,6 +1580,7 @@ impl<'a, 'p> Emitter<'a, 'p> {
             | Op::GdsAtomic { .. }
             | Op::GdsAppend { .. } => return super::memory::emit(self, v, d),
             Op::Image(attr) => return super::image::emit(self, v, d, attr),
+            Op::RtQuery(op) => return super::bvh::emit_rt(self, v, d, op),
             Op::Export(attr) => {
                 super::io::export(self, v, attr)?;
                 return Ok(None);

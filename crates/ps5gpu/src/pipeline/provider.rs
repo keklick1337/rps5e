@@ -142,6 +142,9 @@ pub struct ProviderStats {
     /// Of `gpu_thread_dispatches`, those whose record kernel ran in a launch
     /// batch (`RPS5E_LAUNCH_BATCH`).
     pub batched_launches: u64,
+    /// Launch batches that ended at their second member, after which their
+    /// run stopped batching ([`launch_batch_singles_enabled`]).
+    pub single_launch_batches: u64,
     /// Indirect dispatches skipped for a zero count in a record no GPU work
     /// was writing.
     pub empty_indirect_dispatches: u64,
@@ -344,6 +347,10 @@ enum Compiled {
     /// A graphics pipeline library ([`super::library`]) and how long the
     /// driver took.
     Library { key: super::library::LibKey, result: Result<vk::Pipeline, vk::Result>, ns: u64 },
+    /// A job that changed nothing (a variant that was not better).
+    Nothing,
+    /// The spill variant of compute pipeline `key`.
+    Variant { key: ComputeKey, pipeline: vk::Pipeline },
 }
 
 /// How a pipeline was built.
@@ -1868,6 +1875,11 @@ pub struct ShaderPipelines {
     /// Barriers recorded when the open launch batch began (a later barrier
     /// ends the batch: the kernels run before it).
     batch_barriers: u64,
+    /// Kernels in the open launch batch.
+    batch_kernels: u32,
+    /// The current run of guest dispatches closed a launch batch that held
+    /// one kernel (see [`launch_batch_singles_enabled`]).
+    single_batch_run: bool,
     /// The bytes the dispatch being recorded stores to through written
     /// buffers whose stores are bounded: (buffer, guest address, bytes).
     write_limits: smallvec::SmallVec<[(u32, u64, u64); 4]>,
@@ -1899,6 +1911,8 @@ pub(crate) struct PipelineTables {
     pub(crate) disk: Shared<PipelineDiskCache>,
     gds: Shared<Buffer>,
     fault: Shared<Buffer>,
+    /// The host BVH mirrors (`RPS5E_HW_RT` on a device with ray queries).
+    rt: Shared<Option<crate::rt::mirror::Mirror>>,
     null_buffer: Shared<Buffer>,
     /// GDS and the null buffer were zeroed on the device.
     zeroed: Shared<bool>,
@@ -1921,6 +1935,13 @@ pub(crate) struct PipelineTables {
     /// dependent: pipelines over it are listed with the plain key (the
     /// module the list holds and the next run looks up).
     relocated_plain: Shared<crate::fxhash::HashMap<u64, u64>>,
+    /// The guest inputs of compute modules, by module key, for their
+    /// spill variants ([`spill_variants_enabled`]).
+    compute_sources: Shared<HashMap<u64, Arc<super::sources::ModuleSource>>>,
+    /// Spill variants of compute pipelines, used instead of the ordinary
+    /// pipeline of their key ([`spill_variants_enabled`]; both stay, so
+    /// in-run A/B periods can take either).
+    compute_variants: Shared<HashMap<ComputeKey, vk::Pipeline>>,
     pending_graphics: Shared<crate::fxhash::HashSet<GraphicsKey>>,
     /// Graphics pipeline libraries made, queued, and failed
     /// ([`super::library`]).
@@ -2045,6 +2066,20 @@ enum Launch {
 fn launch_batch_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LAUNCH_BATCH")) && crate::backend::ab::release_fast("launch-batch")
+}
+
+/// `RPS5E_LAUNCH_BATCH_SINGLES=0`: a run of guest dispatches begins a new
+/// launch batch at every dispatch that finds none open. Otherwise, once a
+/// batch of the run ended at its second member (a barrier, a write-through
+/// or a hazard came between them), the rest of the run records each kernel
+/// next to its dispatch ([`early_launch_enabled`]): a batch per dispatch
+/// splits the recording buffer twice and puts a full barrier on each side
+/// of every kernel (GTA V's per-object BVH builds, one written-through
+/// dispatch after another). Both ways are exact; only the GPU's work order
+/// differs. A/B scope release `launch-batch-singles`.
+fn launch_batch_singles_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_LAUNCH_BATCH_SINGLES")) && crate::backend::ab::release_fast("launch-batch-singles")
 }
 
 /// `RPS5E_GUEST_COMPUTE_ORDER=0`: every dispatch is ordered after the
@@ -2503,6 +2538,18 @@ fn plan_only_env() -> bool {
 }
 
 impl ShaderPipelines {
+    /// Tests: mirror guest BVHs on the host (`RPS5E_HW_RT`) whatever the
+    /// environment says; false when the device has no ray queries.
+    #[cfg(test)]
+    pub(crate) fn enable_hw_rt(&mut self) -> bool {
+        if self.t.rt.is_none() {
+            *self.t.rt.w() = crate::rt::mirror::Mirror::new(&self.dev).ok();
+        }
+        self.t.rt.is_some()
+    }
+}
+
+impl ShaderPipelines {
     /// GDS starts out zero (as after a GPU reset), and so do the reads of the
     /// null buffer bound for missing resources.
     fn zero_buffers(&mut self, sched: &mut crate::scheduler::Scheduler) {
@@ -2543,9 +2590,11 @@ impl ShaderPipelines {
         // GDS is also the source and destination of command-processor
         // transfers (DMA_DATA, RELEASE_MEM / EOS read-backs).
         let gds = Buffer::new(dev, 64 << 10, storage | vk::BufferUsageFlags::TRANSFER_SRC, MemoryUse::Device)?;
-        let fault = Buffer::new(dev, 4096, storage, MemoryUse::Download)?;
-        fault.bytes_mut().fill(0);
-        fault.flush(0, 4096);
+        // The fault log, then the ray-tracing table (`crate::rt::table`).
+        let fault_bytes = crate::rt::table::BASE as u64 * 4 + crate::rt::table::BYTES;
+        let fault = Buffer::new(dev, fault_bytes, storage, MemoryUse::Download)?;
+        fault.bytes_mut()[..fault_bytes as usize].fill(0);
+        fault.flush(0, fault_bytes);
         let null_buffer = Buffer::new(dev, 64 << 10, storage, MemoryUse::Device)?;
         let t = Arc::new(PipelineTables {
             swaps: Shared::new(0),
@@ -2560,6 +2609,7 @@ impl ShaderPipelines {
             disk: Shared::new(PipelineDiskCache::new(dev, cache_path.clone())?),
             gds: Shared::new(gds),
             fault: Shared::new(fault),
+            rt: Shared::new(if crate::shader::EmitOptions::for_device(dev).hw_rt { crate::rt::mirror::Mirror::new(dev).ok() } else { None }),
             null_buffer: Shared::new(null_buffer),
             zeroed: Shared::new(false),
             indirect_mesh: Shared::new(if dev.caps.mesh_shader && dev.mesh.is_some() { IndirectMeshKernel::new(dev) } else { None }),
@@ -2572,6 +2622,8 @@ impl ShaderPipelines {
             relocating: Shared::new(Default::default()),
             not_relocatable: Shared::new(Default::default()),
             relocated_plain: Shared::new(Default::default()),
+            compute_sources: Shared::new(Default::default()),
+            compute_variants: Shared::new(Default::default()),
             pending_graphics: Shared::new(Default::default()),
             libraries: Shared::new(Default::default()),
             pending_libraries: Shared::new(Default::default()),
@@ -2696,6 +2748,8 @@ impl ShaderPipelines {
             touched_ranges: Vec::new(),
             guest_run_queue: None,
             batch_barriers: 0,
+            batch_kernels: 0,
+            single_batch_run: false,
             write_limits: smallvec::SmallVec::new(),
             store_bounds: Default::default(),
             image_barriers: Vec::new(),
@@ -3283,6 +3337,12 @@ impl ShaderPipelines {
         match c {
             Compiled::Module { key, stage, address, compiler, result, translate_ns, module_ns, source, relocated } => {
                 self.t.pending_modules.w().remove(&key);
+                if stage == ShaderStage::Compute && spill_variants_enabled() && result.is_ok() {
+                    if let Some(src) = &source {
+                        let plain = relocated.as_ref().filter(|r| !r.proven).map_or(key, |r| r.plain_key);
+                        self.t.compute_sources.w().insert(plain, src.clone());
+                    }
+                }
                 if self.ahead.modules.remove(&key) {
                     self.ahead.retry = true;
                 }
@@ -3365,6 +3425,12 @@ impl ShaderPipelines {
                         crate::log_once(&format!("ps5gpu: graphics pipeline creation failed: {e:?}"));
                         self.t.failed_graphics.w().insert(key);
                     }
+                }
+            }
+            Compiled::Nothing => {}
+            Compiled::Variant { key, pipeline } => {
+                if let Some(old) = self.t.compute_variants.w().insert(key, pipeline) {
+                    self.t.swapped_out.w().push(old);
                 }
             }
             Compiled::Library { key, result, ns } => {
@@ -3625,7 +3691,8 @@ impl ShaderPipelines {
                         self.t.prewarm_counts.w().skipped[3] += 1;
                         continue;
                     }
-                    (Box::new(compute_job(self.dev.clone(), self.t.disk.cache, key, cs, None, self.fast_builds())), hash_of(&key))
+                    let variant = self.spill_variant_inputs(key.cs, key.cs);
+                    (Box::new(compute_job(self.dev.clone(), self.t.disk.cache, key, cs, None, self.fast_builds(), variant)), hash_of(&key))
                 }
             };
             if let Some(pool) = &*self.t.pool {
@@ -4660,14 +4727,7 @@ impl ShaderPipelines {
                     // import table, one reading at unbounded addresses
                     // through mirrors and guest memory, others through
                     // mirrors.
-                    let unranged = crate::buffers::unranged_sync_enabled() && hazards::reads_unranged_memory(info, &snapshot.device_address_ranges);
-                    let table = match info.buffers_in_guest_memory.then(|| ctx.buffers.bda_imports(ctx.sched)).flatten() {
-                        Some(t) => t,
-                        None => match unranged.then(|| ctx.buffers.cache().unranged_table()).flatten() {
-                            Some(t) => t,
-                            None => ctx.buffers.bda_page_table(ctx.sched)?.0,
-                        },
-                    };
+                    let table = page_table_for(ctx, info, snapshot)?;
                     writes.single_buffer(number, vk::DescriptorBufferInfo { buffer: table, offset: 0, range: vk::WHOLE_SIZE });
                 }
                 DescriptorBindingKind::FaultBuffer => {
@@ -5545,9 +5605,27 @@ impl ShaderPipelines {
         }
     }
 
+    /// What a compute pipeline of module `key` (listed as `listed`) needs
+    /// to build its spill variant ([`spill_variants_enabled`]): the
+    /// compiler and the module's guest inputs.
+    fn spill_variant_inputs(&self, key: u64, listed: u64) -> Option<(Arc<dyn ShaderCompiler>, Arc<super::sources::ModuleSource>)> {
+        if !spill_variants_enabled() || !self.dev.caps.pipeline_executable_info {
+            return None;
+        }
+        let source = [key, listed].iter().find_map(|k| self.t.compute_sources.get(k).cloned().or_else(|| self.t.prewarm.source_of(*k)))?;
+        Some((self.compiler.clone()?, source))
+    }
+
     /// The compute pipeline of `key` (dispatches wait for it: later work
     /// may depend on them).
     fn compute_pipeline(&mut self, key: ComputeKey, cs: &Arc<Module>) -> Result<vk::Pipeline, Failure> {
+        if !self.t.compute_variants.is_empty() && crate::backend::ab::release_fast("spill-variants") {
+            if let Some(&p) = self.t.compute_variants.get(&key) {
+                self.stats.compute_hits += 1;
+                crate::perf::PIPELINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(p);
+            }
+        }
         if let Some(&p) = self.t.compute.get(&key) {
             self.stats.compute_hits += 1;
             crate::perf::PIPELINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5558,7 +5636,8 @@ impl ShaderPipelines {
         }
         let cs_listed = self.t.relocated_plain.get(&key.cs).copied().unwrap_or(key.cs);
         let record = self.t.layout_descs.get(&key.layout).map(|(layout, _)| super::prewarm::ComputeRecord { cs: cs_listed, layout: layout.clone(), subgroup32: key.subgroup32 });
-        let job = compute_job(self.dev.clone(), self.t.disk.cache, key, cs.clone(), record, self.fast_builds());
+        let variant = self.spill_variant_inputs(key.cs, cs_listed);
+        let job = compute_job(self.dev.clone(), self.t.disk.cache, key, cs.clone(), record, self.fast_builds(), variant);
         let t = std::time::Instant::now();
         match &*self.t.pool {
             None => self.finish(job()),
@@ -7483,6 +7562,9 @@ impl ShaderPipelines {
         // is ordered against everything (a counter reset by one dispatch
         // must land before the next one's atomics).
         let device_writes = bound[0].prepared.program.writes_device_memory;
+        if device_writes {
+            crate::rt::watch::unranged();
+        }
         let precise = precise_barriers() && !writes.gds && !device_writes;
         let writes_memory = !writes.written_ranges.is_empty() || !writes.written_images.is_empty();
         // A dispatch reading memory it has no ranges for waits for every
@@ -7505,18 +7587,30 @@ impl ShaderPipelines {
         // dispatches need no barrier of their own (see `launch_batch_enabled`).
         let mut barrier: Option<crate::scheduler::hazard::DispatchBarrier> = None;
         let mut launch = None;
+        if !follow {
+            self.single_batch_run = false;
+        }
         if let Some(record) = args.filter(|_| thread_dims && follow && launch_batch_enabled()) {
             if ctx.sched.launch_cmd().is_some() {
                 let b = ctx.sched.guest_dispatch_barrier(&touched, &writes.written_ranges, reads_unranged, true);
                 barrier = Some(b);
                 if b == crate::scheduler::hazard::DispatchBarrier::None && barrier_count(ctx) == self.batch_barriers && record_clean(ctx) {
                     launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record, Launch::Batched)?);
+                    self.batch_kernels += 1;
                 } else {
+                    // A batch that ends at its second member gained nothing:
+                    // the rest of the run records its kernels next to the
+                    // dispatches instead of a batch per dispatch.
+                    if self.batch_kernels <= 1 && launch_batch_singles_enabled() {
+                        self.single_batch_run = true;
+                        self.stats.single_launch_batches += 1;
+                    }
                     ctx.sched.close_launch_batch();
                 }
-            } else if ctx.sched.begin_launch_batch() {
+            } else if !(self.single_batch_run && launch_batch_singles_enabled()) && ctx.sched.begin_launch_batch() {
                 // The batch's barriers order everything before the dispatch.
                 self.batch_barriers = barrier_count(ctx);
+                self.batch_kernels = 1;
                 barrier = Some(crate::scheduler::hazard::DispatchBarrier::None);
                 launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, record, Launch::Batched)?);
             }
@@ -7575,6 +7669,19 @@ impl ShaderPipelines {
             Some(record) => Some((record.buffer, record.offset)),
             None => None,
         };
+        if bound[0].prepared.resources.info.uses_bvh && module.reflection.host_bvh && self.t.rt.is_some() {
+            if ctx.bail(crate::slices::spec::Hole::Special) {
+                return Err(Failure::Bail);
+            }
+            // The host BVH mirrors are brought up to date before the
+            // dispatch that queries them (ordered after the barrier above,
+            // like the dispatch's own reads).
+            let program = bound[0].prepared.program.address;
+            let table = page_table_for(ctx, &bound[0].prepared.resources.info, &bound[0].prepared.snapshot)?;
+            if let Some(m) = self.t.rt.w().as_mut() {
+                m.before_dispatch(ctx, program, table, &self.t.fault);
+            }
+        }
         let cb = ctx.sched.ordered_cmd();
         // SAFETY: recording buffer; compatible pipeline.
         crate::scheduler::disturb_state();
@@ -7709,6 +7816,7 @@ impl ShaderPipelines {
             Launch::Batched => {
                 let cb = ctx.sched.launch_cmd().ok_or_else(|| Failure::Error("no launch batch".into()))?;
                 kernel.record(cb, record, command_slot, data_slot, cs.layout.dispatch_thread_limits_dword(), &rules);
+                ctx.sched.note_launch_kernel();
                 self.stats.batched_launches += 1;
             }
         }
@@ -7735,7 +7843,8 @@ impl ShaderPipelines {
         self.trace_pass(
             ctx,
             &format!(
-                "draw {:?} n={} prim={} es={:#x} gs={:#x} vs={:#x} ps={:#x} -> {o:?} colors=[{}] depth={depth:?}",
+                "draw q{} {:?} n={} prim={} es={:#x} gs={:#x} vs={:#x} ps={:#x} -> {o:?} colors=[{}] depth={depth:?}",
+                draw.packet.queue,
                 draw.packet.kind,
                 draw.packet.count,
                 draw.primitive_type,
@@ -7992,20 +8101,184 @@ fn translate_job(dev: Arc<GpuDevice>, compiler: Arc<dyn ShaderCompiler>, key: u6
 }
 
 /// The compile job of the compute pipeline of `key` (as [`graphics_job`]).
-fn compute_job(dev: Arc<GpuDevice>, cache: vk::PipelineCache, key: ComputeKey, cs: Arc<Module>, record: Option<super::prewarm::ComputeRecord>, fast: bool) -> impl FnOnce() -> Compiled + Send + 'static {
+fn compute_job(
+    dev: Arc<GpuDevice>,
+    cache: vk::PipelineCache,
+    key: ComputeKey,
+    cs: Arc<Module>,
+    record: Option<super::prewarm::ComputeRecord>,
+    fast: bool,
+    variant: Option<(Arc<dyn ShaderCompiler>, Arc<super::sources::ModuleSource>)>,
+) -> impl FnOnce() -> Compiled + Send + 'static {
     fn build(dev: &GpuDevice, cache: vk::PipelineCache, key: &ComputeKey, cs: &Module, fast: bool, optimised: bool) -> (Result<vk::Pipeline, vk::Result>, Built) {
         let what = || format!("compute cs {:#x} ({} words)", cs.address, cs.words);
         build_pipeline(cache, fast, optimised, &what, &|cache, flags| create_compute_pipeline(dev, cache, key, cs, flags))
     }
     move || {
         let (result, built) = build(&dev, cache, &key, &cs, fast, false);
-        let rebuild = (built.tier == Tier::Fast && result.is_ok() && fast_pipelines_mode() != FastPipelines::Only).then(|| {
-            Box::new(move || {
+        let mut rebuild = None;
+        if built.tier == Tier::Fast && result.is_ok() && fast_pipelines_mode() != FastPipelines::Only {
+            let (dev, cs) = (dev.clone(), cs.clone());
+            rebuild = Some(Box::new(move || {
                 let (result, built) = build(&dev, cache, &key, &cs, false, true);
                 Compiled::Compute { key, result, record: None, built, rebuild: None }
-            }) as Rebuild
-        });
+            }) as Rebuild);
+        } else if let (Ok(p), Some((compiler, source))) = (&result, variant) {
+            let spill = pipeline_spill(&dev, *p);
+            if spill.is_some_and(|s| s.local > SPILL_LOCAL_BYTES) {
+                rebuild = Some(Box::new(spill_variant_job(dev.clone(), cache, key, cs.clone(), compiler, source, spill.unwrap_or_default())) as Rebuild);
+            }
+        }
         Compiled::Compute { key, result, record, built, rebuild }
+    }
+}
+
+/// `RPS5E_SPILL_VARIANTS=0`: compute pipelines are built only from their
+/// ordinary module. By default a compute pipeline whose driver statistics
+/// show register spills (more than [`SPILL_LOCAL_BYTES`] of local memory)
+/// is built again in the background from the program translated with the
+/// emulated f32 denormal flush kept where the host would flush itself
+/// ([`crate::shader::without_host_flush`]): both modules compute the same
+/// results, and the host compiler allocates one of them without spills
+/// (GTA V's ray traversal: 168 registers and 160 bytes of spills with the
+/// elision, 223 registers and none without, ~40 % less GPU time). The
+/// variant replaces the pipeline when it spills less (local and shared
+/// memory both no larger, one smaller). Needs
+/// VK_KHR_pipeline_executable_properties. A/B in one run with
+/// `RPS5E_AB_SCOPE=release RPS5E_AB_ONLY=spill-variants` (slow periods use
+/// the ordinary pipeline).
+pub(crate) fn spill_variants_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_SPILL_VARIANTS"))
+}
+
+/// Local memory per invocation above which a compute pipeline is tried
+/// again as its variant: private arrays of the translation need a few
+/// words (16-48 bytes in GTA V), spills more.
+const SPILL_LOCAL_BYTES: u64 = 64;
+
+/// Salt of the module key of a spill variant (its own module cache entry).
+const SPILL_VARIANT_SALT: u64 = 0x5b11_1a7e_0f75_c0de;
+
+/// The memory a pipeline's executable needs beyond its registers, from the
+/// driver's statistics (bytes per invocation of local memory, bytes of
+/// shared memory per work-group).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Spill {
+    local: u64,
+    shared: u64,
+    registers: u64,
+}
+
+/// The [`Spill`] statistics of compute pipeline `p` (created with
+/// `CAPTURE_STATISTICS`); None without the statistics.
+fn pipeline_spill(dev: &GpuDevice, p: vk::Pipeline) -> Option<Spill> {
+    if !dev.caps.pipeline_executable_info {
+        return None;
+    }
+    let ext = ash::khr::pipeline_executable_properties::Device::new(&dev.instance, &dev.device);
+    let ei = vk::PipelineExecutableInfoKHR::default().pipeline(p).executable_index(0);
+    // SAFETY: a compute pipeline created with CAPTURE_STATISTICS on this
+    // device; executable 0 is its only stage.
+    let stats = unsafe { ext.get_pipeline_executable_statistics(&ei) }.ok()?;
+    let named = stats.iter().filter_map(|st| {
+        let name = st.name_as_c_str().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // SAFETY: the union member read is the one `format` names.
+        let v = unsafe {
+            match st.format {
+                vk::PipelineExecutableStatisticFormatKHR::INT64 => st.value.i64.max(0) as u64,
+                vk::PipelineExecutableStatisticFormatKHR::UINT64 => st.value.u64,
+                _ => return None,
+            }
+        };
+        Some((name, v))
+    });
+    spill_from_statistics(named)
+}
+
+/// [`Spill`] from a pipeline executable's named integer statistics; None
+/// when no local-memory (scratch) statistic is among them.
+fn spill_from_statistics(stats: impl Iterator<Item = (String, u64)>) -> Option<Spill> {
+    let mut s = Spill::default();
+    let mut found = false;
+    for (name, v) in stats {
+        let name = name.to_ascii_lowercase();
+        // The NVIDIA driver (615) reports local memory with bit 36 set.
+        let v = v & 0xFFFF_FFFF;
+        if name.contains("local memory") || name.contains("scratch") {
+            s.local = v;
+            found = true;
+        } else if name.contains("shared memory") || name.contains("lds") {
+            s.shared = v;
+        } else if name.contains("register") && !name.contains("scalar") {
+            s.registers = v;
+        }
+    }
+    found.then_some(s)
+}
+
+/// The variant spills less than the ordinary build: neither its local nor
+/// its shared memory is larger, and one of them is smaller.
+fn spills_less(before: Spill, after: Spill) -> bool {
+    after.local <= before.local && after.shared <= before.shared && (after.local < before.local || after.shared < before.shared)
+}
+
+/// The job building the spill variant of compute pipeline `key` (see
+/// [`spill_variants_enabled`]): the program translated with the emulated
+/// flush kept, the same layout; the pipeline replaces the ordinary one
+/// when it spills less.
+fn spill_variant_job(
+    dev: Arc<GpuDevice>,
+    cache: vk::PipelineCache,
+    key: ComputeKey,
+    cs: Arc<Module>,
+    compiler: Arc<dyn ShaderCompiler>,
+    source: Arc<super::sources::ModuleSource>,
+    before: Spill,
+) -> impl FnOnce() -> Compiled + Send + 'static {
+    move || {
+        let address = if cs.address != 0 { cs.address } else { source.program.address };
+        let compiled = crate::shader::without_host_flush(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::sources::retranslate(&*compiler, key.cs ^ SPILL_VARIANT_SALT, &source)))
+                .unwrap_or_else(|_| Err(CompileError::Failed("the translation panicked".into())))
+        });
+        let c = match compiled {
+            Ok(c) if c.reflection == cs.reflection => c,
+            Ok(_) => {
+                log::info!("[spill] compute program {address:#x}: the variant has another layout; kept");
+                return Compiled::Nothing;
+            }
+            Err(e) => {
+                log::info!("[spill] compute program {address:#x}: the variant did not translate ({e}); kept");
+                return Compiled::Nothing;
+            }
+        };
+        let Ok(module) = create_shader_module(&dev, &c.spirv) else { return Compiled::Nothing };
+        let variant = Module { module, reflection: c.reflection, address, words: c.spirv.len(), relocation: cs.relocation.clone() };
+        let what = || format!("compute cs {address:#x} spill variant ({} words)", variant.words);
+        let (result, built) = build_pipeline(cache, false, true, &what, &|cache, flags| create_compute_pipeline(&dev, cache, &key, &variant, flags));
+        // SAFETY: the module is not used by any other pipeline.
+        unsafe { dev.device.destroy_shader_module(module, None) };
+        let Ok(p) = result else { return Compiled::Nothing };
+        let after = pipeline_spill(&dev, p).unwrap_or(before);
+        let better = spills_less(before, after);
+        log::info!(
+            "[spill] compute program {address:#x}: registers/local/shared {}/{}/{} -> variant {}/{}/{}: {}",
+            before.registers,
+            before.local,
+            before.shared,
+            after.registers,
+            after.local,
+            after.shared,
+            if better { "variant used" } else { "kept" }
+        );
+        if !better {
+            // SAFETY: never handed out.
+            unsafe { dev.device.destroy_pipeline(p, None) };
+            return Compiled::Nothing;
+        }
+        let _ = built;
+        Compiled::Variant { key, pipeline: p }
     }
 }
 
@@ -8214,11 +8487,19 @@ fn create_compute_pipeline(dev: &GpuDevice, pipeline_cache: vk::PipelineCache, k
     log::trace!("ps5gpu: creating compute pipeline of module {:#018x}", key.cs);
     // SAFETY: valid create info.
     let pipelines = unsafe { dev.device.create_compute_pipelines(pipeline_cache, &[info], None) }.map_err(|(_, e)| e)?;
-    if dev.caps.pipeline_executable_info {
-        log::info!("[pipeline-stats] cs key {:#018x} created in {:.1} ms", key.cs, t.elapsed().as_secs_f64() * 1e3);
+    if dev.caps.pipeline_executable_info && pipeline_stats_logged() {
+        log::info!("[pipeline-stats] cs key {:#018x} (program {:#x}, {} words) created in {:.1} ms", key.cs, cs.address, cs.words, t.elapsed().as_secs_f64() * 1e3);
         log_pipeline_statistics(dev, pipelines[0], key.cs);
     }
     Ok(pipelines[0])
+}
+
+/// `RPS5E_PIPELINE_STATS=1`: compute pipelines log their creation time and
+/// the driver's statistics (with the extension enabled for
+/// [`spill_variants_enabled`] alone, nothing is logged).
+fn pipeline_stats_logged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_PIPELINE_STATS").is_ok_and(|v| v == "1"))
 }
 
 /// `RPS5E_PIPELINE_STATS=1`: the driver's statistics of every executable
@@ -8413,7 +8694,8 @@ impl ShaderPipelines {
             self.trace_pass(
                 ctx,
                 &format!(
-                    "dispatch cs={:#x} groups={:?} threads={:?} indirect={:#x} -> {o:?}",
+                    "dispatch q{} cs={:#x} groups={:?} threads={:?} indirect={:#x} -> {o:?}",
+                    dispatch.packet.queue,
                     dispatch.shader.address, dispatch.packet.groups, dispatch.threads, dispatch.packet.indirect_address
                 ),
                 &dumps,
@@ -8578,7 +8860,7 @@ impl PipelineProvider for ShaderPipelines {
             (g.stats, g.materialization_statistics())
         };
         Some(format!(
-            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu/{}early/{}batched cs-group-clamps={} cs-unsynced={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}miss/{}inline/{}first/{}msunlocked{} recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={}/{}memo prefetch-miss={:?} revalidated={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
+            "pipelines: recorded={}d/{}c needs_shader={} skipped={} errors={} programs={} (plan_fail={} decode_fail={} materialize_fail={}) modules={} (fail={}) gfx={} (hits {}) cs={} (hits {}) cpu_idx={} rect={} indirect={}/{}gpu/{}mesh cs-thread-dims={}gpu/{}early/{}batched/{}single cs-group-clamps={} cs-unsynced={} cs-empty-indirect={} heap_sets={} dummies={} view-memo={}/{}miss clamp-misses={} compiling={}/{}w/{}bw/{}q/{}ahead/{}miss/{}inline/{}first/{}msunlocked{} recipes={}/{} stream-memo={} stream-copies={}/{}MiB/{}trim staging-retags={} isolated={:?} bind-reuse={} bindings={} res-reuse={}/{} ring={}/{}r miss={}/{}/{}i/s(why={} cand={}) prep-reuse={} prefetched={}/{}memo prefetch-miss={:?} revalidated={} deferred-table={} table={}/{}r/{}dwords module-key-misses={} mat=[same {} patched {} recycled {} new {} fallback {} rec hit {} miss {}] bda=[stages {} mirrored {} materialized {}]{}",
             s.recorded_draws,
             s.recorded_dispatches,
             s.needs_shader,
@@ -8602,6 +8884,7 @@ impl PipelineProvider for ShaderPipelines {
             s.gpu_thread_dispatches,
             s.early_launches,
             s.batched_launches,
+            s.single_launch_batches,
             s.gpu_group_clamps,
             s.unsynced_dispatches,
             s.empty_indirect_dispatches,
@@ -8690,7 +8973,7 @@ impl Drop for ShaderPipelines {
         let d = &self.dev.device;
         // SAFETY: device idle; every handle below belongs to this provider.
         unsafe {
-            for &p in self.t.graphics.values().chain(self.t.compute.values()).chain(self.t.swapped_out.iter()).chain(self.t.libraries.values()) {
+            for &p in self.t.graphics.values().chain(self.t.compute.values()).chain(self.t.compute_variants.values()).chain(self.t.swapped_out.iter()).chain(self.t.libraries.values()) {
                 d.destroy_pipeline(p, None);
             }
             for m in self.t.modules.values().flatten() {
@@ -8881,6 +9164,27 @@ mod unnormalized_tests {
 mod compile_mode_tests {
     use super::*;
 
+    /// The spill statistics of the NVIDIA driver (615) for GTA V's ray
+    /// traversal: local memory carries bit 36; the variant without the
+    /// host-FTZ elision is taken because it spills less.
+    #[test]
+    fn spill_statistics_and_the_variant_rule() {
+        let stats = |regs: u64, local: u64, shared: u64| {
+            vec![("Register Count".to_string(), regs), ("Binary Size".to_string(), 460416), ("Local Memory Size".to_string(), (1 << 36) + local), ("Shared Memory Size".to_string(), shared)]
+        };
+        let before = spill_from_statistics(stats(168, 176, 8192).into_iter()).unwrap();
+        assert_eq!(before, Spill { local: 176, shared: 8192, registers: 168 });
+        assert!(before.local > SPILL_LOCAL_BYTES, "the traversal is tried again");
+        let after = spill_from_statistics(stats(223, 16, 3072).into_iter()).unwrap();
+        assert!(spills_less(before, after));
+        assert!(!spills_less(after, before));
+        assert!(!spills_less(before, before), "equal: the ordinary build stays");
+        // Less local memory but more shared memory: kept.
+        assert!(!spills_less(Spill { local: 944, shared: 8000, registers: 168 }, Spill { local: 560, shared: 12096, registers: 255 }));
+        assert_eq!(spill_from_statistics(vec![("Register Count".to_string(), 40)].into_iter()), None, "no local-memory statistic");
+        assert_eq!(spill_from_statistics(vec![("Scratch Memory Size".to_string(), 64)].into_iter()).map(|s| s.local), Some(64));
+    }
+
     /// A relocatable module serves the program wherever the code words its
     /// translation read are the same (a table the game patched per load is
     /// not); the per-pixel masks pack 16 bits per pixel.
@@ -8961,4 +9265,19 @@ fn dispatch_hash_log(ctx: &mut DrawContext, program: u64, d: &ResolvedDispatch, 
     }
     let args = if direct { String::from("direct") } else { format!("{:016x}", hash(ctx, d.packet.indirect_address, 12)) };
     log::info!("ps5gpu: dhash #{n} p{program:#x} q{} threads {threads:?} args {args} [{}]", d.packet.queue, parts.join(" "));
+}
+
+/// The device-address page table a stage reads guest memory through: the
+/// import table for stages reading every buffer in guest memory, the table
+/// of mirrors and guest memory for reads at unbounded addresses, else the
+/// table of mirrors.
+fn page_table_for(ctx: &mut DrawContext, info: &ps5shader::resources::ShaderResourceInfo, snapshot: &ps5shader::resources::ResourceSnapshot) -> Result<vk::Buffer, Failure> {
+    let unranged = crate::buffers::unranged_sync_enabled() && hazards::reads_unranged_memory(info, &snapshot.device_address_ranges);
+    Ok(match info.buffers_in_guest_memory.then(|| ctx.buffers.bda_imports(ctx.sched)).flatten() {
+        Some(t) => t,
+        None => match unranged.then(|| ctx.buffers.cache().unranged_table()).flatten() {
+            Some(t) => t,
+            None => ctx.buffers.bda_page_table(ctx.sched)?.0,
+        },
+    })
 }

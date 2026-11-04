@@ -161,6 +161,9 @@ pub struct ShaderReflection {
     /// by the module's own checks: a compute pipeline may turn the
     /// driver's buffer robustness off (VK_EXT_pipeline_robustness).
     pub own_buffer_checks: bool,
+    /// The module's BVH traversals use the host mirrors (hardware traversal
+    /// copies or box pruning): they must be current at its dispatches.
+    pub host_bvh: bool,
 }
 
 impl ShaderReflection {
