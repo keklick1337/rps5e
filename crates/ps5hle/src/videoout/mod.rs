@@ -61,6 +61,7 @@ pub const ERROR_INVALID_INDEX: i64 = err(0x8029_000A);
 pub const ERROR_INVALID_HANDLE: i64 = err(0x8029_000B);
 pub const ERROR_INVALID_EVENT_QUEUE: i64 = err(0x8029_000C);
 pub const ERROR_INVALID_EVENT: i64 = err(0x8029_000D);
+pub const ERROR_SLOT_OCCUPIED: i64 = err(0x8029_0010);
 pub const ERROR_FLIP_QUEUE_FULL: i64 = err(0x8029_0012);
 pub const ERROR_UNSUPPORTED_OUTPUT_MODE: i64 = err(0x8029_0016);
 pub const ERROR_UNAVAILABLE_OUTPUT_MODE: i64 = err(0x8029_0019);
@@ -698,8 +699,7 @@ fn present_reserved_flip(id: u64) -> Result<(), i64> {
         };
         if port.bus_type == BUS_TYPE_OVERLAY {
             drop(g);
-            complete_flip(id);
-            mark_flip_presented(id);
+            finish_gpu_flip(id, true);
             log::trace!("videoout: overlay gpu flip handle={handle} index={buffer_index} arg={flip_arg} (not shown)");
             return Ok(());
         }
@@ -746,13 +746,51 @@ fn present_reserved_flip(id: u64) -> Result<(), i64> {
             r.ticket = Some(t);
         }
     }
-    complete_flip(id);
-    if ticket.is_none() {
-        // Blank flip (index -1) or unregistered buffer: nothing to show.
-        mark_flip_presented(id);
-    }
+    // A blank flip (index -1) or an unregistered buffer shows nothing.
+    finish_gpu_flip(id, ticket.is_none());
     log::trace!("videoout: gpu flip handle={handle} index={buffer_index} mode={flip_mode} arg={flip_arg}");
     Ok(())
+}
+
+thread_local! {
+    /// GPU flips presented inside [`with_flip_completions`] whose completion
+    /// the caller runs later.
+    static LATER_COMPLETIONS: std::cell::RefCell<Option<Vec<(u64, bool)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A GPU flip was handed to the presenter: it completes now (the flip
+/// count, flip events and flip status the guest sees), or later when
+/// [`with_flip_completions`] collects it. `presented`: nothing to show, it
+/// counts as presented at once.
+fn finish_gpu_flip(id: u64, presented: bool) {
+    let later = LATER_COMPLETIONS.with(|l| l.borrow_mut().as_mut().map(|v| v.push((id, presented))).is_some());
+    if !later {
+        complete_flip(id);
+        if presented {
+            mark_flip_presented(id);
+        }
+    }
+}
+
+/// Run `f` (GPU flips): the flips it presents are not completed; their
+/// completion is returned for the caller to run once the work before them
+/// is visible to the guest (the GPU command processor completes a flip
+/// after the end-of-pipe writes before it).
+pub fn with_flip_completions<R>(f: impl FnOnce() -> R) -> (R, Box<dyn FnOnce() + Send>) {
+    let outer = LATER_COMPLETIONS.with(|l| l.borrow_mut().replace(Vec::new()));
+    let r = f();
+    let flips = LATER_COMPLETIONS.with(|l| std::mem::replace(&mut *l.borrow_mut(), outer)).unwrap_or_default();
+    (
+        r,
+        Box::new(move || {
+            for (id, presented) in flips {
+                complete_flip(id);
+                if presented {
+                    mark_flip_presented(id);
+                }
+            }
+        }),
+    )
 }
 
 /// CPU-path flip (`sceVideoOutSubmitFlip`): paced on the calling thread,

@@ -803,19 +803,27 @@ fn cb_wait_equeue(ctx: &mut CpuContext) -> HleResult {
     let cap = ctx.rdx() as i32;
     let out_count = ctx.rcx();
     let timeout_ptr = ctx.r8();
+    // libkernel checks the count first, then the queue; every failure
+    // stores 0 events.
+    let fail = |ctx: &mut CpuContext, e: HleResult| {
+        if out_count != 0 {
+            ctx.write_u32(out_count, 0);
+        }
+        e
+    };
+    if cap < 1 {
+        return fail(ctx, ERR_INVALID_ARGUMENT);
+    }
     if !is_valid_equeue(handle) {
-        return ERR_BAD_QUEUE;
+        return fail(ctx, ERR_BAD_QUEUE);
     }
     if events == 0 {
-        return ERR_MEMORY_FAULT;
-    }
-    if cap < 1 {
-        return ERR_INVALID_ARGUMENT;
+        return fail(ctx, ERR_MEMORY_FAULT);
     }
     let timeout = if timeout_ptr != 0 {
         match ctx.read_u32(timeout_ptr) {
             Some(t) => Some(t),
-            None => return ERR_MEMORY_FAULT,
+            None => return fail(ctx, ERR_MEMORY_FAULT),
         }
     } else {
         None
@@ -834,12 +842,7 @@ fn cb_wait_equeue(ctx: &mut CpuContext) -> HleResult {
             }
             if delivered == 0 { ERR_MEMORY_FAULT } else { OK }
         }
-        Err(e) => {
-            if out_count != 0 {
-                ctx.write_u32(out_count, 0);
-            }
-            e
-        }
+        Err(e) => fail(ctx, e),
     }
 }
 

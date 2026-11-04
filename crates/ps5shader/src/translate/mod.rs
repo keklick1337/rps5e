@@ -256,7 +256,22 @@ pub mod float_rules {
     /// take a polynomial in turns where the host's sine / cosine is more
     /// than 4 ulp from it (drivers whose sin / cos lose precision).
     pub const SIN_COS_SERIES: u32 = 1 << 10;
-    pub const ALL: u32 = TINY_AFTER_ROUNDING | DIV_SCALE_FLUSH | DIV_FMAS_NAN | F16_DENORMALS | LDEXP_DENORMALS | INT_TO_F32_ROUND | COMPARE_CONSTANT_FOLD | TINY_ONE_MULTIPLY | PKNORM_F32 | F16_ROUNDING | SIN_COS_SERIES;
+    /// v_div_fmas_f32 never flushes its inputs but flushes a denormal
+    /// result to a zero of its sign in the f32 modes that flush results
+    /// (measured on RDNA2).
+    pub const DIV_FMAS_FLUSH: u32 = 1 << 11;
+    pub const ALL: u32 = TINY_AFTER_ROUNDING
+        | DIV_SCALE_FLUSH
+        | DIV_FMAS_NAN
+        | F16_DENORMALS
+        | LDEXP_DENORMALS
+        | INT_TO_F32_ROUND
+        | COMPARE_CONSTANT_FOLD
+        | TINY_ONE_MULTIPLY
+        | PKNORM_F32
+        | F16_ROUNDING
+        | SIN_COS_SERIES
+        | DIV_FMAS_FLUSH;
 }
 
 impl TranslateOptions {
@@ -297,6 +312,7 @@ pub fn f32_denormal_flush_with(op: Opcode, mode: FloatMode, rules: u32) -> u32 {
     use Opcode::*;
     let natural = match op {
         VDivScaleF32 if rules & float_rules::DIV_SCALE_FLUSH != 0 => 1,
+        VDivFmasF32 if rules & float_rules::DIV_FMAS_FLUSH != 0 => 2,
         // v_mad_legacy_f32 / v_mac_legacy_f32: measured on gfx1010 in f32
         // denormal modes 0 to 3.
         VMadF32 | VMacF32 | VMadMkF32 | VMadAkF32 | VMadLegacyF32 | VMacLegacyF32 => return 3,

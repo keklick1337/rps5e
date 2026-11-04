@@ -1239,6 +1239,11 @@ fn register_buffer_range(handle: i32, start: i32, addresses: &[u64], attribute: 
     {
         let mut g = lock();
         let Some(p) = g.ports.get_mut(&handle) else { return ERROR_INVALID_HANDLE };
+        // Taken slots are SLOT_OCCUPIED, also when the requested set is
+        // still registered too (console: re-registering the set on screen).
+        if (0..addresses.len()).any(|i| p.slots[start as usize + i].group >= 0) {
+            return ERROR_SLOT_OCCUPIED;
+        }
         let group = if requested_group >= 0 {
             requested_group
         } else {
@@ -1248,9 +1253,6 @@ fn register_buffer_range(handle: i32, start: i32, addresses: &[u64], attribute: 
             return ERROR_INVALID_VALUE;
         }
         if p.groups[group as usize].is_some() {
-            return ERROR_RESOURCE_BUSY;
-        }
-        if (0..addresses.len()).any(|i| p.slots[start as usize + i].group >= 0) {
             return ERROR_RESOURCE_BUSY;
         }
         p.groups[group as usize] = Some(attribute);

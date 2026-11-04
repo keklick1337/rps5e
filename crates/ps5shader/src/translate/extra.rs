@@ -197,8 +197,9 @@ impl<'a> Translator<'a> {
         self.b().bitcast(u, Type::F64)
     }
 
-    /// Write an f64 result: clamp to [0, 1] (NaN gives +0); the output
-    /// modifier does not apply to f64 results.
+    /// Write an f64 result: clamp to [0, 1] (NaN gives +0 under
+    /// DX10_CLAMP and passes through without it, as for f32 and f16); the
+    /// output modifier does not apply to f64 results.
     pub(super) fn write_f64_result(&mut self, ins: &Instruction, m: &Mods, v: Value) -> Result<()> {
         let v = if m.clamp {
             let zero = self.b().f64(0.0);
@@ -206,7 +207,13 @@ impl<'a> Translator<'a> {
             let positive = self.b().fcmp(FCmp::OGt, v, zero);
             let below = self.b().fcmp(FCmp::OLt, v, one);
             let upper = self.b().select(below, v, one);
-            self.b().select(positive, upper, zero)
+            let r = self.b().select(positive, upper, zero);
+            if self.float_mode.dx10_clamp {
+                r
+            } else {
+                let nan = self.b().fcmp(FCmp::Uno, v, v);
+                self.b().select(nan, v, r)
+            }
         } else {
             v
         };
@@ -762,8 +769,9 @@ impl<'a> Translator<'a> {
                 let p = self.b().imul(a, b);
                 let c31 = self.u(31);
                 let high = self.b().ashr(p, c31);
-                let c = self.src_u32(ins, m, 2);
+                let c = self.mad16_addend(ins, m);
                 let r = self.wide_add(m.clamp, p, high, c, true);
+                let r = self.mad16_result(m, r);
                 self.write_u32_result(ins, m, r)?;
             }
             VMin3I16 | VMin3U16 | VMax3I16 | VMax3U16 | VMed3I16 | VMed3U16 => {

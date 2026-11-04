@@ -228,8 +228,11 @@ fn open_register_flip_and_events() {
     assert!(ctx.write_u64(BASE + 0x808, 0xC0DE_0000_0000_0000));
     assert!(ctx.write_u64(BASE + 0x810, 0));
     assert_eq!(call("sceVideoOutRegisterBuffers2", &mut ctx, &[hu, 0, 0, entries, 2, attr]), 0);
-    // Slots are taken now.
-    assert_eq!(call("sceVideoOutRegisterBuffers2", &mut ctx, &[hu, 1, 0, entries, 2, attr]), ERROR_RESOURCE_BUSY);
+    // Slots are taken now: SLOT_OCCUPIED, for a free set and for the
+    // registered one (console); a free set over free slots still works.
+    assert_eq!(call("sceVideoOutRegisterBuffers2", &mut ctx, &[hu, 1, 0, entries, 2, attr]), ERROR_SLOT_OCCUPIED);
+    assert_eq!(call("sceVideoOutRegisterBuffers2", &mut ctx, &[hu, 0, 0, entries, 2, attr]), ERROR_SLOT_OCCUPIED);
+    assert_eq!(call("sceVideoOutRegisterBuffers2", &mut ctx, &[hu, 0, 2, entries, 1, attr]), ERROR_RESOURCE_BUSY, "set 0 is registered");
     let info = display_buffer_info(h as i32, 1).unwrap();
     assert_eq!(info.address, SURF + size);
     assert_eq!(info.attribute.width, w);

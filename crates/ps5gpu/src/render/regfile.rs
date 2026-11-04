@@ -100,6 +100,11 @@ pub fn initial_context_registers() -> Vec<u32> {
     for i in 0..8 {
         set(0x1e0 + i, 0x2001_0001);
     }
+    // PA_SC_CLIPRECT_n_BR: (8192, 8192), as in the SDK's register defaults;
+    // the top-left corners are 0.
+    for i in 0..4 {
+        set(0x085 + 2 * i, 0x2000_2000);
+    }
     for i in 0..16 {
         set(0x94 + 2 * i, 0x8000_0000);
         set(0x95 + 2 * i, 0x4000_4000);

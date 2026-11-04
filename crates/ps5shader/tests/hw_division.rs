@@ -140,3 +140,67 @@ fn division_fmas_nan() {
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
+
+/// v_div_fmas_f32 with denormal operands and results (RDNA2 rows, VCC
+/// clear and set): the inputs are never flushed, and a denormal result
+/// becomes a zero of its sign when the f32 denormal mode flushes outputs
+/// (FLOAT_MODE bit 5 clear). Columns: src0, src1, src2, VCC, result with
+/// output flushing, result without.
+///
+/// The hardware also rounds the scaled fused result once; the translation
+/// rounds the sum, then the scaled value, so a sum scaled by 2^-64 into the
+/// denormal range with denormals kept can be one ulp off. Those rows
+/// (`single_rounding`) are not checked in the modes that keep results.
+const FMAS_DENORMAL_VECTORS: [[u32; 6]; 26] = [
+    [0x00000001, 0x80800000, 0x1fea6146, 1, 0x00000000, 0x003a9851],
+    [0x8da51d6f, 0x96a2a07a, 0x2004bac1, 1, 0x00000000, 0x00425d61],
+    [0xbec6b7ec, 0x20000000, 0x00800000, 1, 0x80000000, 0x8018d6fd],
+    [0x00000001, 0x6a2932fa, 0x00400000, 1, 0x00000000, 0x002a4cbf],
+    [0x0becd7b0, 0x2535a659, 0x80000001, 0, 0x80000000, 0x80000001],
+    [0x20000000, 0x08fe0996, 0x807fffff, 0, 0x80000000, 0x807fffff],
+    [0x9d1996e9, 0x03feab54, 0x00400000, 0, 0x00000000, 0x00400000],
+    [0x80000000, 0x9d47e6bf, 0x00000001, 0, 0x00000000, 0x00000001],
+    [0x32d351d2, 0x1f800000, 0x9f800000, 1, 0x80000000, 0x80200000],
+    [0x1452d51e, 0xb9246da0, 0x9682e357, 1, 0x80000000, 0x80000008],
+    [0x84b5a818, 0x2de2cedc, 0x1f800000, 1, 0x00000000, 0x00200000],
+    [0x149e259b, 0x80800000, 0x1a3dc795, 1, 0x00000000, 0x000005ee],
+    [0xff800000, 0x00000001, 0x1e8b9c7b, 0, 0xff800000, 0xff800000],
+    [0x096fea1f, 0x40000000, 0x00400000, 0, 0x09efea2f, 0x09efea2f],
+    [0xb8c9817a, 0x0adcc633, 0x007fffff, 0, 0x842cc747, 0x842cc747],
+    [0x807fffff, 0xff7fffff, 0x3f000000, 0, 0x408fffff, 0x408fffff],
+    [0xff800000, 0x00000001, 0x1e8b9c7b, 1, 0xff800000, 0xff800000],
+    [0x807fffff, 0xff7fffff, 0x3f000000, 1, 0x208fffff, 0x208fffff],
+    [0x802927c2, 0x7f7fffff, 0x80000000, 1, 0x9fa49f07, 0x9fa49f07],
+    [0x007fffff, 0xde01282a, 0x25a1ba53, 1, 0x05a1b64a, 0x05a1b64a],
+    [0x00400000, 0x14afa671, 0x807fffff, 0, 0x80000000, 0x807fffff],
+    [0x95928216, 0x80000001, 0x807fffff, 0, 0x80000000, 0x807fffff],
+    [0x807fffff, 0x3f800000, 0x00000000, 0, 0x80000000, 0x807fffff],
+    [0x9e2d4ac9, 0x80000000, 0x80000001, 0, 0x80000000, 0x80000001],
+    [0x007fffff, 0xff800000, 0x15e81bf3, 0, 0xff800000, 0xff800000],
+    [0x007fffff, 0xff800000, 0x15e81bf3, 1, 0xff800000, 0xff800000],
+];
+
+#[test]
+fn division_fmas_denormals() {
+    let mut failures = Vec::new();
+    for bits in [0xC0u8, 0xD0, 0xE0, 0xF0] {
+        let m = mode(bits, false);
+        let mut input = vec![0u32; THREADS * STRIDE];
+        for (lane, v) in FMAS_DENORMAL_VECTORS.iter().enumerate() {
+            input[lane * STRIDE..lane * STRIDE + 4].copy_from_slice(&v[..4]);
+        }
+        let out = run_mode(&HELPER_CODE, &input, m);
+        for (lane, v) in FMAS_DENORMAL_VECTORS.iter().enumerate() {
+            let expected = if bits & 0x20 != 0 { v[5] } else { v[4] };
+            let single_rounding = v[3] == 1 && expected & 0x7F80_0000 == 0 && expected & 0x7FFF_FFFF != 0 && v[2] & 0x7F80_0000 < 128 << 23;
+            if single_rounding && bits & 0x20 != 0 {
+                continue;
+            }
+            let actual = out[lane * STRIDE + 2];
+            if actual != expected {
+                failures.push(format!("mode {bits:#x} vcc {}: div_fmas({:#x}, {:#x}, {:#x}) = {actual:#x}, expected {expected:#x}", v[3], v[0], v[1], v[2]));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}

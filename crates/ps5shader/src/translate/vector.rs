@@ -1069,9 +1069,10 @@ impl<'a> Translator<'a> {
                 let a = self.src_u16(ins, &m, 0, false);
                 let b = self.src_u16(ins, &m, 1, false);
                 let p = self.b().imul(a, b);
-                let c = self.src_u32(ins, &m, 2);
+                let c = self.mad16_addend(ins, &m);
                 let zero = self.b().u32(0);
                 let r = self.wide_add(m.clamp, p, zero, c, false);
+                let r = self.mad16_result(&m, r);
                 self.write_u32_result(ins, &m, r)
             }
             VPkAddI16 | VPkSubI16 => {
@@ -1194,6 +1195,31 @@ impl<'a> Translator<'a> {
 
     /// `low + addend` with clamp saturation of a 64-bit `(low, high)` +
     /// 32-bit sum (unsigned, or signed with the addend's sign).
+    /// The 32-bit addend of v_mad_u32_u16 / v_mad_i32_i16: op_sel bit 2
+    /// takes the high half of src2, zero-extended for both (measured on
+    /// RDNA2).
+    pub fn mad16_addend(&mut self, ins: &Instruction, m: &Mods) -> Value {
+        let c = self.src_u32(ins, m, 2);
+        if m.op_sel(2) {
+            let sixteen = self.b().u32(16);
+            self.b().lshr(c, sixteen)
+        } else {
+            c
+        }
+    }
+
+    /// The result of v_mad_u32_u16 / v_mad_i32_i16: op_sel bit 3 moves the
+    /// low 16 bits of the (clamped) sum to the high half and clears the
+    /// low half (measured on RDNA2).
+    pub fn mad16_result(&mut self, m: &Mods, r: Value) -> Value {
+        if m.op_sel(3) {
+            let sixteen = self.b().u32(16);
+            self.b().shl(r, sixteen)
+        } else {
+            r
+        }
+    }
+
     pub fn wide_add(&mut self, clamp: bool, low: Value, high: Value, addend: Value, signed: bool) -> Value {
         let sum = self.b().iadd(low, addend);
         if !clamp {

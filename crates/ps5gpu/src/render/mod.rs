@@ -2005,6 +2005,16 @@ mod tests {
         ctx[cx::PA_SC_CLIPRECT_RULE as usize] = 0;
         let b = RegisterBanks { context: &ctx, shader: &[], uconfig: &[] };
         assert!(resolve_scissor(&b).is_empty());
+        // After a context clear the rectangles are (0, 0)-(8192, 8192): a
+        // rule over all four that the game set without writing them clips
+        // to that square instead of to nothing.
+        let mut ctx = super::regfile::initial_context_registers();
+        ctx[cx::PA_SC_SCREEN_SCISSOR_BR as usize] = 0x4000_4000;
+        ctx[cx::PA_SC_WINDOW_SCISSOR_BR as usize] = 0x4000_4000;
+        ctx[cx::PA_SC_GENERIC_SCISSOR_BR as usize] = 0x4000_4000;
+        ctx[cx::PA_SC_CLIPRECT_RULE as usize] = 0x8000;
+        let b = RegisterBanks { context: &ctx, shader: &[], uconfig: &[] };
+        assert_eq!(resolve_scissor(&b), Rect { x0: 0, y0: 0, x1: 8192, y1: 8192 });
     }
 
     #[test]

@@ -1706,19 +1706,29 @@ fn inet_pton(af: i32, text: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Resolver timeout (microseconds) a 0 stands for, and the smallest one
+/// accepted.
+const RESOLVER_DEFAULT_TIMEOUT_US: i32 = 1_000_000;
+
 /// sceNetResolverStartNtoa(rid, hostname, SceNetInAddr* addr, timeout,
 /// retry, flags): dotted IPv4 literals resolve locally; the console is
 /// offline, so names fail with "no DNS".
 fn cb_resolver_start_ntoa(ctx: &mut CpuContext) -> HleResult {
     let (id, host_addr, dst, flags) = (ctx.rdi() as i32, ctx.rsi(), ctx.rdx(), ctx.r9() as i32);
     let (timeout, retry) = (ctx.rcx() as i32, ctx.r8() as i32);
-    // A negative timeout or retry count and any flag bit but 0x1 and
-    // 0x10000 are EINVAL before the resolver is looked up.
-    if host_addr == 0 || dst == 0 || timeout < 0 || retry < 0 || flags as u32 & !0x0001_0001 != 0 {
+    // libSceNet's order: a negative timeout or retry count, any flag bit
+    // but 0x1 and 0x10000, and a timeout under one second (0 stands for
+    // one second) are EINVAL before the resolver is looked up; an unknown
+    // resolver is EBADF before a null name or address is looked at.
+    let timeout = if timeout == 0 { RESOLVER_DEFAULT_TIMEOUT_US } else { timeout };
+    if timeout < RESOLVER_DEFAULT_TIMEOUT_US || retry < 0 || flags as u32 & !0x0001_0001 != 0 {
         return finish(ctx, net_error(EINVAL_));
     }
     if net().resolver_mut(id).is_none() {
         return finish(ctx, net_error(EBADF_));
+    }
+    if host_addr == 0 || dst == 0 {
+        return finish(ctx, net_error(EINVAL_));
     }
     let host = ctx.read_cstr_bytes(host_addr, MAX_NAME_LENGTH).unwrap_or_default();
     if flags & 0x10000 == 0 {
@@ -4434,14 +4444,26 @@ mod tests {
         let rid = cb_resolver_create(&mut ctx);
         assert!((0..RESOLVERS_MAX as i64).contains(&rid));
 
-        // Argument checks come before the resolver id check.
+        // Timeout, retry and flag checks come before the resolver id
+        // check; a null name or address after it (libSceNet 13.42).
         ctx.write_bytes(BASE + 0x100, b"192.168.1.20\0");
         args(&mut ctx, &[0x7777, BASE + 0x100, 0, 0, 0, 0]);
+        assert_eq!(cb_resolver_start_ntoa(&mut ctx), NET_ERROR_BAD_FD as i64);
+        args(&mut ctx, &[rid as u64, BASE + 0x100, 0, 0, 0, 0]);
         assert_eq!(cb_resolver_start_ntoa(&mut ctx), net_error(EINVAL_) as i64);
         args(&mut ctx, &[0x7777, BASE + 0x100, BASE + 0x200, 0, 0, 0]);
         assert_eq!(cb_resolver_start_ntoa(&mut ctx), NET_ERROR_BAD_FD as i64);
         args(&mut ctx, &[rid as u64, BASE + 0x100, BASE + 0x200, 0, 0, 0x2]);
         assert_eq!(cb_resolver_start_ntoa(&mut ctx), net_error(EINVAL_) as i64);
+        // 0 stands for one second; 1..999999 microseconds are refused.
+        for timeout in [1u64, 999_999] {
+            args(&mut ctx, &[0x7777, BASE + 0x100, BASE + 0x200, timeout, 0, 0]);
+            assert_eq!(cb_resolver_start_ntoa(&mut ctx), net_error(EINVAL_) as i64, "{timeout}");
+        }
+        for timeout in [1_000_000u64, 5_000_000, 0x7fff_ffff] {
+            args(&mut ctx, &[0x7777, BASE + 0x100, BASE + 0x200, timeout, 0, 0]);
+            assert_eq!(cb_resolver_start_ntoa(&mut ctx), NET_ERROR_BAD_FD as i64, "{timeout}");
+        }
         for (timeout, retry, flags) in [(-1i32, 0i32, 0u32), (0, -1, 0), (5_000_000, 1, 0x2_0000), (0, 0, 0x1_0003), (0, 0, 0x8000_0000)] {
             args(&mut ctx, &[0x7777, BASE + 0x100, BASE + 0x200, timeout as u32 as u64, retry as u32 as u64, flags as u64]);
             assert_eq!(cb_resolver_start_ntoa(&mut ctx), net_error(EINVAL_) as i64, "{timeout} {retry} {flags:#x}");

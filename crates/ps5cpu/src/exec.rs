@@ -644,7 +644,10 @@ fn read_rsp() -> u64 {
 #[inline(never)]
 pub fn enter_guest(regs: &GuestRegs) -> GuestExit {
     #[cfg(windows)]
-    crate::win::init();
+    {
+        crate::win::init();
+        crate::win::init_thread_fpu();
+    }
     let regs = *regs;
     let t = exec();
     assert!(t.depth < MAX_NESTING, "guest call nesting too deep");

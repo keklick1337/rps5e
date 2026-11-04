@@ -286,7 +286,9 @@ pub(crate) fn poll(handle: u32, need: i32) -> HleResult {
 
 pub(crate) fn signal(handle: u32, n: i32) -> HleResult {
     let Some(s) = get(handle) else { return ERR_NOT_FOUND };
-    if n < 0 {
+    // A count of 0 is EINVAL like a negative one (console oracle row
+    // `sema_signal_zero`).
+    if n < 1 {
         return ERR_INVALID_ARGUMENT;
     }
     let mut g = lock_inner(&s);
@@ -760,12 +762,12 @@ mod tests {
         assert_eq!(signal(h, 3), OK);
         assert_eq!(signal(h, 1), ERR_INVALID_ARGUMENT); // would exceed max
         assert_eq!(signal(h, -1), ERR_INVALID_ARGUMENT);
-        // A zero count adds nothing and succeeds, full or empty.
-        assert_eq!(signal(h, 0), OK);
+        // A zero count is EINVAL (console) and adds nothing, full or empty.
+        assert_eq!(signal(h, 0), ERR_INVALID_ARGUMENT);
         assert_eq!(value(h), Some(3));
         assert_eq!(wait(h, 3, None), OK);
         assert_eq!(value(h), Some(0));
-        assert_eq!(signal(h, 0), OK);
+        assert_eq!(signal(h, 0), ERR_INVALID_ARGUMENT);
         assert_eq!(poll(h, 1), ERR_BUSY);
         assert!(delete(h));
         assert_eq!(poll(h, 1), ERR_NOT_FOUND);

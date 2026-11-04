@@ -76,6 +76,7 @@ const EFAULT: HleResult = kerr(14);
 const EBUSY: HleResult = kerr(16);
 const EINVAL: HleResult = kerr(22);
 const EAGAIN: HleResult = kerr(35);
+const EOPNOTSUPP: HleResult = kerr(45);
 const ENAMETOOLONG: HleResult = kerr(63);
 
 pub(crate) const MAP_FIXED: u64 = 0x10;
@@ -2167,14 +2168,12 @@ impl MemState {
             if ps5vm::ranges::covered(aligned, total) {
                 return if host.protect(aligned, total, prot) { OK } else { EINVAL };
             }
-            return EINVAL;
+            // Nothing mapped in the range: 0 on the console (13.60).
+            return OK;
         }
-        // An unmapped start is EINVAL. Further on, as FreeBSD's
-        // vm_map_protect: holes and reservations (guard entries) are
-        // skipped, every committed part is protected.
-        if pieces[0].start != aligned {
-            return EINVAL;
-        }
+        // As FreeBSD's vm_map_protect: holes (an unmapped start included)
+        // and reservations (guard entries) are skipped, every committed
+        // part is protected.
         let committed: Vec<Range> = pieces.into_iter().filter(|r| r.rtype.committed()).collect();
         for r in &committed {
             if !host.protect(r.start, r.size, prot) {
@@ -2190,6 +2189,14 @@ impl MemState {
             self.ranges.protect(r.start, r.size, prot);
         }
         OK
+    }
+
+    /// Whether a page of `[addr, addr + len)` (widened to pages) is mapped
+    /// flexible memory.
+    fn holds_flexible(&self, addr: u64, len: u64) -> bool {
+        let start = addr & !(PAGE_SIZE - 1);
+        let Some(total) = len.checked_add(addr - start).and_then(|l| align_up(l, PAGE_SIZE)) else { return false };
+        self.ranges.pieces(start, total).iter().any(|p| p.rtype == RangeType::Flexible)
     }
 
     /// sceKernelMtypeprotect: protect as sceKernelMprotect, then give the
@@ -3082,12 +3089,19 @@ fn cb_madvise(ctx: &mut CpuContext) -> HleResult {
 }
 
 /// sceKernelMtypeprotect(addr, len, type, prot): a zero length is 0; the
-/// direct mappings of the range take the memory type.
+/// direct mappings of the range take the memory type. A range holding a
+/// flexible page is EOPNOTSUPP and nothing changes (measured on 13.60:
+/// all-flexible and direct-then-flexible ranges; a range of holes only is 0).
 fn cb_mtypeprotect(ctx: &mut CpuContext) -> HleResult {
-    if ctx.rsi() == 0 {
+    let (addr, len) = (ctx.rdi(), ctx.rsi());
+    if len == 0 {
         return OK;
     }
-    lock().mtype_protect(ctx.rdi(), ctx.rsi(), ctx.rdx() as i32, ctx.rcx() as i32)
+    let mut st = lock();
+    if st.holds_flexible(addr, len) {
+        return EOPNOTSUPP;
+    }
+    st.mtype_protect(addr, len, ctx.rdx() as i32, ctx.rcx() as i32)
 }
 
 /// sceKernelVirtualQuery(addr, flags, info*, info_size)

@@ -511,3 +511,29 @@ fn read_event_on_a_pipe() {
     fs::close(pr).unwrap();
     fs::close(pw).unwrap();
 }
+
+/// sceKernelWaitEqueue checks the event count before the queue and stores
+/// 0 events on every failure (libkernel_sys).
+#[test]
+fn wait_failures_store_no_events() {
+    const BASE: u64 = 0x5CFD_0000_0000;
+    let vm = vm_arena(BASE);
+    let mut ctx = CpuContext::new(vm);
+    let eq = create_named("wait_failures");
+    ctx.write_u32(BASE + 0x10, 0);
+    let call = |ctx: &mut CpuContext, queue: u64, events: u64, num: u64| {
+        ctx.write_u32(BASE + 0x8, 0xdead);
+        ctx.set(crate::CpuRegister::Rdi, queue);
+        ctx.set(crate::CpuRegister::Rsi, events);
+        ctx.set(crate::CpuRegister::Rdx, num);
+        ctx.set(crate::CpuRegister::Rcx, BASE + 0x8);
+        ctx.set(crate::CpuRegister::R8, BASE + 0x10);
+        let r = cb_wait_equeue(ctx);
+        (r, ctx.read_u32(BASE + 0x8))
+    };
+    assert_eq!(call(&mut ctx, 0x1234_5678, BASE + 0x100, 0), (ERR_INVALID_ARGUMENT, Some(0)), "count before queue");
+    assert_eq!(call(&mut ctx, 0x1234_5678, BASE + 0x100, 1), (ERR_BAD_QUEUE, Some(0)));
+    assert_eq!(call(&mut ctx, eq, 0, 1), (ERR_MEMORY_FAULT, Some(0)));
+    assert!(call(&mut ctx, eq, BASE + 0x100, 1) == (ERR_TIMED_OUT, Some(0)), "a timeout stores 0");
+    assert!(delete(eq));
+}

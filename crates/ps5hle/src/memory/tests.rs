@@ -1482,7 +1482,7 @@ fn madvise_and_posix_unmap_protect_contracts() {
     assert_eq!(t.call(cb_posix_munmap, &[m, PAGE * 3]).0, 0);
     assert_eq!(t.call(cb_posix_munmap, &[m, PAGE]).0, 0, "nothing mapped is not an error");
     assert_eq!(posix_madvise(m, PAGE, 4), Ok(0), "advice does not need a mapping");
-    assert_eq!(t.call(cb_posix_mprotect, &[m, PAGE, 1]).0, -1);
+    assert_eq!(t.call(cb_posix_mprotect, &[m, PAGE, 1]).0, 0, "nothing mapped is not an error");
 }
 
 /// The kernel's `munmap` rounds the start down and the end up to page
@@ -1653,7 +1653,8 @@ fn reported_protection_adds_read_for_write() {
 
 /// sceKernelMprotect: a zero length is 0, bits outside 0x3F7 are dropped,
 /// holes and reservations inside the range are skipped while the committed
-/// parts are protected, and an unmapped start is EINVAL.
+/// parts are protected; an unmapped start and a range with nothing mapped
+/// are 0 too (console, 13.60).
 #[test]
 fn mprotect_skips_holes_and_reservations() {
     let t = T::new();
@@ -1678,10 +1679,41 @@ fn mprotect_skips_holes_and_reservations() {
     assert_eq!(t.munmap(base + PAGE, PAGE), OK);
     assert_eq!(t.call(cb_mprotect, &[base, PAGE * 3, PROT_CPU_RW as u64]).0, OK);
     assert_eq!(t.query(base + PAGE * 2, 0).prot, reported_protection(PROT_CPU_RW));
-    // An unmapped start.
-    assert_eq!(t.call(cb_mprotect, &[base + PAGE, PAGE * 2, PROT_CPU_RW as u64]).0, EINVAL);
+    // An unmapped start: the mapped page after the hole changes.
+    assert_eq!(t.call(cb_mprotect, &[base + PAGE, PAGE * 2, PROT_CPU_RD as u64]).0, OK);
+    assert_eq!(t.query(base + PAGE * 2, 0).prot, PROT_CPU_RD);
+    assert_eq!(t.query(base, 0).prot, reported_protection(PROT_CPU_RW), "before the range");
+    // Only a hole, then nothing mapped at all.
+    assert_eq!(t.call(cb_mprotect, &[base + PAGE, PAGE, PROT_CPU_RW as u64]).0, OK);
     assert_eq!(t.munmap(base, PAGE * 4), OK);
-    assert_eq!(t.call(cb_mprotect, &[base, PAGE, PROT_CPU_RW as u64]).0, EINVAL);
+    assert_eq!(t.call(cb_mprotect, &[base, PAGE, PROT_CPU_RW as u64]).0, OK);
+    assert_eq!(t.call(cb_posix_mprotect, &[base, PAGE * 2, PROT_CPU_RW as u64]).0, 0);
+}
+
+/// sceKernelMtypeprotect over a range holding a flexible page is
+/// EOPNOTSUPP (0x8002002D) and changes neither protection nor type, also
+/// when the range starts in direct memory; a range of holes only is 0
+/// (console, 13.60).
+#[test]
+fn mtypeprotect_refuses_flexible_pages() {
+    let t = T::new();
+    let (r, base) = t.reserve(0, PAGE * 4, 0, 0);
+    assert_eq!(r, OK);
+    let phys = t.alloc_ok(PAGE, PAGE);
+    assert_eq!(t.direct(base, PAGE, PROT_CPU_RW, MAP_FIXED, phys, PAGE, "mtype_direct").0, OK);
+    assert_eq!(t.flex(base + PAGE, PAGE, PROT_CPU_RW, MAP_FIXED, Some("mtype_flex")).0, OK);
+    let eopnotsupp = EOPNOTSUPP;
+    assert_eq!(eopnotsupp, 0x8002_002Du32 as i32 as HleResult);
+    assert_eq!(t.call(cb_mtypeprotect, &[base + PAGE, PAGE, 3, PROT_CPU_RD as u64]).0, eopnotsupp, "flexible only");
+    assert_eq!(t.call(cb_mtypeprotect, &[base, PAGE * 2, 3, PROT_CPU_RD as u64]).0, eopnotsupp, "direct then flexible");
+    let q = t.query(base, 0);
+    assert_eq!((q.mtype, q.prot), (MTYPE_C, reported_protection(PROT_CPU_RW)), "nothing changed");
+    assert_eq!(t.query(base + PAGE, 0).prot, reported_protection(PROT_CPU_RW));
+    assert_eq!(t.call(cb_mtypeprotect, &[base, PAGE, 3, PROT_CPU_RD as u64]).0, OK, "direct only");
+    assert_eq!(t.query(base, 0).mtype, 3);
+    assert_eq!(t.munmap(base, PAGE * 4), OK);
+    assert_eq!(t.call(cb_mtypeprotect, &[base, PAGE * 2, 3, PROT_CPU_RD as u64]).0, OK, "holes only");
+    assert_eq!(t.release(phys, PAGE), OK);
 }
 
 /// sceKernelMtypeprotect gives the direct mappings of the range the memory

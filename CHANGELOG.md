@@ -26,6 +26,14 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 - Ray-tracing shaders now intersect BVH triangle nodes of types 2 and 3 (the node's triangles v2 v3 v4 and v2 v4 v0, as the guest's BVH builders lay them out); only types 0 and 1 were tested before, so ~9 % of GTA V's shadow-casting triangles never cast a shadow.
 - The GPU profile (`RPS5E_GPU_PROFILE=1`) lost the GPU time of a submission's earlier command buffers and of its launch batches whenever a launch batch split the submission: the time is now counted, and the batches show as `chained`. GTA V's city was under-reported by ~25-30 ms per frame (real GPU time ~80-85 ms per frame, not ~51).
 - `RPS5E_FRAME_TIMES` files are appended every second instead of being written at shutdown (and every 1024 frames): a run stopped by a timeout no longer leaves a file cut at 2048 frames.
+- `sceKernelMprotect` / `mprotect` over a range that starts in unmapped memory, or that has nothing mapped at all, now changes the mapped pages and returns 0 as the console does (was EINVAL). `sceKernelMtypeprotect` over a range holding flexible memory returns EOPNOTSUPP (0x8002002D) and changes nothing, as on the console.
+- `sceKernelSignalSema` with a count of 0 returns EINVAL as on the console (was 0).
+- `sceKernelWaitEqueue` checks the event count before the queue and stores 0 events on every failure.
+- `sceVideoOutRegisterBuffers` / `sceVideoOutRegisterBuffers2` over buffer slots that are still registered return SLOT_OCCUPIED (0x80290010) instead of RESOURCE_BUSY.
+- `sceNetResolverStartNtoa`: a timeout of 0 stands for one second and a timeout under one second is EINVAL; an unknown resolver id is reported before a missing host name or address, as the system library does.
+- Shaders: `v_mad_u32_u16` / `v_mad_i32_i16` honour op_sel bits 2 and 3 (high half of the 32-bit addend; result into the high half), checked against RDNA2 hardware results; an f64 result clamp keeps a NaN when DX10_CLAMP is off, like f32 and f16; `v_div_fmas_f32` flushes a denormal result in the f32 modes that flush results (its inputs stay unflushed). Games translate their shaders once more on the first start.
+- After a context clear the four clip rectangles are (0, 0)-(8192, 8192), as in the system's register defaults, instead of empty: a clip-rectangle rule set without writing the rectangles no longer hides every draw.
+- Windows: guest threads start with the console's x87 control word (64-bit precision) instead of Windows' 53-bit one, so the games' `long double` arithmetic is no longer rounded short.
 
 ## [0.1.4-alpha] - 2026-11-01
 

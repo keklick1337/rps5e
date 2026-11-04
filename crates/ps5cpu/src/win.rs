@@ -62,6 +62,28 @@ pub(crate) fn init() {
     });
 }
 
+/// x87 control word a new thread starts with on the console (FreeBSD's
+/// initial FPU state: 64-bit precision, round to nearest, every exception
+/// masked). Windows starts threads with 0x27F (53-bit precision), which
+/// would round the guest's `long double` arithmetic.
+const GUEST_INITIAL_FPUCW: u16 = 0x037F;
+
+thread_local! {
+    static FPU_READY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Give this thread the console's initial x87 control word before its
+/// first guest call (once per host thread; later calls keep what the guest
+/// set). MXCSR already starts at 0x1F80, as on the console.
+pub(crate) fn init_thread_fpu() {
+    if FPU_READY.with(|f| f.replace(true)) {
+        return;
+    }
+    let cw = GUEST_INITIAL_FPUCW;
+    // SAFETY: loads the x87 control word from a local.
+    unsafe { std::arch::asm!("fldcw [{p}]", p = in(reg) &cw, options(nostack, readonly, preserves_flags)) };
+}
+
 /// TEB offset of the guest thread-pointer slot.
 pub fn guest_tp_slot() -> u32 {
     init();
@@ -424,5 +446,31 @@ extern "sysv64" fn interrupted(saved: *mut CONTEXT, xsave: *mut u8) -> ! {
         }
         RtlRestoreContext(c, std::ptr::null());
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A thread's first guest call runs with the console's x87 control
+    /// word; a value the guest sets later is kept.
+    #[test]
+    fn guest_threads_start_with_the_console_fpu_control_word() {
+        std::thread::spawn(|| {
+            let read = || {
+                let mut cw = 0u16;
+                // SAFETY: stores the x87 control word into a local.
+                unsafe { std::arch::asm!("fnstcw [{p}]", p = in(reg) &mut cw, options(nostack, preserves_flags)) };
+                cw
+            };
+            super::init_thread_fpu();
+            assert_eq!(read(), super::GUEST_INITIAL_FPUCW);
+            let changed = 0x027Fu16;
+            // SAFETY: loads the x87 control word from a local.
+            unsafe { std::arch::asm!("fldcw [{p}]", p = in(reg) &changed, options(nostack, readonly, preserves_flags)) };
+            super::init_thread_fpu();
+            assert_eq!(read(), changed);
+        })
+        .join()
+        .unwrap();
     }
 }
