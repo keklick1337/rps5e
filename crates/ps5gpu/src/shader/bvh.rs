@@ -1010,7 +1010,9 @@ const CANDIDATE_AABB: u32 = 1;
 const PROXY_LIST: u32 = 0xFFFF_FFFE;
 const COMMITTED_TRIANGLE: u32 = 1;
 const RAY_NO_OPAQUE: u32 = 0x2;
-const RAY_CULL_BACK_FACING: u32 = 0x10;
+/// The faces a guest facing test drops (`sign(t_num) == flip`): Vulkan
+/// calls them front-facing.
+const RAY_CULL_FRONT_FACING: u32 = 0x20;
 const RAY_TERMINATE_ON_FIRST_HIT: u32 = 0x4;
 
 fn closest_only() -> bool {
@@ -1188,7 +1190,7 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                 let origin = e.construct(v3, &ray[0..3]);
                 let direction = e.construct(v3, &ray[3..6]);
                 // (`RPS5E_HW_RT_CLOSEST=1`, diagnostics: never end at the first hit.)
-                let allowed = if closest_only() { RAY_CULL_BACK_FACING } else { RAY_CULL_BACK_FACING | RAY_TERMINATE_ON_FIRST_HIT };
+                let allowed = if closest_only() { RAY_CULL_FRONT_FACING } else { RAY_CULL_FRONT_FACING | RAY_TERMINATE_ON_FIRST_HIT };
                 let mask = e.cu(allowed);
                 let flags = e.band(ray_flags, mask);
                 let t_min = e.cf(0.0);

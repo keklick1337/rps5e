@@ -20,10 +20,60 @@
 
 use std::collections::BTreeMap;
 
+fn writers_enabled() -> bool {
+    crate::pipeline::frontend::word_speculation() != 0
+}
+
+impl WrittenWords {
+    /// Diagnostics: the newest recorded GPU write covering `addr`: its
+    /// range and the work that recorded it.
+    pub fn writer_of(&self, addr: u64) -> Option<(u64, u64, u64)> {
+        self.writers.range(..=addr).rev().take(64).find(|(_, &(e, _))| e > addr).map(|(&s, &(e, w))| (s, e, w))
+    }
+
+    /// The newest tick of the GPU writes recorded over `[addr, addr+size)`
+    /// when every byte is covered by a record (pending or landed); None
+    /// when a byte has none (never written by GPU work as far as the record
+    /// knows, or its record was dropped).
+    pub fn settled(&self, addr: u64, size: u64) -> Option<u64> {
+        let end = addr + size;
+        if self.lost_all || self.lost.range(..end).next_back().is_some_and(|(_, &le)| le > addr) {
+            return None;
+        }
+        let mut cur = addr;
+        let mut tick = 0;
+        for (&s, &(e, st)) in self.overlapping(addr, end) {
+            if s > cur {
+                return None;
+            }
+            tick = tick.max(match st {
+                State::Pending(t) | State::Landed(t) => t,
+            });
+            cur = e;
+            if cur >= end {
+                return Some(tick);
+            }
+        }
+        None
+    }
+}
+
+/// The tick of the newest draw or dispatch recorded that stores through
+/// device addresses without an evaluated range (its writes reach no write
+/// record; diagnostics, see `SharedWrittenWords::writes_complete`).
+pub static UNRANGED_WRITE_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note a draw or dispatch recorded in `tick` that stores through device
+/// addresses without an evaluated range.
+pub fn note_unranged_write(tick: u64) {
+    UNRANGED_WRITE_TICK.fetch_max(tick, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// Written, no write-through recorded yet.
-    Pending,
+    /// Written by GPU work recorded in this tick, no write-through
+    /// recorded yet.
+    Pending(u64),
     /// In guest memory once this tick completed.
     Landed(u64),
 }
@@ -39,6 +89,9 @@ fn in_place_enabled() -> bool {
 pub(super) struct WrittenWords {
     /// start -> (end, state); the ranges never overlap.
     map: BTreeMap<u64, (u64, State)>,
+    /// Diagnostics (`RPS5E_WORD_SPECULATION`): the work that recorded each
+    /// GPU write (start -> (end, kind << 56 | shader address)).
+    writers: BTreeMap<u64, (u64, u64)>,
     /// Ranges of records dropped when the record was full (start -> end,
     /// merged, never overlapping): GPU work may have written there.
     lost: BTreeMap<u64, u64>,
@@ -87,9 +140,15 @@ impl WrittenWords {
         self.map.insert(start, (end, state));
     }
 
-    /// GPU work recorded now writes `[addr, addr+size)`.
-    pub fn written(&mut self, addr: u64, size: u64) {
-        self.insert(addr, addr + size, State::Pending);
+    /// GPU work recorded now (in `tick`) writes `[addr, addr+size)`.
+    pub fn written(&mut self, addr: u64, size: u64, tick: u64) {
+        if writers_enabled() {
+            if self.writers.len() > 1 << 16 {
+                self.writers.clear();
+            }
+            self.writers.insert(addr, (addr + size, crate::backend::profile::work()));
+        }
+        self.insert(addr, addr + size, State::Pending(tick));
     }
 
     /// A write-through of the pages `[page_start, page_end)` is recorded in
@@ -105,7 +164,7 @@ impl WrittenWords {
         self.split_pending_at(page_start);
         self.split_pending_at(page_end);
         for (_, v) in self.map.range_mut(page_start..page_end) {
-            if v.1 == State::Pending {
+            if matches!(v.1, State::Pending(_)) {
                 v.1 = State::Landed(tick);
             }
         }
@@ -116,7 +175,7 @@ impl WrittenWords {
     /// before and after `at`.
     fn split_pending_at(&mut self, at: u64) {
         if let Some((&s, &(e, st))) = self.map.range(..at).next_back() {
-            if e > at && st == State::Pending {
+            if e > at && matches!(st, State::Pending(_)) {
                 self.map.insert(s, (at, st));
                 self.map.insert(at, (e, st));
             }
@@ -128,7 +187,7 @@ impl WrittenWords {
     fn written_through_by_inserts(&mut self, page_start: u64, page_end: u64, addr: u64, size: u64, tick: u64) {
         let pending: Vec<(u64, u64)> = self
             .overlapping(page_start, page_end)
-            .filter(|(_, &(_, st))| st == State::Pending)
+            .filter(|(_, &(_, st))| matches!(st, State::Pending(_)))
             .map(|(&s, &(e, _))| (s.max(page_start), e.min(page_end)))
             .collect();
         for (s, e) in pending {
@@ -187,7 +246,7 @@ impl WrittenWords {
         let mut tick = 0;
         for (_, &(_, st)) in self.overlapping(addr, end) {
             match st {
-                State::Pending => return None,
+                State::Pending(_) => return None,
                 State::Landed(t) => tick = tick.max(t),
             }
         }
@@ -203,7 +262,7 @@ impl WrittenWords {
         } else {
             self.overlapping(start, end)
                 .map(|(&s, &(e, st))| (s, e, match st {
-                    State::Pending => None,
+                    State::Pending(_) => None,
                     State::Landed(t) => Some(t),
                 }))
                 .collect()
@@ -216,7 +275,7 @@ impl WrittenWords {
         self.overlapping(start, end)
             .take(24)
             .map(|(&s, &(e, st))| match st {
-                State::Pending => format!("{s:#x}+{:#x}:P", e - s),
+                State::Pending(t) => format!("{s:#x}+{:#x}:P{t}", e - s),
                 State::Landed(t) => format!("{s:#x}+{:#x}:L{t}", e - s),
             })
             .collect()
@@ -234,7 +293,7 @@ impl WrittenWords {
                 return None;
             }
             match st {
-                State::Pending => return None,
+                State::Pending(_) => return None,
                 State::Landed(t) => tick = tick.max(t),
             }
             cur = e;
@@ -284,10 +343,10 @@ mod tests {
     #[test]
     fn a_neighbouring_write_keeps_the_old_landing() {
         let mut w = WrittenWords::default();
-        w.written(0x1800, 0x39300);
+        w.written(0x1800, 0x39300, 1);
         w.written_through(0x1000, 0x3b000, 0x1800, 0x39300, 10);
         assert_eq!(w.landed(0x1850, 4), Some(10));
-        w.written(0x1900, 0xc0);
+        w.written(0x1900, 0xc0, 1);
         assert_eq!(w.landed(0x1850, 4), Some(10));
         assert_eq!(w.landed(0x1900, 4), None, "pending");
         w.written_through(0x1000, 0x2000, 0x1900, 0xc0, 12);
@@ -301,13 +360,27 @@ mod tests {
     #[test]
     fn a_pending_write_lands_with_the_next_write_through_of_its_page() {
         let mut w = WrittenWords::default();
-        w.written(0x0, 0x10000);
+        w.written(0x0, 0x10000, 1);
         assert_eq!(w.landed(0x2050, 4), None);
-        w.written(0x2400, 0x10);
+        w.written(0x2400, 0x10, 1);
         w.written_through(0x2000, 0x3000, 0x2400, 0x10, 7);
         assert_eq!(w.landed(0x2050, 4), Some(7));
         assert_eq!(w.landed(0x3050, 4), None, "another page is still pending");
         assert_eq!(w.landed(0x10000, 4), None, "not written");
+    }
+
+    /// Every byte covered by GPU write records: the newest writer's tick
+    /// (pending or landed); a byte without a record: none.
+    #[test]
+    fn settled_ranges_report_their_newest_writer() {
+        let mut w = WrittenWords::default();
+        w.written(0x1000, 0x100, 4);
+        w.written(0x1080, 0x10, 7);
+        assert_eq!(w.settled(0x1000, 4), Some(4));
+        assert_eq!(w.settled(0x1078, 0x10), Some(7));
+        w.written_through(0x0, 0x4000, 0x1000, 4, 9);
+        assert_eq!(w.settled(0x1000, 4), Some(9), "landed by a later write-through");
+        assert_eq!(w.settled(0x10fc, 8), None, "a byte past the records");
     }
 
     /// A newer write over a landed range makes it pending again; a
@@ -315,9 +388,9 @@ mod tests {
     #[test]
     fn rewrites_and_downloads() {
         let mut w = WrittenWords::default();
-        w.written(0x0, 0x100);
+        w.written(0x0, 0x100, 1);
         w.written_through(0x0, 0x1000, 0x0, 0x100, 3);
-        w.written(0x40, 0x8);
+        w.written(0x40, 0x8, 1);
         assert_eq!(w.landed(0x40, 4), None);
         assert_eq!(w.landed(0x80, 4), Some(3));
         w.forget(0x0, 0x1000);
@@ -343,8 +416,8 @@ mod tests {
                 let size = 4 + (r >> 40) % 0x3000 & !3;
                 match r % 5 {
                     0 | 1 => {
-                        a.written(addr, size);
-                        b.written(addr, size);
+                        a.written(addr, size, 1);
+                        b.written(addr, size, 1);
                     }
                     2 | 3 => {
                         let (ps, pe) = (addr & !0xFFF, (addr + size + 0xFFF) & !0xFFF);
@@ -367,7 +440,7 @@ mod tests {
     #[test]
     fn unwritten_words_stay_known_across_a_full_record() {
         let mut w = WrittenWords::default();
-        w.written(0x15c0, 0xb8);
+        w.written(0x15c0, 0xb8, 1);
         assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0));
         assert!(w.in_guest_memory_after(0x1674, 4) != Some(0), "last word of the range");
         assert!(w.in_guest_memory_after(0x1690, 4) == Some(0), "after the range on its page");
@@ -375,7 +448,7 @@ mod tests {
         w.written_through(0x1000, 0x2000, 0x15c0, 0xb8, 5);
         assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0), "landed is still written");
         for i in 0..WrittenWords::MAX as u64 {
-            w.written(0x100000 + i * 16, 8);
+            w.written(0x100000 + i * 16, 8, 1);
         }
         assert!(w.in_guest_memory_after(0x15c0, 4) != Some(0), "dropped from the full record");
         assert!(w.in_guest_memory_after(0x1690, 4) == Some(0));
@@ -391,7 +464,7 @@ mod tests {
     fn guest_memory_holds_unwritten_and_landed_words() {
         let mut w = WrittenWords::default();
         assert_eq!(w.in_guest_memory_after(0x1000, 4), Some(0));
-        w.written(0x1000, 0x10);
+        w.written(0x1000, 0x10, 1);
         assert_eq!(w.in_guest_memory_after(0x1000, 4), None, "pending");
         assert_eq!(w.in_guest_memory_after(0x1010, 4), Some(0), "next to it");
         w.written_through(0x1000, 0x2000, 0x1000, 0x10, 9);
@@ -400,7 +473,7 @@ mod tests {
         assert_eq!(page.in_guest_memory_after(0x100c, 8), Some(9), "the page copy agrees");
         assert_eq!(page.in_guest_memory_after(0x1f00, 4), Some(0));
         assert_eq!(page.in_guest_memory_after(0x2000, 4), None, "outside the page");
-        w.written(0x1004, 4);
+        w.written(0x1004, 4, 1);
         assert_eq!(w.in_guest_memory_after(0x1000, 0x10), None, "rewritten");
         assert_eq!(w.page_words(0x1000, 0x2000).in_guest_memory_after(0x1004, 4), None);
     }
@@ -409,11 +482,11 @@ mod tests {
     fn a_full_record_is_cleared() {
         let mut w = WrittenWords::default();
         for i in 0..WrittenWords::MAX as u64 {
-            w.written(i * 16, 8);
+            w.written(i * 16, 8, 1);
             w.written_through(i * 16 & !0xFFF, (i * 16 & !0xFFF) + 0x1000, i * 16, 8, 1);
         }
         assert!(w.map.len() <= WrittenWords::MAX);
-        w.written(1 << 40, 8);
+        w.written(1 << 40, 8, 1);
         assert!(w.map.len() < WrittenWords::MAX);
     }
 }

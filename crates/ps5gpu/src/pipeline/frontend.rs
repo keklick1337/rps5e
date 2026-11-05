@@ -365,6 +365,107 @@ fn note_slow_word_wait(program: u64, addr: u64, waited: std::time::Duration, rec
     );
 }
 
+/// `RPS5E_WORD_SPECULATION=check` (diagnostics): every GPU-written word a
+/// materialisation waits for is compared with the value guest memory held
+/// before the wait (counted per program), its wait timed by whether every
+/// GPU write of it had completed, and attributed to the work whose write
+/// record covers it (`[gpu]` line `word-spec=`; waits of 1 ms or more are
+/// logged).
+pub(crate) fn word_speculation() -> u8 {
+    static V: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("RPS5E_WORD_SPECULATION").as_deref() {
+        Ok("check") => 1,
+        _ => 0,
+    })
+}
+
+/// Counters of [`word_speculation`].
+pub(crate) struct WordSpecStats {
+    pub same: std::sync::atomic::AtomicU64,
+    pub changed: std::sync::atomic::AtomicU64,
+    programs: std::sync::Mutex<Vec<(u64, u64, u64)>>,
+    /// (waiting program, writer work, word offset in the writer's range,
+    /// range size) -> waits.
+    writers: std::sync::Mutex<Vec<((u64, u64, u64, u64), u64)>>,
+    /// Waits (count, microseconds) for words whose writers had not / had
+    /// all completed.
+    waits: [std::sync::atomic::AtomicU64; 2],
+    wait_us: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl WordSpecStats {
+    /// A wait of `us` for a word whose writers had all completed or not.
+    fn note_wait(&self, complete: bool, us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = complete as usize;
+        self.waits[i].fetch_add(1, Relaxed);
+        self.wait_us[i].fetch_add(us, Relaxed);
+    }
+
+    fn note_writer(&self, program: u64, addr: u64, writer: Option<(u64, u64, u64)>) {
+        let key = match writer {
+            Some((s, e, w)) => (program, w, addr - s, e - s),
+            None => (program, 0, 0, 0),
+        };
+        let mut g = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.iter_mut().find(|e| e.0 == key) {
+            e.1 += 1;
+        } else if g.len() < 4096 {
+            g.push((key, 1));
+        }
+    }
+
+    fn note(&self, program: u64, same: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if same { &self.same } else { &self.changed }.fetch_add(1, Relaxed);
+        let mut p = self.programs.lock().unwrap_or_else(|e| e.into_inner());
+        match p.iter_mut().find(|e| e.0 == program) {
+            Some(e) => {
+                if same {
+                    e.1 += 1
+                } else {
+                    e.2 += 1
+                }
+            }
+            None => p.push((program, same as u64, !same as u64)),
+        }
+    }
+
+    /// The `[gpu]` line part (empty when off).
+    pub fn line(&self) -> String {
+        use std::sync::atomic::Ordering::Relaxed;
+        if word_speculation() == 0 {
+            return String::new();
+        }
+        let mut p = self.programs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        p.sort_unstable_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        let top: Vec<String> = p.iter().take(16).map(|(a, s, c)| format!("{a:#x}:{s}/{c}")).collect();
+        let mut w = self.writers.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        w.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let wr: Vec<String> = w.iter().take(24).map(|((p, k, o, n), c)| format!("p{p:#x}<-{}{:#x}+{o:#x}/{n:#x}:{c}", k >> 56, k & ((1 << 56) - 1))).collect();
+        format!(
+            " word-spec=waits pending {}/{}us complete {}/{}us same {} changed {} [{}] writers [{}]",
+            self.waits[0].load(Relaxed),
+            self.wait_us[0].load(Relaxed),
+            self.waits[1].load(Relaxed),
+            self.wait_us[1].load(Relaxed),
+            self.same.load(Relaxed),
+            self.changed.load(Relaxed),
+            top.join(" "),
+            wr.join(" ")
+        )
+    }
+}
+
+pub(crate) static WORD_SPEC: WordSpecStats = WordSpecStats {
+    same: std::sync::atomic::AtomicU64::new(0),
+    changed: std::sync::atomic::AtomicU64::new(0),
+    programs: std::sync::Mutex::new(Vec::new()),
+    writers: std::sync::Mutex::new(Vec::new()),
+    waits: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+    wait_us: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+};
+
 /// `RPS5E_WORD_WAIT_LOG=<seconds>` (diagnostics): the first GPU-written words a
 /// materialisation waits for are logged with the exact write record and
 /// the page's history (`RPS5E_MEM_HISTORY=1`).
@@ -1632,6 +1733,11 @@ impl ShaderFrontend {
                             );
                         }
                     }
+                    let spec = word_speculation();
+                    let mut stale = [0u8; 4];
+                    let had_stale = spec != 0 && memory.read_backing(a, &mut stale);
+                    let complete = (spec != 0).then(|| written_words.as_ref().is_some_and(|(w, t)| w.writes_complete(a, 4, t)));
+                    let spec_t0 = (spec != 0).then(std::time::Instant::now);
                     // Timed only for the wait report (the clock is not free).
                     let t0 = crate::backend::profile::desc_wait_why().then(std::time::Instant::now);
                     let before = crate::backend::profile::desc_wait_why().then(|| b.cache().describe_word(a, s.current_tick()));
@@ -1641,6 +1747,27 @@ impl ShaderFrontend {
                     }
                     forget_page(a);
                     waited.set(true);
+                    if let (Some(c), Some(t0)) = (complete, spec_t0) {
+                        let us = t0.elapsed().as_micros() as u64;
+                        WORD_SPEC.note_wait(c, us);
+                        static LONG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if us >= 1000 && LONG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 600 {
+                            let writer = written_words.as_ref().and_then(|(w, _)| w.writer_of(a));
+                            log::info!(
+                                "ps5gpu: word-spec long wait p{shader_base:#x} word {a:#x} {us} us complete {c} writer {:x?} | {}",
+                                writer.map(|(s, e, w)| (s, e - s, w >> 56, w & ((1 << 56) - 1))),
+                                b.cache().describe_word(a, s.current_tick())
+                            );
+                        }
+                    }
+                    if had_stale {
+                        let mut now = [0u8; 4];
+                        if memory.read_backing(a, &mut now) {
+                            WORD_SPEC.note(shader_base, now == stale);
+                            let writer = written_words.as_ref().and_then(|(w, _)| w.writer_of(a));
+                            WORD_SPEC.note_writer(shader_base, a, writer);
+                        }
+                    }
                 } else {
                     return None;
                 }

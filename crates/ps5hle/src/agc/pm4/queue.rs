@@ -28,6 +28,43 @@ pub const QUEUE_COUNT: usize = 1 + COMPUTE_QUEUE_COUNT;
 static IDLE_NO_WORK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static IDLE_BLOCKED_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `RPS5E_PM4_BLOCKED_WHY=1` (diagnostics): the time every queue head was
+/// blocked is summed per set of heads (queue, packet, waited address and
+/// kind) and the largest are logged with the `[pm4]` line.
+fn blocked_why_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_PM4_BLOCKED_WHY").is_ok_and(|v| v == "1"))
+}
+
+type BlockedHeads = Vec<(usize, u64, u64, &'static str)>;
+
+static BLOCKED_WHY: std::sync::Mutex<Vec<(BlockedHeads, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn note_blocked(heads: BlockedHeads, us: u64) {
+    let mut g = BLOCKED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.iter_mut().find(|e| e.0 == heads) {
+        e.1 += us;
+        e.2 += 1;
+    } else if g.len() < 4096 {
+        g.push((heads, us, 1));
+    }
+}
+
+fn blocked_why_line() -> String {
+    let mut g = BLOCKED_WHY.lock().unwrap_or_else(|e| e.into_inner());
+    g.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    let parts: Vec<String> = g
+        .iter()
+        .take(10)
+        .map(|(h, us, n)| {
+            let heads: Vec<String> = h.iter().map(|(q, p, a, k)| format!("q{q}@{p:#x}[{a:#x}]{k}")).collect();
+            format!("{} ms/{n}x {}", us / 1000, heads.join(","))
+        })
+        .collect();
+    g.clear();
+    parts.join(" | ")
+}
+
 /// How long the GPU thread waits before re-polling blocked submissions.
 const RETRY_INTERVAL: Duration = Duration::from_micros(100);
 
@@ -406,6 +443,7 @@ impl GpuQueue {
                 SliceResult::AllBlocked => {
                     let t = Instant::now();
                     let st = self.lock();
+                    let why = blocked_why_enabled().then(|| Self::blocked_heads(&st));
                     // A label written since the heads blocked (end-of-pipe
                     // work unblocks them, see `retry_blocked`) or a new
                     // submission: run again without waiting.
@@ -416,6 +454,9 @@ impl GpuQueue {
                     };
                     Self::unblock_all(&mut st);
                     IDLE_BLOCKED_US.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(heads) = why {
+                        note_blocked(heads, t.elapsed().as_micros() as u64);
+                    }
                 }
                 _ => {}
             }
@@ -434,7 +475,7 @@ impl GpuQueue {
                     );
                 }
                 log::info!(
-                    "[pm4] packets={} draws={} dispatches={} flips={} labels={} interrupts={} frames={} idle no-work {} ms, blocked {} ms",
+                    "[pm4] packets={} draws={} dispatches={} flips={} labels={} interrupts={} frames={} held-writes={} idle no-work {} ms, blocked {} ms",
                     PACKETS.load(Relaxed),
                     DRAWS.load(Relaxed),
                     DISPATCHES.load(Relaxed),
@@ -442,12 +483,16 @@ impl GpuQueue {
                     LABEL_WRITES.load(Relaxed),
                     INTERRUPTS.load(Relaxed),
                     self.frames(),
+                    WRITES_HELD.load(Relaxed),
                     IDLE_NO_WORK_US.load(Relaxed) / 1000,
                     IDLE_BLOCKED_US.load(Relaxed) / 1000
                 );
                 if let Some(s) = ps5gpu::backend::summary() {
                     log::info!("[gpu] {s}");
                     log::info!("[gpu-sys] {}", ps5gpu::perf::sys::line());
+                }
+                if blocked_why_enabled() {
+                    log::info!("[pm4] blocked by (heads: queue@packet [addr] kind): {}", blocked_why_line());
                 }
                 let stuck = Self::stuck_heads(&self.lock(), Duration::from_secs(5));
                 if !stuck.is_empty() {
@@ -478,10 +523,35 @@ impl GpuQueue {
             .collect()
     }
 
+    /// What every queue head waits for (`RPS5E_PM4_BLOCKED_WHY`): queue,
+    /// packet, the address of its memory wait and whether that address is
+    /// an end-of-pipe label (`gpu`), or a held write (`held`).
+    fn blocked_heads(st: &State) -> Vec<(usize, u64, u64, &'static str)> {
+        st.queues
+            .iter()
+            .filter_map(|q| q.front())
+            .map(|s| {
+                let (addr, kind) = match s.exec.waiting_on {
+                    _ if s.exec.held() => {
+                        // The held packet's opcode (PM4 type-3 header bits 15:8).
+                        let mut h = [0u8; 4];
+                        let op = if crate::agc::mem::read(s.exec.current_packet(), &mut h) { (u32::from_le_bytes(h) >> 8) & 0xFF } else { 0 };
+                        (op as u64, "held")
+                    }
+                    Some((addr, ..)) => (addr, if super::interp::is_gpu_label(addr) { "gpu" } else { "mem" }),
+                    None => (0, "other"),
+                };
+                (s.queue, s.exec.current_packet(), addr, kind)
+            })
+            .collect()
+    }
+
     fn unblock_all(st: &mut State) {
         for q in st.queues.iter_mut() {
             if let Some(h) = q.front_mut() {
-                h.blocked = false;
+                // A head holding a write behind a late write stays blocked
+                // until that write landed.
+                h.blocked = h.exec.held();
             }
         }
     }

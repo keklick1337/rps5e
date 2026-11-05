@@ -27,7 +27,7 @@
 //!
 //! It then adds a copy of the nest whose nodes come from host ray queries
 //! ([`RtOp`]): each invocation runs a query over the host's mirror of the
-//! BVH (`Begin`, with the guest ray, its instance mask, and back-face
+//! BVH (`Begin`, with the guest ray, its instance mask, and facing
 //! culling and first-hit ending when the nest culls by facing and never
 //! narrows its query extent); the RT cores commit opaque triangles (by the
 //! leaf entries' and instances' flags) and hand out the others one at a
@@ -276,9 +276,12 @@ struct Nest {
     /// byte (bits 31:24 of the word at +60) against a value from before
     /// the nest: the host query culls by it too.
     mask: Option<Entry>,
-    /// The nest culls back faces (it tests the sign of a triangle query's
-    /// `t_num`, the facing): the host query culls them too (the instances'
-    /// flags may disable or flip it, as the guest's do).
+    /// The nest culls by facing (it tests the sign of a triangle query's
+    /// `t_num`): the host query culls the same faces (the instances' flags
+    /// may disable or flip it, as the guest's do). The guest keeps the
+    /// triangles whose `t_num` is negative unless the instance is flipped
+    /// (the console drivers' rule `sign(t_num) != flip`); Vulkan calls those
+    /// back-facing, so the host culls front-facing ones.
     cull: bool,
     /// The root query's extent never changes in the nest (a header phi or
     /// a value made in it would): the guest accepts the first candidate it
@@ -772,9 +775,9 @@ fn rewrite(func: &mut Function, n: &Nest, slot: u8) -> Block {
     begin.push(mask);
     let active = n.active.make(func, s1);
     begin.push(active);
-    // Ray flags (SPIR-V `RayFlags`): cull back-facing triangles,
-    // terminate on the first hit.
-    begin.push(func.const_u32(if n.cull { 0x10 } else { 0 } | if n.first_hit { 0x4 } else { 0 }));
+    // Ray flags (SPIR-V `RayFlags`): cull front-facing triangles (the faces
+    // the guest drops, see `Nest::cull`), terminate on the first hit.
+    begin.push(func.const_u32(if n.cull { 0x20 } else { 0 } | if n.first_hit { 0x4 } else { 0 }));
     func.append(s1, Op::RtQuery(RtOp::Begin { slot }), Type::VOID, begin);
     let enter = func.const_bool(true);
     {

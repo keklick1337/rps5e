@@ -631,7 +631,7 @@ pub enum RtOp {
     /// otherwise. The same in every invocation of the wave.
     Lookup { levels: u8 },
     /// `(entry, origin x, y, z, direction x, y, z, extent: u32 bits, cull
-    /// mask, active: bool, ray flags: u32 (cull back faces 0x10, end at
+    /// mask, active: bool, ray flags: u32 (cull front faces 0x20, end at
     /// the first hit 0x4))`: start the query of
     /// `slot` over the mirror `entry` (from `Lookup`); instances whose mask
     /// byte shares no bit with the cull mask are skipped; an inactive

@@ -1640,44 +1640,73 @@ fn cp_occlusion_dumps_queued_without_waiting() {
     assert!(sum > 0, "the object stays visible");
 }
 
-/// `RPS5E_LABELS_AT_EOP=cpu` (opt-in; the test runs with that set): an end-of-pipe label reaches
-/// guest memory only once the GPU finished the work before it, while the
-/// command processor's own wait on it is satisfied as soon as the label
-/// was recorded (the executor shows it to the interpreter's reads).
-#[test]
-fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
-    type Landing = Box<dyn FnOnce() + Send>;
-    #[derive(Default)]
-    struct Gpu {
-        done: Mutex<Vec<Landing>>,
-        labels: Mutex<Vec<(u64, Vec<u8>)>>,
+/// A fake GPU for the `RPS5E_LABELS_AT_EOP=cpu` tests: late writes are kept
+/// until the test runs their landings (the GPU finished), and the
+/// interpreter's reads see them at once.
+#[derive(Default)]
+struct LateGpu {
+    done: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    labels: Mutex<Vec<(u64, Vec<u8>)>>,
+}
+
+impl ps5gpu::render::RenderExecutor for LateGpu {
+    fn draw(&self, _: &ps5gpu::render::ResolvedDraw) {}
+    fn dispatch(&self, _: &ps5gpu::render::ResolvedDispatch) {}
+    fn after_pipe(&self, done: Box<dyn FnOnce() + Send>) {
+        self.done.lock().unwrap().push(done);
     }
-    impl ps5gpu::render::RenderExecutor for Gpu {
-        fn draw(&self, _: &ps5gpu::render::ResolvedDraw) {}
-        fn dispatch(&self, _: &ps5gpu::render::ResolvedDispatch) {}
-        fn after_pipe(&self, done: Landing) {
-            self.done.lock().unwrap().push(done);
+    fn label_after_gpu(&self, addr: u64, data: &[u8], write: Box<dyn FnOnce() + Send>) {
+        self.labels.lock().unwrap().push((addr, data.to_vec()));
+        self.after_pipe(write);
+    }
+    fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
+        if !read(out) {
+            return false;
         }
-        fn label_after_gpu(&self, addr: u64, data: &[u8], write: Landing) {
-            self.labels.lock().unwrap().push((addr, data.to_vec()));
-            self.after_pipe(write);
-        }
-        fn read_ordered(&self, addr: u64, out: &mut [u8], read: &dyn Fn(&mut [u8]) -> bool) -> bool {
-            if !read(out) {
-                return false;
-            }
-            for (a, d) in self.labels.lock().unwrap().iter() {
-                for (i, b) in out.iter_mut().enumerate() {
-                    let at = addr + i as u64;
-                    if at >= *a && at < a + d.len() as u64 {
-                        *b = d[(at - a) as usize];
-                    }
+        for (a, d) in self.labels.lock().unwrap().iter() {
+            for (i, b) in out.iter_mut().enumerate() {
+                let at = addr + i as u64;
+                if at >= *a && at < a + d.len() as u64 {
+                    *b = d[(at - a) as usize];
                 }
             }
-            true
         }
+        true
     }
-    if std::env::var("RPS5E_LABELS_AT_EOP").as_deref() != Ok("cpu") {
+}
+
+/// Runs a queue with a [`LateGpu`] over the commands built in `e`.
+fn run_late(e: &Env) -> (std::sync::Arc<LateGpu>, GpuQueue) {
+    let rec = std::sync::Arc::new(LateGpu::default());
+    let q = GpuQueue::new(1);
+    let ex: std::sync::Arc<dyn ps5gpu::render::RenderExecutor> = rec.clone();
+    q.with_interpreter(0, |i| i.executor = Some(ex));
+    submit_cb(e, &q);
+    run_queue(&q);
+    (rec, q)
+}
+
+/// The landings [`LateGpu`] holds (the GPU finishing its work), one at a
+/// time with `after` called after each.
+fn land_all(rec: &LateGpu, mut after: impl FnMut()) -> usize {
+    let landings = std::mem::take(&mut *rec.done.lock().unwrap());
+    let n = landings.len();
+    for f in landings {
+        f();
+        after();
+    }
+    n
+}
+
+/// `RPS5E_LABELS_AT_EOP=cpu` (opt-in; run with it set): an end-of-pipe label reaches
+/// guest memory only once the GPU finished the work before it, while the
+/// command processor's own wait on it is satisfied as soon as the label
+/// was recorded (the executor shows it to the interpreter's reads). A
+/// memory write after that wait waits until the label landed, as on the
+/// console (the command processor goes on once the label is in memory).
+#[test]
+fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
+    if !matches!(std::env::var("RPS5E_LABELS_AT_EOP").as_deref().map(str::trim), Ok("cpu")) {
         return;
     }
     let e = Env::new();
@@ -1690,19 +1719,58 @@ fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
     e.call("sceAgcCbReleaseMem", &[e.cb(), 0x28, 0, 0, 0, label], &[1, 1, 0, 0, 0, 0]);
     e.call("sceAgcDcbWaitRegMem", &[e.cb(), 0, 3, 0, 0, label], &[1, 0xFFFF_FFFF, 16]);
     e.call("sceAgcDcbWriteData", &[e.cb(), 5, 0, out, seven, 1], &[0, 0]);
-    let rec = std::sync::Arc::new(Gpu::default());
-    let q = GpuQueue::new(1);
-    let ex: std::sync::Arc<dyn ps5gpu::render::RenderExecutor> = rec.clone();
-    q.with_interpreter(0, |i| i.executor = Some(ex));
-    submit_cb(&e, &q);
-    run_queue(&q);
-    assert_eq!(q.pending(), 0, "the wait saw the recorded label");
-    assert_eq!(mem::r32(out), Some(7));
+    let (rec, q) = run_late(&e);
     assert_eq!(mem::r32(label), Some(0), "the CPU sees the label only after the GPU");
-    for f in std::mem::take(&mut *rec.done.lock().unwrap()) {
-        f();
-    }
+    assert_eq!(mem::r32(out), Some(0), "the write after the wait comes after the label");
+    assert_eq!(q.pending(), 1, "the queue went past the wait and holds the write");
+    assert_eq!(land_all(&rec, || assert_eq!(mem::r32(out), Some(0))), 1);
     assert_eq!(mem::r32(label), Some(1));
+    // A landing retries the blocked queues (of the global queue set).
+    q.retry_blocked();
+    run_queue(&q);
+    assert_eq!(q.pending(), 0);
+    assert_eq!(mem::r32(out), Some(7));
+}
+
+/// A label kept in memory the guest reuses once the command processor
+/// reports it is past the label (Demon's Souls keeps such labels in its
+/// command buffers): the guest sees the report only after the label
+/// landed, so its new contents are never overwritten by the stale label.
+#[test]
+fn late_labels_never_land_over_memory_the_guest_reused() {
+    if !matches!(std::env::var("RPS5E_LABELS_AT_EOP").as_deref().map(str::trim), Ok("cpu")) {
+        return;
+    }
+    let e = Env::new();
+    // The label lives in the command space after the commands (as if a
+    // NOP's payload of this command buffer held it).
+    let label = e.a(CMD_END - 0x40);
+    let done = e.a(LABELS + 0x80);
+    mem::w32(label, 0);
+    mem::w32(done, 0);
+    let one = e.a(DATA + 0x48);
+    mem::w32(one, 1);
+    e.call("sceAgcCbReleaseMem", &[e.cb(), 0x28, 0, 0, 0, label], &[1, 1, 0, 0, 0, 0]);
+    e.call("sceAgcDcbWaitRegMem", &[e.cb(), 0, 3, 0, 0, label], &[1, 0xFFFF_FFFF, 16]);
+    e.call("sceAgcDcbWriteData", &[e.cb(), 5, 0, done, one, 1], &[0, 0]);
+    let (rec, q) = run_late(&e);
+    // The guest polls `done` and rewrites the command memory once it is set;
+    // the GPU finishes its work one landing at a time meanwhile.
+    let reuse = |reused: &mut bool| {
+        if !*reused && mem::r32(done) == Some(1) {
+            mem::w32(label, 0xC0DE_0001);
+            *reused = true;
+        }
+    };
+    let mut reused = false;
+    reuse(&mut reused);
+    land_all(&rec, || reuse(&mut reused));
+    q.retry_blocked();
+    run_queue(&q);
+    reuse(&mut reused);
+    land_all(&rec, || reuse(&mut reused));
+    assert!(reused, "the command processor's report reached the guest");
+    assert_eq!(mem::r32(label), Some(0xC0DE_0001), "a stale label landed over reused memory");
 }
 
 /// The private RELEASE_MEM uses the native dword layout.

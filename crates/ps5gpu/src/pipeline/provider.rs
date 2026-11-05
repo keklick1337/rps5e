@@ -4913,12 +4913,13 @@ impl ShaderPipelines {
     /// Device-address reads without a page-table entry since the last call
     /// (count and up to 8 distinct 64 KiB windows), then the buffer is reset.
     fn take_faults(&self) -> String {
+        let escapes = self.take_write_escapes();
         self.t.fault.invalidate(0, 4096);
         let b = self.t.fault.bytes_mut();
         let w = |i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let n = w(0);
         if n == 0 {
-            return String::new();
+            return escapes;
         }
         let mut windows: Vec<u64> = Vec::new();
         for k in 0..(n.min(crate::shader::memory::FAULT_SLOTS)) as usize {
@@ -4935,7 +4936,35 @@ impl ShaderPipelines {
             .iter()
             .map(|&w| format!("{w:#x}{}{}", if mem.backing_ptr(w, 4).is_some() { ":memfd" } else { "" }, if ps5vm::ranges::accessible(w, 4, false) { ":acc" } else { "" }))
             .collect();
-        format!(" unmapped-reads={n} {described:?}")
+        format!(" unmapped-reads={n} {described:?}{escapes}")
+    }
+
+    /// Device-address writes outside their planned written range since the
+    /// last call (`RPS5E_WRITE_RANGE_CHECKS`): count and up to 8 distinct
+    /// 64 KiB windows; the log is reset.
+    fn take_write_escapes(&self) -> String {
+        use crate::shader::memory::{ESCAPES, ESCAPE_SLOTS};
+        let (at, len) = (ESCAPES as u64 * 4, (2 + 2 * ESCAPE_SLOTS as u64) * 4);
+        self.t.fault.invalidate(at, len);
+        let b = self.t.fault.bytes_mut();
+        let w = |i: u32| u32::from_le_bytes(b[i as usize * 4..i as usize * 4 + 4].try_into().unwrap());
+        let n = w(ESCAPES);
+        let st = &crate::shader::memory::WRITE_RANGE_CHECK_STATS;
+        let emitted: Vec<u64> = st.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        if n == 0 {
+            return if emitted.iter().any(|&c| c != 0) { format!(" write-range-checks={emitted:?}") } else { String::new() };
+        }
+        let mut windows: Vec<u64> = Vec::new();
+        for k in 0..n.min(ESCAPE_SLOTS) {
+            let a = w(ESCAPES + 2 + 2 * k) as u64 | (w(ESCAPES + 3 + 2 * k) as u64) << 32;
+            let win = a & !0xFFFF;
+            if !windows.contains(&win) && windows.len() < 8 {
+                windows.push(win);
+            }
+        }
+        b[at as usize..(at + len) as usize].fill(0);
+        self.t.fault.flush(at, len);
+        format!(" write-range-checks={emitted:?} write-escapes={n} {windows:x?}")
     }
 
     fn probe_stage(&mut self, ctx: &mut DrawContext, address: u64, snapshot: &ps5shader::resources::ResourceSnapshot, info: &ps5shader::resources::ShaderResourceInfo) {
@@ -6719,6 +6748,9 @@ impl ShaderPipelines {
         // write anything: the draw is ordered against all other work.
         let unknown_hazards = hazards::unknown_hazards_enabled();
         let unranged_writes = unknown_hazards && bound.iter().any(|b| hazards::writes_unranged_memory(b.prepared.program.writes_device_memory, &b.prepared.snapshot.device_address_ranges));
+        if bound.iter().any(|b| hazards::writes_unranged_memory(b.prepared.program.writes_device_memory, &b.prepared.snapshot.device_address_ranges)) {
+            crate::buffers::written_words::note_unranged_write(ctx.sched.current_tick());
+        }
         let isolated = !shared_rendering_scopes() || writes.gds || !writes.written_images.is_empty() || !writes.written_ranges.is_empty() || feedback || unranged_writes;
         if isolated {
             let why = &mut self.stats.isolated;
@@ -7564,6 +7596,9 @@ impl ShaderPipelines {
         let device_writes = bound[0].prepared.program.writes_device_memory;
         if device_writes {
             crate::rt::watch::unranged();
+        }
+        if hazards::writes_unranged_memory(device_writes, &bound[0].prepared.snapshot.device_address_ranges) {
+            crate::buffers::written_words::note_unranged_write(ctx.sched.current_tick());
         }
         let precise = precise_barriers() && !writes.gds && !device_writes;
         let writes_memory = !writes.written_ranges.is_empty() || !writes.written_images.is_empty();

@@ -75,6 +75,17 @@ pub struct Resources {
 /// Addresses the fault buffer keeps after its count word.
 pub const FAULT_SLOTS: u32 = 64;
 
+/// Word of the fault buffer counting device-address writes outside their
+/// planned written range (`RPS5E_WRITE_RANGE_CHECKS`), and the addresses
+/// kept after it (pairs of words from `ESCAPES + 2` on).
+pub const ESCAPES: u32 = 512;
+
+/// Device-address writes the emitter met with `RPS5E_WRITE_RANGE_CHECKS`:
+/// without a resource use, without a planned written range, without the
+/// flattened table, checked.
+pub static WRITE_RANGE_CHECK_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub const ESCAPE_SLOTS: u32 = 64;
+
 /// Where a buffer access reads.
 #[derive(Clone, Copy)]
 pub enum Target {
@@ -682,6 +693,82 @@ impl Emitter<'_, '_> {
     }
 
     /// The fault buffer (bound with the page table), if the layout has it.
+    /// `RPS5E_WRITE_RANGE_CHECKS=1` (diagnostics): a device-address store
+    /// or atomic of `bytes` at `addr` (u64) whose access has a planned
+    /// written range (the flattened table's base and size words the host
+    /// filled, see `ps5shader::resources::WRITTEN_RANGE_DWORD_COUNT`) and
+    /// falls outside it is noted in the fault buffer (count at word
+    /// [`ESCAPES`], then up to [`ESCAPE_SLOTS`] addresses): the host
+    /// tracked only the planned range as written. The store itself is made
+    /// either way.
+    pub(crate) fn check_written_range(&mut self, v: Value, addr: Word, bytes: u32) -> R<()> {
+        if !self.feat.emit.write_range_checks {
+            return Ok(());
+        }
+        let note = |k: usize| WRITE_RANGE_CHECK_STATS[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(memory_index) = self.uses(v).and_then(|u| u.iter().find(|u| u.operand == ResourceOperand::Resource)).map(|u| u.memory_index) else {
+            note(0);
+            return Ok(());
+        };
+        let Some(&slot) = self.input.request.written_range_slot_by_memory_index.get(&memory_index) else {
+            note(1);
+            return Ok(());
+        };
+        if self.input.request.bindings.find(DescriptorBindingKind::FlattenedResourceTable).is_none() {
+            note(2);
+            return Ok(());
+        }
+        note(3);
+        let Some(fault) = self.fault_buffer() else { return Ok(()) };
+        let words: Vec<Word> = (0..3).map(|k| {
+            let i = self.cu(slot + k);
+            self.word_buffer_load(DescriptorBindingKind::FlattenedResourceTable, i)
+        }).collect::<R<_>>()?;
+        let t64 = self.ty(Type::U64);
+        let base = self.join64(words[0], words[1]);
+        let size = self.ins(S::UConvert, t64, &[words[2]]);
+        let end = self.ins(S::IAdd, t64, &[base, size]);
+        // The host plans ranges of 48-bit addresses (the tag bits above
+        // are ignored by the page table too).
+        let mask = self.c64(ps5shader::resources::ADDRESS_MASK);
+        let addr = self.ins(S::BitwiseAnd, t64, &[addr, mask]);
+        let n = self.c64(bytes as u64);
+        let last = self.ins(S::IAdd, t64, &[addr, n]);
+        let tb = self.t_bool();
+        let below = self.ins(S::ULessThan, tb, &[addr, base]);
+        let above = self.ins(S::UGreaterThan, tb, &[last, end]);
+        let outside = self.lor(below, above);
+        self.if_then(outside, |e| {
+            let tu = e.t_u32();
+            let p = e.ptr(SC::StorageBuffer, tu);
+            let zero = e.cu(0);
+            let at = e.cu(ESCAPES);
+            let slot0 = e.access(p, fault, &[zero, at]);
+            let (sc, sem, one) = (e.cu(SCOPE_DEVICE), e.cu(0), e.cu(1));
+            let k = e.ins(S::AtomicIAdd, tu, &[slot0, sc, sem, one]);
+            let slots = e.cu(ESCAPE_SLOTS);
+            let room = e.ult(k, slots);
+            e.if_then(room, |e| {
+                let (lo, hi) = e.split64(addr);
+                let two = e.cu(2);
+                let i = e.imul(k, two);
+                let first = e.cu(ESCAPES + 2);
+                let i = e.iadd(i, first);
+                let tu = e.t_u32();
+                let p = e.ptr(SC::StorageBuffer, tu);
+                let zero = e.cu(0);
+                let a = e.access(p, fault, &[zero, i]);
+                e.store(a, lo);
+                let one = e.cu(1);
+                let i1 = e.iadd(i, one);
+                let a = e.access(p, fault, &[zero, i1]);
+                e.store(a, hi);
+            });
+        });
+        self.writes_buffers = true;
+        Ok(())
+    }
+
     fn fault_buffer(&mut self) -> Option<Word> {
         if let Some(v) = self.res.fault {
             return Some(v);
@@ -1510,12 +1597,18 @@ fn emit_access(e: &mut Emitter, v: Value, d: &ValueData) -> R<Option<Word>> {
             let vty = e.arg_ty(v, 1);
             let ex = exec(e)?;
             let routed = e.routes_apertures(flat);
+            let bytes = match access {
+                ps5shader::ssa::Access::Dwords(k) => 4 * k as u32,
+                a => a.bytes(),
+            };
             e.if_then(ex, |e| {
-                let r = if routed {
-                    route_flat_store(e, addr, |e, a, low| aperture_store_access(e, a, low, access, value, vty), |e| global_store(e, addr, access, value, vty))
-                } else {
+                // Only the device-address path is checked (not LDS or
+                // scratch through a flat aperture).
+                let global = |e: &mut Emitter| {
+                    e.check_written_range(v, addr, bytes)?;
                     global_store(e, addr, access, value, vty)
                 };
+                let r = if routed { route_flat_store(e, addr, |e, a, low| aperture_store_access(e, a, low, access, value, vty), global) } else { global(e) };
                 if let Err(m) = r {
                     e.res_error(m);
                 }
@@ -1532,11 +1625,11 @@ fn emit_access(e: &mut Emitter, v: Value, d: &ValueData) -> R<Option<Word>> {
             let zero = if wide { e.c64(0) } else { e.cu(0) };
             let routed = e.routes_apertures(flat);
             let r = e.if_value(ex, ty, zero, |e| {
-                let r = if routed {
-                    route_flat(e, addr, ty, |e, a, low| e.aperture_atomic(a, low, op, data, cmp, wide), |e| global_atomic(e, addr, op, data, cmp, wide))
-                } else {
+                let global = |e: &mut Emitter| {
+                    e.check_written_range(v, addr, if wide { 8 } else { 4 })?;
                     global_atomic(e, addr, op, data, cmp, wide)
                 };
+                let r = if routed { route_flat(e, addr, ty, |e, a, low| e.aperture_atomic(a, low, op, data, cmp, wide), global) } else { global(e) };
                 guarded(e, r)
             });
             e.take_error()?;

@@ -690,6 +690,21 @@ impl SharedWrittenWords {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Diagnostics: the newest recorded GPU write covering `addr`.
+    pub(crate) fn writer_of(&self, addr: u64) -> Option<(u64, u64, u64)> {
+        self.lock().writer_of(addr)
+    }
+
+    /// The GPU work that wrote `[addr, addr+size)` has all completed
+    /// (`timeline`): every byte is covered by a GPU write record of a
+    /// completed tick, and every draw or dispatch storing through device
+    /// addresses without a range completed too. The device memory then
+    /// holds the final bytes until new work writes them.
+    pub(crate) fn writes_complete(&self, addr: u64, size: u64, timeline: &crate::scheduler::Timeline) -> bool {
+        let unranged = written_words::UNRANGED_WRITE_TICK.load(std::sync::atomic::Ordering::Relaxed);
+        self.lock().settled(addr, size).is_some_and(|t| timeline.is_complete(t)) && (unranged == 0 || timeline.is_complete(unranged))
+    }
+
     /// The write records of the page `[start, end)` (one lock for many
     /// questions about its words).
     pub(crate) fn page(&self, start: u64, end: u64) -> written_words::PageWords {
@@ -1377,7 +1392,7 @@ impl BufferCache {
         if written {
             // GPU work may change these pages after any write-through.
             self.forget_written_through(addr, size);
-            self.written_words.lock().written(addr, size);
+            self.written_words.lock().written(addr, size, sched.current_tick());
             self.forget_fills(addr, size);
         }
         // Written ranges the CPU may poll are written through to guest

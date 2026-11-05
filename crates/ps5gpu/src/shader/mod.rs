@@ -279,6 +279,10 @@ pub struct EmitOptions {
     /// host queries to the end and hand the guest loop no node (the cost
     /// of the queries alone; the frames lose their ray-traced effects).
     pub hw_rt_probe: bool,
+    /// `RPS5E_WRITE_RANGE_CHECKS=1` (diagnostics): device-address stores
+    /// with a planned written range note the addresses outside it
+    /// (`Emitter::check_written_range`).
+    pub write_range_checks: bool,
 }
 
 impl EmitOptions {
@@ -317,6 +321,7 @@ impl EmitOptions {
         hw_rt_stats: false,
         hw_rt_prune: false,
         hw_rt_probe: false,
+        write_range_checks: false,
     };
     /// Every exact switch on, on a device with every feature they use
     /// (tests).
@@ -355,6 +360,7 @@ impl EmitOptions {
         hw_rt_stats: false,
         hw_rt_prune: false,
         hw_rt_probe: false,
+        write_range_checks: false,
     };
 
     /// The switches from the environment (read once).
@@ -400,6 +406,7 @@ impl EmitOptions {
                 hw_rt_stats: crate::rt::level() >= 2,
                 hw_rt_prune: opt_in("RPS5E_HW_RT_PRUNE"),
                 hw_rt_probe: opt_in("RPS5E_HW_RT_PROBE"),
+                write_range_checks: opt_in("RPS5E_WRITE_RANGE_CHECKS"),
             };
             if o.no_f32_flush {
                 log::warn!("[shader] RPS5E_NO_F32_FLUSH=1: f32 denormals are not flushed as the guest's FLOAT_MODE asks (the host's own behaviour)");

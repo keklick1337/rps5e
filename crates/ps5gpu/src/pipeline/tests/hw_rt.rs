@@ -195,6 +195,7 @@ const V_ADD_F32: u32 = 0x03;
 const V_MUL_F32: u32 = 0x08;
 const V_RCP_F32: u32 = 0x2A;
 const V_LSHLREV_B32: u32 = 0x1A;
+const V_LSHRREV_B32: u32 = 0x16;
 const SMEM_BUFFER_LOAD_DWORDX2: u32 = 0x09;
 const LIT: u32 = sa::LITERAL;
 const fn inl(n: u32) -> u32 {
@@ -216,12 +217,15 @@ const BVH_QUERY: [u32; 5] = [0xF198_8F07, 0x0002_1804, 0x0807_0605, 0x0C0B_0A09,
 /// not opaque; an accepted lane retires (s[40:41]). Lanes 60..63 take no
 /// part. Lane `l` writes its hit flag and t to `out[2l]`, `out[2l+1]`.
 fn traversal_program(g: &mut Guest) -> u64 {
-    g.program(&traversal_code(false))
+    g.program(&traversal_code(false, false))
 }
 
 /// `store`: each pop also writes the lane's t (memory written between
-/// candidates).
-fn traversal_code(store: bool) -> Vec<u32> {
+/// candidates). `facing`: a candidate is accepted only when its `t_num` is
+/// negative (the console's facing test without a flipped instance: the
+/// sign of `t_num` is the triangle's facing, compared with the instance's
+/// flip bit).
+fn traversal_code(store: bool, facing: bool) -> Vec<u32> {
     let mut c = Code::default();
     // Ray.
     c.put([sa::vop1(V_CVT_F32_U32, 6, VGPR)]);
@@ -271,6 +275,12 @@ fn traversal_code(store: bool) -> Vec<u32> {
     // A candidate (t_num not +inf) the any-hit rule takes.
     c.put([sa::vopc(V_CMP_NE_U32, LIT, 24), 0x7F80_0000]);
     c.put([sa::sop2(S_AND_B64, sa::VCC_LO, sa::VCC_LO, sa::EXEC_LO)]);
+    if facing {
+        c.put([sa::sop1(S_MOV_B64, 38, sa::VCC_LO)]);
+        c.put([sa::vop2(V_LSHRREV_B32, 31, inl(31), 24)]);
+        c.put([sa::vopc(V_CMP_NE_U32, inl(0), 31)]);
+        c.put([sa::sop2(S_AND_B64, sa::VCC_LO, sa::VCC_LO, 38)]);
+    }
     c.put([sa::sop2(S_AND_B32, 30, 29, LIT), 0x4000_0001, sa::sopc(S_CMP_EQ_U32, 30, inl(1))]);
     c.put([sa::sop2(S_CSELECT_B64, 32, inl(0), NEG1)]);
     c.put([sa::sop2(S_AND_B64, sa::VCC_LO, sa::VCC_LO, 32)]);
@@ -484,6 +494,90 @@ fn hw_rt_traversal_loops_run_on_ray_queries() {
         }
     }
     assert!(moved, "the host BLAS never followed the moved triangle");
+}
+
+/// Stores `words` (byte offset, value) into the BVH with a dispatch (as the
+/// console's refit programs write triangle nodes).
+fn store_words(g: &mut Guest, bvh: u64, words: &[(u32, f32)]) -> ResolvedDispatch {
+    let mut code = Vec::new();
+    for &(at, x) in words {
+        code.extend([sa::vop1(sa::OP_V_MOV_B32, 1, LIT), x.to_bits(), sa::vop1(sa::OP_V_MOV_B32, 2, LIT), at]);
+        code.extend(asm::buffer_store_dword(1, 2, 0));
+    }
+    code.push(sa::S_ENDPGM);
+    let cs = g.program(&code);
+    let mut shader = stage(cs, &raw_buffer_descriptor(bvh, 1024));
+    shader.rsrc1 = (0xC0 << 12) | (1 << 21) | 7;
+    ResolvedDispatch { packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() }, shader, rsrc3: 0, threads: [64, 1, 1], start: [0; 3] }
+}
+
+/// A traversal that tests the facing of its candidates (the console's
+/// shadow traversals keep the triangles whose `t_num` is negative: seen
+/// clockwise from the ray origin) runs on host ray queries that cull the
+/// same faces: an opaque triangle the host commits and a non-opaque one it
+/// hands to the guest are the ones the guest keeps; turned around, the
+/// opaque one is no hit.
+#[test]
+#[ignore]
+fn hw_rt_traversal_loops_keep_the_faces_the_guest_keeps() {
+    let mut g = Guest::new(16 << 20);
+    let mut rig = Rig::with_compiler(
+        &g,
+        |dev| {
+            let f = crate::shader::Features::of(dev);
+            let emit = crate::shader::EmitOptions { hw_rt: dev.caps.ray_query, hw_rt_prune: false, ..f.emit };
+            Arc::new(crate::shader::SpirvCompiler::new(crate::shader::Features { emit, ..f }, Some(g.mem)))
+        },
+        None,
+        None,
+    );
+    if !rig.provider.enable_hw_rt() {
+        eprintln!("no ray queries on this device: skipped");
+        return;
+    }
+    let mem = g.mem;
+    // Every triangle of the scene is seen clockwise from the rays' origins
+    // (z = 0, along +z): the guest keeps them all.
+    let bvh = leaf_scene(&mut g, 0.7);
+    let out = g.zeroed(512);
+    let cs = g.program(&traversal_code(false, true));
+    let d = traversal(cs, bvh, out);
+    let guest = lanes(&mut rig, mem, &d, out);
+    for (l, r) in guest.iter().enumerate() {
+        assert_eq!(*r, expected(l, 0.7, 0.918), "guest traversal, lane {l}");
+    }
+    let mut host = None;
+    for _ in 0..12 {
+        let r = lanes(&mut rig, mem, &d, out);
+        if r != guest {
+            host = Some(r);
+            break;
+        }
+    }
+    let host = host.expect("the traversal never ran on the host's ray queries (or culled the faces the guest keeps)");
+    for (l, r) in host.iter().enumerate() {
+        assert_eq!(*r, expected(l, f32::INFINITY, 0.918), "host traversal, lane {l}");
+    }
+    // Primitive 0 (opaque) turned around: v1 and v2 swap their y.
+    let turn = store_words(&mut g, bvh, &[(528, 3.0), (540, -1.0)]);
+    let want = |l: usize| {
+        let x = (l as f32 + 0.5) / 48.0;
+        if l < 60 && (0.5..0.918).contains(&x) {
+            (1, 2.0)
+        } else {
+            (0, 10000.0)
+        }
+    };
+    let near = |a: (u32, f32), b: (u32, f32)| a.0 == b.0 && (a.1 - b.1).abs() <= 1e-5 * b.1;
+    let mut last = Vec::new();
+    for _ in 0..4 {
+        assert_eq!(rig.dispatch(&turn), DrawOutcome::Recorded);
+        last = lanes(&mut rig, mem, &d, out);
+        if last.iter().enumerate().all(|(l, r)| near(*r, want(l))) {
+            return;
+        }
+    }
+    panic!("a back-facing opaque triangle still hits: {last:?}");
 }
 
 const S_LSHL_B32: u32 = 0x1E;
@@ -785,7 +879,7 @@ fn rt_ops(f: &ps5shader::ssa::Function) -> Vec<ps5shader::ssa::RtOp> {
 #[test]
 fn rt_loops_recognise_one_and_two_level_traversals() {
     use ps5shader::ssa::{RtOp, RtGet};
-    for (words, levels) in [(traversal_code(false), 1u8), (two_level_code(), 2)] {
+    for (words, levels, cull) in [(traversal_code(false, false), 1u8, false), (traversal_code(false, true), 1u8, true), (two_level_code(), 2, false)] {
         let mut f = ssa_of(&words);
         let out = ps5shader::opt::rt_loops::replace_traversals(&mut f);
         assert_eq!(out.replaced, 1, "levels {levels}: {:?}", out.skipped);
@@ -795,11 +889,11 @@ fn rt_loops_recognise_one_and_two_level_traversals() {
         assert!(ops.iter().any(|o| matches!(o, RtOp::Begin { .. })));
         assert!(ops.iter().any(|o| matches!(o, RtOp::Fetch { level: 0, .. })));
         assert_eq!(ops.iter().any(|o| matches!(o, RtOp::Get { what: RtGet::InGuest, .. })), levels == 2);
-        // The program has no facing test and reads no instance mask; its
-        // extent never changes: first hit, no culling.
+        // The programs read no instance mask; their extent never changes:
+        // first hit, back faces culled when they test the facing.
         let begins = f.order.iter().flat_map(|&b| f.block(b).insts.iter()).copied().filter(|&v| matches!(f.op(v), ps5shader::ssa::Op::RtQuery(RtOp::Begin { .. }))).collect::<Vec<_>>();
         let flags = f.as_const(*f.args(begins[0]).last().unwrap());
-        assert_eq!(flags, Some(0x4));
+        assert_eq!(flags, Some(if cull { 0x24 } else { 0x4 }));
         // The guest's nest stays for BVHs the host does not mirror.
         let bvh = f.order.iter().flat_map(|&b| f.block(b).insts.iter()).filter(|&&v| matches!(f.op(v), ps5shader::ssa::Op::Image(a) if matches!(a.op, ps5shader::ssa::ImageOp::BvhIntersect { boxes: true, .. }))).count();
         assert!(bvh > 0);
@@ -810,7 +904,7 @@ fn rt_loops_recognise_one_and_two_level_traversals() {
 fn rt_loops_leave_loops_that_write_memory_between_candidates() {
     // A store in the loop depends on the order of the candidates: no
     // hardware copy.
-    let mut f = ssa_of(&traversal_code(true));
+    let mut f = ssa_of(&traversal_code(true, false));
     let out = ps5shader::opt::rt_loops::replace_traversals(&mut f);
     assert_eq!(out.replaced, 0);
     assert!(out.skipped.iter().any(|(_, why)| why.contains("buffer_store")), "{:?}", out.skipped);

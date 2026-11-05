@@ -184,9 +184,8 @@ pub(crate) fn is_gpu_label(addr: u64) -> bool {
 /// label is recorded behind it. A CPU read of GPU results after such a
 /// label then finds them in guest memory instead of waiting for the GPU
 /// while holding the back-end (GTA V's main thread reads a 1x1 target
-/// after its label every frame). Opt-in: Demon's Souls and Minecraft
-/// freeze with it (a late label lands over command-buffer memory the game
-/// already reused: `dropped: bad packet header 0x00000001`).
+/// after its label every frame). The default; what a queue writes after
+/// it read such a label before it landed lands behind it ([`late_writes`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LabelMode {
     /// Written once the work before them is recorded.
@@ -253,16 +252,101 @@ pub(crate) fn defer_label(ex: &dyn RenderExecutor, write: impl FnOnce() + Send +
     }))
 }
 
-/// The landing of a label written after the GPU (`RPS5E_LABELS_AT_EOP=cpu`):
-/// `write` stores it into guest memory; queues waiting on it poll again
-/// (the guest's reads now see it).
-fn landed_label(write: impl FnOnce() -> bool + Send + 'static) -> Box<dyn FnOnce() + Send> {
+/// The landing of late write `seq` ([`late_writes`]): `write` stores it
+/// into guest memory; queues waiting on it poll again (the guest's reads
+/// now see it).
+fn landed_label(seq: u64, write: impl FnOnce() -> bool + Send + 'static) -> Box<dyn FnOnce() + Send> {
+    // Landed when it ran or when the executor dropped it unrun (work given
+    // up): nothing is left to wait for either way.
+    struct Landed(u64);
+    impl Drop for Landed {
+        fn drop(&mut self) {
+            late_writes::landed(self.0);
+        }
+    }
+    let landed = Landed(seq);
     Box::new(move || {
         if !write() && rare_warning(&WRITE_WARNINGS) {
             log::warn!("[pm4] cannot write a label after the GPU");
         }
+        drop(landed);
         super::queue::global().retry_blocked();
     })
+}
+
+/// Packets held because their queue was behind a late write
+/// ([`Interpreter::hold_write`]).
+pub(crate) static WRITES_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Late writes (`RPS5E_LABELS_AT_EOP=cpu`): memory writes of the command
+/// processor that reach guest memory after the GPU finished the work
+/// recorded before them, while the command processor's own reads see them
+/// at once. Each has a sequence number in issue order and stays in the
+/// pending set until it landed.
+///
+/// On the console a command processor that waited for a label (or read
+/// it) acts after the label is in memory: everything it writes afterwards
+/// lands after the label. Here the wait is satisfied before the label
+/// lands, so a queue that read bytes of a late write still on its way
+/// holds its next memory write until that write landed
+/// ([`Interpreter::hold_write`]). Without that the guest can see such a
+/// later write first, take the memory the label lives in as free, reuse it,
+/// and the label then lands over the new contents (Demon's Souls keeps
+/// labels inside its command buffers: `bad packet header 0x00000001` in a
+/// later command buffer, then a freeze).
+/// `RPS5E_LATE_WRITE_ORDER=0` turns the ordering off.
+pub(crate) mod late_writes {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Pending late writes: sequence number → `[addr, end)`.
+    static PENDING: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("RPS5E_LATE_WRITE_ORDER").map_or(true, |v| v.trim() != "0"))
+    }
+
+    /// A late write of `len` bytes at `addr` was issued: its sequence number.
+    pub fn issue(addr: u64, len: u64) -> u64 {
+        let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        p.insert(seq, (addr, addr + len.max(1)));
+        COUNT.store(p.len(), Ordering::Release);
+        seq
+    }
+
+    pub fn landed(seq: u64) {
+        let mut p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        p.remove(&seq);
+        COUNT.store(p.len(), Ordering::Release);
+    }
+
+    pub fn any_pending() -> bool {
+        COUNT.load(Ordering::Acquire) != 0
+    }
+
+    /// The newest pending late write over `[addr, addr + len)`.
+    pub fn newest_over(addr: u64, len: u64) -> Option<u64> {
+        if !any_pending() {
+            return None;
+        }
+        let end = addr + len.max(1);
+        let p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        p.iter().rev().find(|(_, &(a, e))| a < end && addr < e).map(|(s, _)| *s)
+    }
+
+    /// Whether a late write with a sequence number up to `seq` is pending.
+    pub fn pending_up_to(seq: u64) -> bool {
+        if seq == 0 || !any_pending() {
+            return false;
+        }
+        let p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        p.keys().next().is_some_and(|&s| s <= seq)
+    }
 }
 
 /// 100 MHz reference clock (EOP / COPY_DATA timestamps): the clock shaders
@@ -334,9 +418,18 @@ pub struct Execution {
     /// What the submission waits on when it suspended on a memory wait
     /// (address, value read, reference, mask, compare function).
     pub waiting_on: Option<(u64, u64, u64, u64, u32)>,
+    /// The submission held a memory write behind this late write
+    /// ([`Interpreter::hold_write`]): not worth running again before it
+    /// landed (its landing retries blocked queues).
+    pub held_behind: u64,
 }
 
 impl Execution {
+    /// Still held behind a late write that has not landed.
+    pub fn held(&self) -> bool {
+        late_writes::pending_up_to(self.held_behind)
+    }
+
     /// Address of the packet the submission is parked on.
     pub fn current_packet(&self) -> u64 {
         self.stack.last().map_or(0, |c| c.addr + c.offset as u64 * 4)
@@ -431,6 +524,14 @@ pub struct Interpreter {
     /// The last resolved draw (the next draw re-resolves only the banks
     /// written since, `regs.dirty`).
     draw_cache: Option<ResolvedDraw>,
+    /// The newest late write this queue read before it landed: while it
+    /// (or one issued before it) is on its way, the queue's own memory
+    /// writes wait (see [`late_writes`]).
+    behind_late: std::cell::Cell<u64>,
+    /// A packet is being executed ([`Self::hold_write`] can hold it).
+    in_packet: std::cell::Cell<bool>,
+    /// The packet being executed held a write: it runs again later.
+    write_held: std::cell::Cell<bool>,
 }
 
 /// Context registers after a context clear (shared with the slice recorder).
@@ -482,6 +583,9 @@ impl Interpreter {
             flips: 0,
             executor: crate::agc::render_executor(),
             draw_cache: None,
+            behind_late: std::cell::Cell::new(0),
+            in_packet: std::cell::Cell::new(false),
+            write_held: std::cell::Cell::new(false),
         }
     }
 
@@ -535,6 +639,7 @@ impl Interpreter {
         ex.suspended = false;
         ex.made_progress = false;
         ex.waiting_on = None;
+        ex.held_behind = 0;
         ex.next = None;
         let mut packets = 0u64;
         let r = self.run_packets(ex, &mut packets);
@@ -607,8 +712,18 @@ impl Interpreter {
             // SAFETY: inside the checked buffer range (len <= remaining).
             payload.extend_from_slice(unsafe { std::slice::from_raw_parts((paddr + 4) as *const u32, (len - 1) as usize) });
             let pkt = Packet { header: h & !1, addr: paddr, remaining };
+            self.in_packet.set(true);
             let r = self.dispatch(ex, &pkt, &payload);
+            self.in_packet.set(false);
             self.payload = payload;
+            if self.write_held.replace(false) {
+                // Runs again once the late writes before it landed (each
+                // landing retries blocked queues).
+                WRITES_HELD.fetch_add(1, Ordering::Relaxed);
+                ex.held_behind = self.behind_late.get();
+                ex.next = None;
+                return Ok(());
+            }
             let consumed = r? + 1;
             if consumed > remaining {
                 return Err(format!("packet 0x{h:08x} at 0x{paddr:x} consumed past its buffer"));
@@ -1054,6 +1169,7 @@ impl Interpreter {
         };
         // After the command-processor transfers queued over the range.
         match &self.executor {
+            Some(_) if self.hold_write() => {}
             Some(ex) => ex.write_ordered(addr, data, Box::new(write)),
             None => write(),
         }
@@ -1077,8 +1193,52 @@ impl Interpreter {
             }
         };
         match &self.executor {
+            Some(_) if self.hold_write() => {}
             Some(ex) => ex.write_ordered(addr, &bytes, Box::new(write)),
             None => write(),
+        }
+    }
+
+    /// Issue a late write ([`late_writes`]): `write` stores `data` at `addr`
+    /// into guest memory after the GPU work recorded so far and after every
+    /// late write issued before it; the command processor's reads see
+    /// `data` at once.
+    fn late_write(&self, ex: &dyn RenderExecutor, addr: u64, data: &[u8], write: impl FnOnce() -> bool + Send + 'static) {
+        let seq = late_writes::issue(addr, data.len() as u64);
+        ex.label_after_gpu(addr, data, landed_label(seq, write));
+    }
+
+    /// Before a command-processor write to guest memory: while this queue
+    /// is behind a late write ([`Self::behind_late_write`]) the write is
+    /// held (true) and the packet runs again once the late writes before it
+    /// landed, as the console's command processor writes only after the
+    /// label it waited for is in memory. The write then reaches guest
+    /// memory in order both with that label (for the CPU) and with the GPU
+    /// work recorded after it (for later commands and shaders).
+    fn hold_write(&self) -> bool {
+        if !self.in_packet.get() || !self.behind_late_write() {
+            return false;
+        }
+        self.write_held.set(true);
+        true
+    }
+
+    /// This queue read bytes of a late write before it landed and that
+    /// write (or one issued before it) is still on its way: the queue's own
+    /// writes must wait for it.
+    fn behind_late_write(&self) -> bool {
+        late_writes::pending_up_to(self.behind_late.get())
+    }
+
+    /// After a command-processor read of `[addr, addr + len)`: when a late
+    /// write still on its way covers part of it (the read saw its bytes),
+    /// what this queue writes from now on waits for that write.
+    fn note_late_read(&self, addr: u64, len: usize) {
+        if !late_writes::any_pending() || !late_writes::enabled() || label_mode() != LabelMode::AfterGpuForCpu {
+            return;
+        }
+        if let Some(seq) = late_writes::newest_over(addr, len as u64) {
+            self.behind_late.set(self.behind_late.get().max(seq));
         }
     }
 
@@ -1086,7 +1246,13 @@ impl Interpreter {
     /// queued before applied).
     fn read_ordered(&self, addr: u64, out: &mut [u8]) -> bool {
         match &self.executor {
-            Some(ex) => ex.read_ordered(addr, out, &|o: &mut [u8]| mem::read(addr, o)),
+            Some(ex) => {
+                let ok = ex.read_ordered(addr, out, &|o: &mut [u8]| mem::read(addr, o));
+                if ok {
+                    self.note_late_read(addr, out.len());
+                }
+                ok
+            }
             None => mem::read(addr, out),
         }
     }
@@ -1106,7 +1272,13 @@ impl Interpreter {
     /// recorded (slice mode records it on another thread).
     fn read_control(&self, addr: u64, out: &mut [u8]) -> bool {
         match &self.executor {
-            Some(ex) => ex.read_control(addr, out, &|o: &mut [u8]| mem::read(addr, o)),
+            Some(ex) => {
+                let ok = ex.read_control(addr, out, &|o: &mut [u8]| mem::read(addr, o));
+                if ok {
+                    self.note_late_read(addr, out.len());
+                }
+                ok
+            }
             None => mem::read(addr, out),
         }
     }
@@ -1182,7 +1354,7 @@ impl Interpreter {
         match &self.executor {
             Some(ex) if label_mode() == LabelMode::AfterGpuForCpu => {
                 note_gpu_label(addr);
-                ex.label_after_gpu(addr, &v.to_le_bytes(), landed_label(move || mem::write(addr, &v.to_le_bytes())));
+                self.late_write(ex.as_ref(), addr, &v.to_le_bytes(), move || mem::write(addr, &v.to_le_bytes()));
             }
             Some(ex) if label_after_gpu(ex.as_ref()) => {
                 note_gpu_label(addr);
@@ -1245,10 +1417,10 @@ impl Interpreter {
                     // packet is processed); guest memory gets it, with the
                     // clock when the pipe drained, after the GPU.
                     let bytes = v.unwrap_or_else(reference_clock).to_le_bytes();
-                    ex.label_after_gpu(dst, &bytes[..len], landed_label(move || {
+                    self.late_write(ex.as_ref(), dst, &bytes[..len], move || {
                         write();
                         true
-                    }));
+                    });
                 }
                 Some(ex) if label_after_gpu(ex.as_ref()) => defer_label(ex.as_ref(), write),
                 Some(ex) => {
@@ -1847,6 +2019,9 @@ impl Interpreter {
                     return;
                 }
             }
+        }
+        if !dst_gds && src_sel != 1 && self.executor.is_some() && self.hold_write() {
+            return;
         }
         // Copies and fills touching GPU-written memory run on the GPU, in
         // order with the work recorded before them.

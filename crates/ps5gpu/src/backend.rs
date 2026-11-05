@@ -4227,6 +4227,10 @@ pub(crate) mod profile {
             WORK.store(kind << 56 | (address & ((1 << 56) - 1)), Ordering::Relaxed);
         }
     }
+    /// The work being recorded ([`set_work`]; 0 without the profile).
+    pub fn work() -> u64 {
+        WORK.load(Ordering::Relaxed)
+    }
     static GPU_WRITE_WINDOW: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     static GPU_WRITE_LAST: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
     fn window_slot(window: u64, table: &[AtomicU64; SLOTS], insert: bool) -> Option<usize> {
@@ -4579,6 +4583,7 @@ pub(crate) mod profile {
         } else {
             String::new()
         };
+        let records = records + &crate::pipeline::frontend::WORD_SPEC.line();
         if !desc_wait_why() {
             return records;
         }
