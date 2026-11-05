@@ -1675,6 +1675,12 @@ impl ps5gpu::render::RenderExecutor for LateGpu {
     }
 }
 
+/// The label mode of the test process is `cpu` (the default; another
+/// `RPS5E_LABELS_AT_EOP` value set for the run skips the `cpu` tests).
+fn cpu_labels_configured() -> bool {
+    interp::parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref(), ps5gpu::buffers::guest::bda_configured()) == interp::LabelMode::AfterGpuForCpu
+}
+
 /// Runs a queue with a [`LateGpu`] over the commands built in `e`.
 fn run_late(e: &Env) -> (std::sync::Arc<LateGpu>, GpuQueue) {
     let rec = std::sync::Arc::new(LateGpu::default());
@@ -1698,7 +1704,7 @@ fn land_all(rec: &LateGpu, mut after: impl FnMut()) -> usize {
     n
 }
 
-/// `RPS5E_LABELS_AT_EOP=cpu` (opt-in; run with it set): an end-of-pipe label reaches
+/// `RPS5E_LABELS_AT_EOP=cpu` (the default): an end-of-pipe label reaches
 /// guest memory only once the GPU finished the work before it, while the
 /// command processor's own wait on it is satisfied as soon as the label
 /// was recorded (the executor shows it to the interpreter's reads). A
@@ -1706,7 +1712,7 @@ fn land_all(rec: &LateGpu, mut after: impl FnMut()) -> usize {
 /// console (the command processor goes on once the label is in memory).
 #[test]
 fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
-    if !matches!(std::env::var("RPS5E_LABELS_AT_EOP").as_deref().map(str::trim), Ok("cpu")) {
+    if !cpu_labels_configured() {
         return;
     }
     let e = Env::new();
@@ -1738,7 +1744,7 @@ fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
 /// landed, so its new contents are never overwritten by the stale label.
 #[test]
 fn late_labels_never_land_over_memory_the_guest_reused() {
-    if !matches!(std::env::var("RPS5E_LABELS_AT_EOP").as_deref().map(str::trim), Ok("cpu")) {
+    if !cpu_labels_configured() {
         return;
     }
     let e = Env::new();
@@ -2437,13 +2443,13 @@ fn deferred_labels_keep_their_order() {
 #[test]
 fn label_modes_parse() {
     use interp::{parse_label_mode, LabelMode};
-    assert_eq!(parse_label_mode(None, false), LabelMode::Recorded);
+    assert_eq!(parse_label_mode(None, false), LabelMode::AfterGpuForCpu);
     assert_eq!(parse_label_mode(None, true), LabelMode::AfterGpu);
     assert_eq!(parse_label_mode(Some("1"), false), LabelMode::AfterGpu);
     assert_eq!(parse_label_mode(Some("0"), true), LabelMode::Recorded);
     assert_eq!(parse_label_mode(Some(" through "), false), LabelMode::AfterWriteThroughs);
     assert_eq!(parse_label_mode(Some("cpu"), false), LabelMode::AfterGpuForCpu);
-    assert_eq!(parse_label_mode(Some("yes"), false), LabelMode::Recorded);
+    assert_eq!(parse_label_mode(Some("yes"), false), LabelMode::AfterGpuForCpu);
 }
 
 /// `sceAgcGetDefaultCxStateFlat`: version 8's context defaults as a flat

@@ -135,10 +135,10 @@ fn occlusion_write() -> &'static ps5gpu::render::OcclusionWrite {
     })
 }
 
-/// End-of-pipe labels are written when the packet is processed, ahead of the
-/// GPU: the guest runs ahead of the GPU as before. A CPU read of a
-/// read-through page after such a label sees the last completed
-/// write-through, not necessarily the work in front of the label.
+/// With `RPS5E_LABELS_AT_EOP=0` end-of-pipe labels are written when the
+/// packet is processed, ahead of the GPU: the guest runs ahead of the GPU.
+/// A CPU read of a read-through page after such a label sees the last
+/// completed write-through, not necessarily the work in front of the label.
 /// `RPS5E_LABELS_AT_EOP=1` writes them once the work before them completed
 /// (and its write-throughs reached guest memory), as the console does:
 /// exact, but ASTRO BOT loses ~37 % of its frame rate waiting on the GPU.
@@ -205,7 +205,7 @@ pub(crate) fn parse_label_mode(v: Option<&str>, bda: bool) -> LabelMode {
         Some("through") => LabelMode::AfterWriteThroughs,
         Some("cpu") => LabelMode::AfterGpuForCpu,
         _ if bda => LabelMode::AfterGpu,
-        _ => LabelMode::Recorded,
+        _ => LabelMode::AfterGpuForCpu,
     }
 }
 
