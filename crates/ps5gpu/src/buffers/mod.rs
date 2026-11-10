@@ -227,6 +227,11 @@ pub struct BufferStats {
     pub prologue_runs: u64,
     pub prologue_touched: u64,
     pub prologue_new: u64,
+    /// Mirrors made with room ahead of a chain of adjacent requests
+    /// (`RPS5E_STREAM_ADJACENT`).
+    pub adjacent_leaps: u64,
+    /// Requests no mirror contained (a mirror was made or merged).
+    pub misses: u64,
     /// Import-table updates pointing pages at their (current) mirror, and
     /// pointing them back at guest memory after CPU writes; dirty logs
     /// that overflowed (every resident page checked).
@@ -398,6 +403,15 @@ impl Touched {
         let i = self.spans.partition_point(|&(s, _)| s < addr + size);
         self.tick == tick && i > 0 && self.spans[i - 1].1 > addr
     }
+}
+
+/// `RPS5E_STREAM_ADJACENT=0`: a mirror is only grown ahead of a stream of
+/// requests that overlap the previous ones. Otherwise also of a stream of
+/// requests that each start where the previous mirror ends (see
+/// `find_or_create`).
+fn stream_adjacent_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_STREAM_ADJACENT"))
 }
 
 /// `RPS5E_UPLOAD_PROLOGUE=0`: every upload is recorded in order with the
@@ -1063,6 +1077,7 @@ impl BufferCache {
             return Ok(k);
         }
         let (mut start, mut end) = align_range(addr, size);
+        self.stats.misses += 1;
         crate::slice_shadow::hole(crate::slice_shadow::Hole::BufferMiss);
         let mut old = self.overlapping(start, end);
         let mut score = 0u32;
@@ -1089,6 +1104,36 @@ impl BufferCache {
                 }
             }
         }
+        // A request next to a buffer and overlapping none continues a
+        // stream that advances by whole caching pages (a ring of per-draw
+        // blocks): the chain's length is its score, and past the threshold
+        // the new buffer reserves the room ahead as well, so the following
+        // requests find it instead of making a buffer each.
+        let mut adjacent_score = None;
+        if old.is_empty() && stream_adjacent_enabled() {
+            let left = self.buffers.range(..start).next_back().filter(|(_, b)| b.addr + b.size == start).map(|(_, b)| b.stream_score);
+            let right = self.buffers.get(&end).map(|b| b.stream_score);
+            match (left, right) {
+                (Some(s), None) => {
+                    adjacent_score = Some(s.saturating_add(1));
+                    if s >= STREAM_LEAP_THRESHOLD {
+                        leap = true;
+                        end = (end + STREAM_LEAP_BYTES).min(crate::memory::SPACE_BYTES).max(end);
+                    }
+                }
+                (None, Some(s)) => {
+                    adjacent_score = Some(s.saturating_add(1));
+                    if s >= STREAM_LEAP_THRESHOLD {
+                        leap = true;
+                        start = start.saturating_sub(STREAM_LEAP_BYTES).max(2 * CACHING_PAGE).min(start);
+                    }
+                }
+                _ => {}
+            }
+            if leap {
+                self.stats.adjacent_leaps += 1;
+            }
+        }
         if leap {
             // The reserved room may reach further buffers.
             old = self.overlapping(start, end);
@@ -1098,7 +1143,13 @@ impl BufferCache {
                 end = end.max(b.addr + b.size);
             }
         }
-        let stream_score = if leap { 0 } else { old.iter().map(|k| self.buffers[k].stream_score + 1).sum() };
+        // A buffer of an adjacent chain keeps the chain's score (the
+        // request after its reserved room leaps again at once).
+        let stream_score = match adjacent_score {
+            Some(score) => score,
+            None if leap => 0,
+            None => old.iter().map(|k| self.buffers[k].stream_score + 1).sum(),
+        };
         let buf = Buffer::new(&self.dev, end - start, BUFFER_USAGE, MemoryUse::Device)?;
         let cb = sched.cmd();
         if !old.is_empty() {

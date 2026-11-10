@@ -6,6 +6,7 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ### Changed
 
+- Less overhead per draw in heavy scenes: the recording thread wakes the command interpreter once per half queue instead of once per command (`RPS5E_QUEUE_WAKE_BATCH`), and streams of page-sized buffer blocks share one buffer mirror instead of one per block (`RPS5E_STREAM_ADJACENT`). GTA V gains a few percent.
 - Shader programs are now decoded and planned on a worker thread as soon as the game creates the shader object (`sceAgcCreateShader`), not inside the first draw that uses them; the draw takes the finished program (`RPS5E_CREATE_TIME_SHADERS=0` turns it off).
 - Fixed shader planning that could take seconds (or never finish) on programs whose buffer descriptors are computed through long chains of shared values.
 - Shader objects the game creates (`sceAgcCreateShader`) now move the prewarm work of their programs to the front of the shader prewarm list while it builds in the background, so those modules and pipelines are ready before the draws that use them (`RPS5E_CREATE_TIME_SHADERS=0` turns it off). Modules are still made per draw permutation: what a module depends on (resources, render targets, vertex layout) is only known at the draw.

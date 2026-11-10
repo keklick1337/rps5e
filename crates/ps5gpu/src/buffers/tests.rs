@@ -1213,3 +1213,31 @@ fn new_buffers_reach_both_page_tables_behind_one_barrier() {
     drop(g);
     dev.wait_idle();
 }
+
+/// A stream of requests that each start where the previous mirror ends
+/// (per-draw blocks of whole caching pages) gets a mirror with room ahead
+/// once the chain is long enough: the following requests find it, and
+/// every request binds its own bytes.
+#[test]
+#[ignore]
+fn adjacent_page_streams_get_room_ahead() {
+    let (view, dev, shared, _tracker) = setup(0);
+    let first = view + 0x40000;
+    let mut g = shared.lock().unwrap();
+    let Shared { sched, cache } = &mut *g;
+    cache.set_zero_copy(false);
+    let threshold = STREAM_LEAP_THRESHOLD as u64;
+    for i in 0..64u64 {
+        let page = first + i * CACHING_PAGE;
+        // SAFETY: mapped guest view.
+        unsafe { std::ptr::write_volatile((page + 0x20) as *mut u32, 0xA000 + i as u32) };
+        let s = cache.obtain(sched, page, 0x28, false).unwrap();
+        let bytes = read_device(&dev, sched, s.buffer, s.offset + 0x20, 4);
+        assert_eq!(u32::from_le_bytes(bytes.try_into().unwrap()), 0xA000 + i as u32, "request {i}");
+        // One mirror per request up to the threshold, then one with room.
+        assert_eq!(cache.stats.misses, (i + 1).min(threshold + 2), "request {i}");
+    }
+    assert_eq!(cache.stats.adjacent_leaps, 1);
+    sched.flush_and_wait();
+    dev.wait_idle();
+}

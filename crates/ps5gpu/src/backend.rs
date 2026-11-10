@@ -5242,11 +5242,14 @@ struct QueueSpace {
     lock: std::sync::Mutex<()>,
     woke: std::sync::Condvar,
     waiting: std::sync::atomic::AtomicUsize,
+    /// Commands left at which waiting senders are woken (see `freed`).
+    low_water: u64,
 }
 
 impl QueueSpace {
-    fn new() -> QueueSpace {
-        QueueSpace { lock: std::sync::Mutex::new(()), woke: std::sync::Condvar::new(), waiting: std::sync::atomic::AtomicUsize::new(0) }
+    /// For a queue of `capacity` commands.
+    fn new(capacity: usize) -> QueueSpace {
+        QueueSpace { lock: std::sync::Mutex::new(()), woke: std::sync::Condvar::new(), waiting: std::sync::atomic::AtomicUsize::new(0), low_water: (capacity as u64 / 2).max(1) }
     }
 
     /// Queue `item`, waiting for room when the queue is full.
@@ -5284,11 +5287,26 @@ impl QueueSpace {
         note_pipeline_ab(1, us);
     }
 
-    /// The recorder took a command (its slot is free).
-    fn freed(&self) {
+    /// The recorder took a command (its slot is free); `queued` commands
+    /// are left, the taken one included.
+    ///
+    /// A sender waiting for room is woken once the queue is down to half
+    /// (`RPS5E_QUEUE_WAKE_BATCH`, A/B scope release `queue-wake-batch`;
+    /// `0`: after every command). A sender that fills a queue faster than
+    /// the recorder empties it otherwise sleeps and is woken once per
+    /// command, a wake-up system call on the recording thread each time;
+    /// woken at half it queues half a queue of commands in one go. The
+    /// recorder passes that mark before it can run out of commands, so a
+    /// waiting sender is always woken.
+    fn freed(&self, queued: u64) {
         static ALWAYS: OnceLock<bool> = OnceLock::new();
         let always = *ALWAYS.get_or_init(|| std::env::var("RPS5E_QUEUE_SIGNAL_ALWAYS").is_ok_and(|v| v == "1"));
+        static BATCH: OnceLock<bool> = OnceLock::new();
+        let batch = *BATCH.get_or_init(|| ab::switch_on("RPS5E_QUEUE_WAKE_BATCH")) && ab::release_fast("queue-wake-batch");
         std::sync::atomic::fence(Ordering::SeqCst);
+        if !always && batch && queued > self.low_water {
+            return;
+        }
         if always || self.waiting.load(Ordering::SeqCst) != 0 {
             // Under the lock: a sender between its failed retry and its
             // wait holds it, so the signal cannot fall in between.
@@ -5306,7 +5324,7 @@ impl QueuedExecutor {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let s = stop.clone();
         let wake = tx.clone();
-        let space = Arc::new(QueueSpace::new());
+        let space = Arc::new(QueueSpace::new(record_queue()));
         let freed = space.clone();
         std::thread::Builder::new()
             .name("gpu-record".into())
@@ -5353,7 +5371,7 @@ impl QueuedExecutor {
                     }
                     // A sender waiting for queue space wakes now: its slot
                     // is free the moment the command is taken.
-                    freed.freed();
+                    freed.freed(p.load(Ordering::Acquire));
                     // Commands other than items are told apart in the
                     // idle attribution by a small code in place of a program.
                     let other = match &cmd {
@@ -5691,7 +5709,7 @@ fn summary_locked() -> Option<String> {
             provider.push_str(&format!(" | refills by caller: {}", b.images.refill_callers_top(24)));
         }
         format!(
-            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB, chunk-views {}) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, fault-runs {}/{}p of {} heated, premarked {}/{}p, sync points {} ticks={} eager={}/{}hot/{}runs req={} scopes={} merged={} ends={:?} barriers={}/{}cs/{}xfer/{}img through-copies={} clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new arena={}blk/{}MiB/{}live/{}MiB{}",
+            "draws={} needs_shader={} dispatches={} clears={}c/{}d meta={} dcc-decide={}gpu/{}cpu/{}spent resolves={} eop={} captures={} fills={}+{}p copies={} images={} (up {} [new {} cpu {} gpu {} unw {}] wb {} conv {} retile {} overlay {} known-keys {} imp {} direct {} reuse {} discard {} drop {:?} msdepth {} gc {}/{} at {}/{} MiB superseded {} refills [kept {} own-wb {}] readback {} {}/{} MiB) buffers={} ({} MiB, up {}/{} MiB, untracked {} MiB, {} ms, dn {}/{} MiB {} ms, {} direct, {} through, {} words/{} ms, cp {} fill {} wr {}, settled {}/{} MiB (pressure {}), freed {}/{} MiB, chunk-views {}) vram buf/img {}/{} MiB faults={}/{} [w {} img {} r {} landed {} waited {}] hot {} pages, {}/{} changed, fault-runs {}/{}p of {} heated, premarked {}/{}p, sync points {} ticks={} eager={}/{}hot/{}runs req={} scopes={} merged={} ends={:?} barriers={}/{}cs/{}xfer/{}img through-copies={} clean-skips={} memo-reads={}/{} (dirty {} sync {}) written-uses={} streamed={} uploads={:?}/{}tick/{}w prologue={}runs/{}cp/{}touched/{}new mirror-misses={}/{}leaps arena={}blk/{}MiB/{}live/{}MiB{}",
             s.draws,
             s.needs_shader_draws,
             s.dispatches,
@@ -5803,6 +5821,8 @@ fn summary_locked() -> Option<String> {
             b.sched.stats().prologue_copies,
             bf.prologue_touched,
             bf.prologue_new,
+            bf.misses,
+            bf.adjacent_leaps,
             b.dev.arena.stats().blocks,
             b.dev.arena.stats().block_bytes >> 20,
             b.dev.arena.stats().live,
@@ -5860,19 +5880,24 @@ fn gpu_time_line(t: crate::scheduler::gpu_timer::GpuTime, top: &str) -> String {
 mod queue_space_tests {
     use super::*;
 
-    /// A producer filling a two-slot queue faster than its consumer takes
+    /// A producer filling a small queue faster than its consumer takes
     /// from it is woken by the consumer's signals, never by the timeout,
     /// and every item arrives in order.
     #[test]
     fn full_queue_senders_wake_without_timeouts() {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(2);
-        let space = Arc::new(QueueSpace::new());
+        const CAPACITY: usize = 8;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(CAPACITY);
+        let space = Arc::new(QueueSpace::new(CAPACITY));
         let freed = space.clone();
+        let queued = Arc::new(AtomicU64::new(0));
+        let q = queued.clone();
         const N: u32 = 20_000;
         let consumer = std::thread::spawn(move || {
             let mut next = 0;
             while let Ok(v) = rx.recv() {
-                freed.freed();
+                // As the recorder: the count still holds the taken command.
+                freed.freed(q.load(Ordering::Acquire));
+                q.fetch_sub(1, Ordering::AcqRel);
                 assert_eq!(v, next);
                 next += 1;
                 if next % 64 == 0 {
@@ -5885,6 +5910,7 @@ mod queue_space_tests {
         let before = QUEUE_SPACE_TIMEOUTS.load(Ordering::Relaxed);
         let t0 = std::time::Instant::now();
         for i in 0..N {
+            queued.fetch_add(1, Ordering::AcqRel);
             space.send(&tx, i);
         }
         drop(tx);
