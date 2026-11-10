@@ -638,6 +638,10 @@ fn run_loop<'a>(
 ) -> LoopStats {
     let present = opts.present;
     let primed = std::mem::replace(&mut space.primed, true);
+    // The replay records on this thread: its states are the ones
+    // `RPS5E_IDLE_WHY` attributes the GPU's idle time to.
+    crate::perf::idle::mark_thread();
+    crate::scheduler::allow_spin_waits();
     let cpu = profile::thread_cpu;
     let laps0 = laps();
     // TEMPORARY diagnostic: what a frame's draws are.

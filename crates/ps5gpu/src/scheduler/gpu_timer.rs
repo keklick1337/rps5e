@@ -115,7 +115,8 @@ pub mod wait_trace {
     /// The command buffer of `tick` took `ns` of GPU time; log it when a
     /// traced wait waited for it.
     pub fn read_back(tick: u64, ns: u64, segments: usize, largest: (u64, u64), span: Option<(u64, u64)>, period_ns: f64) {
-        if threshold_ms().is_none() {
+        let idle_why = crate::perf::idle::enabled();
+        if threshold_ms().is_none() && !idle_why {
             return;
         }
         // The GPU clock end of the previous buffer read back: the gap to
@@ -132,6 +133,14 @@ pub mod wait_trace {
             }
             gap
         };
+        if idle_why {
+            if let Some(g) = gap {
+                crate::perf::idle::gap_before(tick, (g * 1e6) as u64);
+            }
+            if threshold_ms().is_none() {
+                return;
+            }
+        }
         if every_tick() {
             log::info!(
                 "[wait-trace] buffer {tick}: gap before {} ms, GPU {:.3} ms, largest {} {:.3} ms",

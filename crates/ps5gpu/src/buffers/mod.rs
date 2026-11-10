@@ -1277,6 +1277,7 @@ impl BufferCache {
     /// becomes GPU-dirty.
     pub fn obtain(&mut self, sched: &mut Scheduler, addr: u64, size: u64, written: bool) -> Result<BufferSlice, vk::Result> {
         let size = size.max(1);
+        obtain_log(addr, size, written, sched.current_tick());
         if written {
             crate::slice_shadow::hole(crate::slice_shadow::Hole::WrittenRange);
             crate::slice_shadow::changed(addr, size);
@@ -2282,10 +2283,9 @@ impl BufferCache {
                 }
             }
         }
-        // Keep the parts of overlapping spans outside the range.
-        if self.written_through.overlaps(start, end) {
-            self.written_through.cut(start, end);
-        }
+        // Keep the parts of overlapping spans outside the range (the cut
+        // finds them itself: no separate look first).
+        self.written_through.cut(start, end);
     }
 
     /// The pages of a run were downloaded: drop the spans inside it.
@@ -3162,3 +3162,18 @@ impl BufferCache {
 
 #[cfg(test)]
 mod tests;
+
+/// `RPS5E_OBTAIN_LOG=<program>` (diagnostics, with the GPU profile): the
+/// first 400 buffer uses of that program's items are logged (range,
+/// written, tick).
+fn obtain_log(addr: u64, size: u64, written: bool, tick: u64) {
+    static P: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(p) = *P.get_or_init(|| std::env::var("RPS5E_OBTAIN_LOG").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())) else { return };
+    if crate::backend::profile::work() & ((1 << 56) - 1) != p {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+        log::info!("[obtain-log] p{p:#x} {addr:#x}+{size:#x} written={written} tick {tick}");
+    }
+}

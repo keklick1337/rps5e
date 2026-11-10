@@ -78,6 +78,15 @@ enum State {
     Landed(u64),
 }
 
+/// `RPS5E_WRITTEN_REPEAT_SKIP=0`: a GPU write recorded again over exactly
+/// the range and state already recorded (a run of dispatches writing one
+/// buffer in one tick) cuts and re-inserts it as any other write (A/B
+/// release name `written-repeat-skip`).
+fn repeat_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_WRITTEN_REPEAT_SKIP")) && crate::backend::ab::release_fast("written-repeat-skip")
+}
+
 /// `RPS5E_WRITTEN_WORDS_IN_PLACE=0`: a write-through re-inserts every
 /// pending range it lands instead of updating it in place.
 fn in_place_enabled() -> bool {
@@ -130,6 +139,16 @@ impl WrittenWords {
         if start >= end {
             return;
         }
+        // The same range in the same state is already there (a run of
+        // dispatches writing one buffer in one tick): ranges never overlap,
+        // so the cut and insert below would put back exactly this entry.
+        if repeat_skip_enabled() && self.map.len() < Self::MAX && self.map.get(&start) == Some(&(end, state)) {
+            return;
+        }
+        self.insert_always(start, end, state);
+    }
+
+    fn insert_always(&mut self, start: u64, end: u64, state: State) {
         if self.map.len() >= Self::MAX {
             let dropped = std::mem::take(&mut self.map);
             for (s, (e, _)) in dropped {
@@ -476,6 +495,55 @@ mod tests {
         w.written(0x1004, 4, 1);
         assert_eq!(w.in_guest_memory_after(0x1000, 0x10), None, "rewritten");
         assert_eq!(w.page_words(0x1000, 0x2000).in_guest_memory_after(0x1004, 4), None);
+    }
+
+    /// Writes repeated over exactly a recorded range (skipped) leave the
+    /// same record as cutting and inserting every one, among random other
+    /// writes, write-throughs and forgets.
+    #[test]
+    fn repeated_writes_leave_the_record_unchanged() {
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut skipped = 0;
+        for _ in 0..50 {
+            let (mut a, mut b) = (WrittenWords::default(), WrittenWords::default());
+            let mut last = (0x1000u64, 0x100u64);
+            for tick in 0..400u64 {
+                let r = next();
+                let addr = (r >> 8) % 0x20000 & !3;
+                let size = 4 + (r >> 40) % 0x3000 & !3;
+                let t = tick / 8;
+                match r % 7 {
+                    0..=2 => {
+                        // The previous write again (a run of dispatches).
+                        skipped += (a.map.get(&last.0) == Some(&(last.0 + last.1, State::Pending(t)))) as usize;
+                        a.insert(last.0, last.0 + last.1, State::Pending(t));
+                        b.insert_always(last.0, last.0 + last.1, State::Pending(t));
+                    }
+                    3 => {
+                        last = (addr, size);
+                        a.insert(addr, addr + size, State::Pending(t));
+                        b.insert_always(addr, addr + size, State::Pending(t));
+                    }
+                    4 | 5 => {
+                        let (ps, pe) = (addr & !0xFFF, (addr + size + 0xFFF) & !0xFFF);
+                        a.written_through(ps, pe, addr, size, tick);
+                        b.written_through(ps, pe, addr, size, tick);
+                    }
+                    _ => {
+                        a.forget(addr & !0xFFF, 0x1000);
+                        b.forget(addr & !0xFFF, 0x1000);
+                    }
+                }
+                assert_eq!(a.map, b.map);
+            }
+        }
+        assert!(skipped > 1000, "repeats skipped: {skipped}");
     }
 
     #[test]

@@ -177,6 +177,8 @@ fn create_shader(ctx: &mut CpuContext) -> HleResult {
         return ERR_MEMORY_FAULT;
     }
     SHADERS_BY_CODE.lock().unwrap().get_or_insert_with(HashMap::new).insert(code, header);
+    // The prewarm work of this program goes to the front of the list.
+    ps5gpu::pipeline::created::note(code);
     super::shader_dump::on_create_shader(header);
     OK
 }

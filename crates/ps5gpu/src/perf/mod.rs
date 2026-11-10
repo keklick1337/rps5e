@@ -20,6 +20,7 @@
 
 pub mod frames;
 pub mod gpu;
+pub mod idle;
 pub mod items;
 pub mod panel;
 pub mod probe;

@@ -139,6 +139,23 @@ enum Kind {
     Background,
 }
 
+/// Moves a queued prewarm job, by tag, to the front of its pool's prewarm
+/// queue: it stays within the prewarm share (urgent jobs still go
+/// first), but runs before the rest of the list. False: not queued there.
+#[derive(Clone)]
+pub struct PromoteHandle(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+
+impl PromoteHandle {
+    pub fn promote(&self, tag: u64) -> bool {
+        (self.0)(tag)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_fn(f: impl Fn(u64) -> bool + Send + Sync + 'static) -> PromoteHandle {
+        PromoteHandle(Arc::new(f))
+    }
+}
+
 pub struct CompilePool<T: Send + 'static> {
     shared: Arc<Shared<T>>,
     threads: Vec<std::thread::JoinHandle<()>>,
@@ -397,6 +414,19 @@ impl<T: Send + 'static> CompilePool<T> {
         true
     }
 
+    /// A handle that moves queued prewarm jobs to the front of the prewarm
+    /// queue from any thread ([`PromoteHandle::promote`]).
+    pub fn promote_handle(&self) -> PromoteHandle {
+        let shared = self.shared.clone();
+        PromoteHandle(Arc::new(move |tag| {
+            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(i) = st.prewarm.iter().position(|(t, _)| *t == tag) else { return false };
+            let Some(job) = st.prewarm.remove(i) else { return false };
+            st.prewarm.push_front(job);
+            true
+        }))
+    }
+
     /// Prewarm jobs queued or running.
     pub fn prewarm_pending(&self) -> usize {
         let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -568,6 +598,46 @@ mod tests {
         }
         assert_eq!(&order[..3], &[0, 30, 1000], "the hurried job, then urgent work, before the rest of the list");
         assert_eq!(order.len(), 52);
+        assert!(pool.shutdown().is_empty());
+    }
+
+    /// A promoted prewarm job runs before the rest of the list but after
+    /// urgent work: the last promoted runs first.
+    #[test]
+    fn promoted_prewarm_jobs_run_first_within_the_list() {
+        use std::sync::atomic::AtomicBool;
+        let mut pool: CompilePool<u32> = CompilePool::new(1);
+        let release = Arc::new(AtomicBool::new(false));
+        let r = release.clone();
+        pool.submit(
+            move || {
+                while !r.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                0
+            },
+            false,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.shared.state.lock().unwrap().urgent.len() != 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for tag in 1..=20u64 {
+            pool.submit_prewarm(move || tag as u32, tag);
+        }
+        let h = pool.promote_handle();
+        let other = std::thread::spawn(move || (h.promote(12), h.promote(15), h.promote(99)));
+        assert_eq!(other.join().unwrap(), (true, true, false));
+        pool.submit(|| 1000, false);
+        assert_eq!(pool.prewarm_queued(), 20);
+        release.store(true, Ordering::SeqCst);
+        let mut order = Vec::new();
+        while order.len() < 22 && Instant::now() < deadline {
+            order.extend(pool.take());
+            pool.wait(Duration::from_millis(5));
+        }
+        assert_eq!(&order[..5], &[0, 1000, 15, 12, 1], "urgent work, then the promoted jobs, then the list");
+        assert_eq!(order.len(), 22);
         assert!(pool.shutdown().is_empty());
     }
 

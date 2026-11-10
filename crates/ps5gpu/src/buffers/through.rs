@@ -12,7 +12,8 @@
 //! that start within that length before its range. Spans longer than
 //! [`LONG`] are also listed apart and looked at one by one: one long span
 //! would otherwise widen every lookup to all spans within its length
-//! (`RPS5E_THROUGH_LONG=0`: the bound covers them too). Each span carries its
+//! (`RPS5E_THROUGH_LONG=0`: the bound covers them too), within the
+//! longest long span's length before the range. Each span carries its
 //! insertion number: overlapping spans answer newest first, and the oldest
 //! half is dropped when the list is full. `RPS5E_THROUGH_INDEX=0` (or a
 //! slow period of A/B scope `release`) answers every lookup by a scan of
@@ -32,6 +33,8 @@ pub(super) struct ThroughSpans {
     max_len: u64,
     /// Keys of the spans longer than [`LONG`] (with `RPS5E_THROUGH_LONG`).
     long: std::collections::BTreeSet<(u64, u64)>,
+    /// No span in `long` is longer (recomputed when the list is trimmed).
+    long_max_len: u64,
 }
 
 /// Spans longer than this are listed apart (see the module comment).
@@ -41,6 +44,14 @@ pub(super) const LONG: u64 = 64 << 10;
 fn indexed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_THROUGH_INDEX")) && crate::backend::ab::release_fast("RPS5E_THROUGH_INDEX")
+}
+
+/// Lookups visit only the long spans starting within the longest one's
+/// length before the range (`RPS5E_THROUGH_LONG_BOUND`, A/B release name
+/// of the same name); otherwise every long span starting before it.
+fn long_bounded() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_THROUGH_LONG_BOUND")) && crate::backend::ab::release_fast("RPS5E_THROUGH_LONG_BOUND")
 }
 
 /// Long spans are listed apart (read once: the lists are built by it).
@@ -57,6 +68,7 @@ impl ThroughSpans {
         self.map.clear();
         self.long.clear();
         self.max_len = 0;
+        self.long_max_len = 0;
     }
 
     fn is_long(span: &ThroughSpan) -> bool {
@@ -67,6 +79,7 @@ impl ThroughSpans {
     fn put(&mut self, k: (u64, u64), span: ThroughSpan) {
         if Self::is_long(&span) {
             self.long.insert(k);
+            self.long_max_len = self.long_max_len.max(span.end - span.start);
         } else {
             self.max_len = self.max_len.max(span.end - span.start);
         }
@@ -102,6 +115,7 @@ impl ThroughSpans {
         self.map.retain(|k, _| k.1 >= cutoff);
         self.long.retain(|k| k.1 >= cutoff);
         self.max_len = self.map.values().filter(|s| !Self::is_long(s)).map(|s| s.end - s.start).max().unwrap_or(0);
+        self.long_max_len = self.long.iter().map(|k| self.map[k].end - self.map[k].start).max().unwrap_or(0);
     }
 
     /// Keys of the spans overlapping `[start, end)`, in no particular order.
@@ -117,11 +131,14 @@ impl ThroughSpans {
         let from = start.saturating_sub(self.max_len);
         let (lo, hi) = if indexed { ((from, 0), (end, 0)) } else { ((0, 0), (u64::MAX, u64::MAX)) };
         let near = self.map.range(lo..hi);
-        let far = self.long.range(..(if indexed { from } else { 0 }, 0)).map(|k| (k, &self.map[k]));
+        let far_from = if indexed && long_bounded() { start.saturating_sub(self.long_max_len) } else { 0 };
+        let far_to = if indexed { from } else { 0 };
+        let far = self.long.range((far_from.min(far_to), 0)..(far_to, 0)).map(|k| (k, &self.map[k]));
         near.chain(far).filter(move |(_, s)| s.start < end && start < s.end)
     }
 
     /// Whether a span overlaps `[start, end)`.
+    #[cfg(test)]
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.overlapping(start, end).next().is_some()
     }

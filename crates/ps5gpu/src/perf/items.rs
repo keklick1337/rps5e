@@ -98,7 +98,7 @@ pub fn measure<R>(kind: u64, program: u64, f: impl FnOnce() -> R) -> R {
             // The largest spans per item (wall time, nested spans overlap).
             let mut top: Vec<(usize, u64)> = sp.iter().copied().enumerate().filter(|&(i, v)| v > 0 && i != 0 && i != 1 && i != 33).collect();
             top.sort_by(|a, b| b.1.cmp(&a.1));
-            let names: Vec<String> = top.iter().take(5).map(|&(i, v)| format!("{}:{:.1}", crate::backend::profile::NAMES[i], v as f64 / *n as f64 / 1000.0)).collect();
+            let names: Vec<String> = top.iter().take(spans_shown()).map(|&(i, v)| format!("{}:{:.1}", crate::backend::profile::NAMES[i], v as f64 / *n as f64 / 1000.0)).collect();
             let cmds: Vec<String> = cmds.iter().zip(COMMAND_NAMES).filter(|(c, _)| **c > 0).map(|(c, name)| format!("{name}:{:.2}", *c as f64 / *n as f64)).collect();
             line.push_str(&format!("[{}]{{{}}}", names.join(","), cmds.join(",")));
         }
@@ -106,4 +106,10 @@ pub fn measure<R>(kind: u64, program: u64, f: impl FnOnce() -> R) -> R {
         t.sums.clear();
     }
     r
+}
+
+/// Spans listed per program (`RPS5E_ITEM_CPU_SPANS`, default 5).
+fn spans_shown() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("RPS5E_ITEM_CPU_SPANS").ok().and_then(|v| v.parse().ok()).unwrap_or(5))
 }

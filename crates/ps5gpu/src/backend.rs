@@ -2374,7 +2374,9 @@ impl Backend {
         self.isolate_preparation("dispatch");
         let timed = self.sched.time_item_begin(d.shader.address);
         let mut ctx = DrawContext { dev: &self.dev, sched: &mut self.sched, buffers: (&mut self.buffers).into(), images: (&mut self.images).into(), targets: &targets };
+        let inner = profile::dstart();
         let outcome = self.pipelines.dispatch(&mut ctx, d);
+        profile::dend(57, inner);
         self.sched.time_item_end(timed);
         if self.pipelines.take_compile_pending() {
             self.stats.dispatches -= 1;
@@ -3170,7 +3172,9 @@ fn lock() -> Option<Guard> {
     let at = std::panic::Location::caller();
     let t0 = sites.then(std::time::Instant::now);
     let tw = (ab::enabled() && crate::perf::sys::is_recorder()).then(std::time::Instant::now);
+    let prev = crate::perf::idle::enter(crate::perf::idle::LOCK, 0);
     let mut g = profile::time(7, || CELL.inner.lock().unwrap_or_else(|e| e.into_inner()));
+    crate::perf::idle::leave(prev);
     CELL.owner.store(me, Ordering::Release);
     if let Some(tw) = tw {
         note_pipeline_ab(2, tw.elapsed().as_micros() as u64);
@@ -3913,7 +3917,7 @@ pub(crate) mod profile {
     /// them are the sub-phases of draw recording, printed (and measured)
     /// only with `RPS5E_GPU_PROFILE=2`.
     pub const BASE_SPANS: usize = 35;
-    pub const NAMES: [&str; 51] = [
+    pub const NAMES: [&str; 58] = [
         "draw", "dispatch", "eop", "flush", "capture", "fault_dl", "fill", "lock", "targets", "prep", "bind", "module", "obtain", "imgview", "img_prep", "devrange", "dcc", "tkey", "tfind",
         "tview", "tgt_find", "wfault", "mat", "d_stages", "d_modules", "d_targets", "d_vinput", "d_ranges", "d_descs", "d_index", "d_pipe", "d_record", "d_post", "draw_cpu", "cmd_cpu",
         // Sub-phases (RPS5E_GPU_PROFILE=2): the front-end preparation,
@@ -3921,8 +3925,13 @@ pub(crate) mod profile {
         "prep_memo", "spec_apply", "layout_find", "shader_data", "stage_ranges", "desc_words", "desc_bind", "commit", "scope_state", "draw_cmd", "hazards", "sdata_build", "stream_copy", "rendering",
         // GPU_PLAN §56: the flattened-table binding (compare and upload).
         "table_cmp", "table_up",
+        // The record phase of dispatches (`ShaderPipelines::try_dispatch`):
+        // entry bookkeeping, ranges, layout and pipeline, barriers and
+        // launch kernels, commit and the dispatch command, what follows it;
+        // the provider's whole part (`dispatch` less it is the back-end's).
+        "c_entry", "c_ranges", "c_layout", "c_barrier", "c_commit", "c_post", "c_provider",
     ];
-    pub static NANOS: [AtomicU64; 51] = [const { AtomicU64::new(0) }; 51];
+    pub static NANOS: [AtomicU64; 58] = [const { AtomicU64::new(0) }; 58];
     /// CPU time of the calling thread (ns).
     #[cfg(windows)]
     pub fn thread_cpu() -> u64 {
@@ -4175,6 +4184,16 @@ pub(crate) mod profile {
     }
     /// [`Self::time`] for the sub-phase spans (>= [`BASE_SPANS`]):
     /// measured only in the detailed profile.
+    /// The start of a sub-phase span ended by [`dend`] (detailed profile
+    /// only; a span left by an early return is not counted).
+    pub fn dstart() -> Option<u64> {
+        detailed().then(span_now)
+    }
+    pub fn dend(k: usize, t: Option<u64>) {
+        if let Some(t) = t {
+            add(k, span_ns(t, span_now()));
+        }
+    }
     pub fn dtime<R>(k: usize, f: impl FnOnce() -> R) -> R {
         if !detailed() {
             return f();
@@ -4684,6 +4703,7 @@ impl RenderExecutor for GpuExecutor {
             // A draw waiting for a compile does so with the back-end
             // unlocked (CPU faults on GPU-written pages need it meanwhile).
             let program = if draw.shaders.ps.address != 0 { draw.shaders.ps.address } else { draw.shaders.vertex_program_address() };
+            let idle_prev = crate::perf::idle::enter(crate::perf::idle::DRAW, program);
             let ran = crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
                 let r = crate::perf::items::measure(crate::perf::items::DRAW, program, || profile::time_cpu(|| profile::time(0, || with_backend(|b| {
                     let c0 = crate::perf::items::enabled().then(|| b.command_counts());
@@ -4695,6 +4715,7 @@ impl RenderExecutor for GpuExecutor {
                 }))));
                 (r.is_some(), r == Some(true))
             });
+            crate::perf::idle::leave(idle_prev);
             if !ran {
                 DRAWS_WITHOUT_BACKEND.fetch_add(1, Ordering::Relaxed);
             }
@@ -4708,6 +4729,7 @@ impl RenderExecutor for GpuExecutor {
         shadow::item(shadow::Kind::Dispatch, 0, || {
             profile::set_work(profile::WORK_DISPATCH, dispatch.shader.address);
             let measured = ab::enabled().then(|| (ab::mode_fast(), profile::thread_cpu()));
+            let idle_prev = crate::perf::idle::enter(crate::perf::idle::DISPATCH, dispatch.shader.address);
             crate::pipeline::unlocked_wait::record(unlocked_waits_allowed(), || {
                 let r = crate::perf::items::measure(crate::perf::items::DISPATCH, dispatch.shader.address, || profile::time(1, || with_backend(|b| {
                     let c0 = crate::perf::items::enabled().then(|| b.command_counts());
@@ -4719,6 +4741,7 @@ impl RenderExecutor for GpuExecutor {
                 })));
                 ((), r == Some(true))
             });
+            crate::perf::idle::leave(idle_prev);
             if let Some((fast, t)) = measured {
                 ab::note_dispatch(fast, profile::thread_cpu() - t);
             }
@@ -5284,6 +5307,11 @@ impl QueuedExecutor {
                 // `records_on_own_thread`).
                 ps5vm::topology::pin_current_thread_to_recorder_core("gpu-record");
                 crate::perf::sys::mark_recorder_thread();
+                crate::perf::idle::mark_thread();
+                // Its waits poll only on a core no other thread uses.
+                if ps5vm::topology::recorder_core().is_some() {
+                    crate::scheduler::allow_spin_waits();
+                }
                 let ex = GpuExecutor;
                 let mut taken = 0u32;
                 loop {
@@ -5293,7 +5321,9 @@ impl QueuedExecutor {
                         Ok(c) => c,
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             let t = std::time::Instant::now();
+                            let idle_prev = crate::perf::idle::enter(crate::perf::idle::IDLE, 0);
                             let r = rx.recv();
+                            crate::perf::idle::leave(idle_prev);
                             let us = t.elapsed().as_micros() as u64;
                             PIPELINE_US[0].fetch_add(us, Ordering::Relaxed);
                             note_pipeline_ab(0, us);
@@ -5314,6 +5344,19 @@ impl QueuedExecutor {
                     // A sender waiting for queue space wakes now: its slot
                     // is free the moment the command is taken.
                     freed.freed();
+                    // Commands other than items are told apart in the
+                    // idle attribution by a small code in place of a program.
+                    let other = match &cmd {
+                        Recorded::Draw(..) | Recorded::Dispatch(..) => 0,
+                        Recorded::EndOfPipe(_) => 1,
+                        Recorded::AfterPipe(_) => 2,
+                        Recorded::MemoryFilled(..) => 3,
+                        Recorded::Flush => 4,
+                        Recorded::SubmissionComplete => 5,
+                        Recorded::SyncPoint => 6,
+                        Recorded::Call(_) => 7,
+                    };
+                    let idle_prev = (other != 0).then(|| crate::perf::idle::enter(crate::perf::idle::OTHER, other)).flatten();
                     match cmd {
                         Recorded::Draw(d, pre) => {
                             draw_prefetch::set(pre);
@@ -5331,6 +5374,7 @@ impl QueuedExecutor {
                         Recorded::SyncPoint => crate::memory::note_sync_point(),
                         Recorded::Call(f) => f(),
                     }
+                    crate::perf::idle::leave(idle_prev);
                     p.fetch_sub(1, Ordering::AcqRel);
                 }
             })

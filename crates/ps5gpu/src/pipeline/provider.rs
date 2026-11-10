@@ -3582,13 +3582,18 @@ impl ShaderPipelines {
             }
         }
         let stale: Vec<(u64, Arc<super::sources::ModuleSource>)> = self.t.prewarm.stale().filter_map(|m| Some((m.key, m.source.clone()?))).collect();
+        if let Some(pool) = &*self.t.pool {
+            super::created::install(pool.promote_handle());
+        }
         if let (Some(compiler), Some(pool)) = (self.compiler.clone(), &*self.t.pool) {
             for (key, source) in stale {
                 if self.t.modules.contains_key(&key) || !self.t.pending_modules.w().insert(key) {
                     continue;
                 }
                 self.t.prewarm_translating.w().insert(key);
+                let address = source.program.address;
                 pool.submit_prewarm(translate_job(self.dev.clone(), compiler.clone(), key, source), key);
+                super::created::register(key, &[address]);
             }
         }
         let records: Vec<PrewarmPipeline> =
@@ -3626,9 +3631,17 @@ impl ShaderPipelines {
     /// waiting for a translation are kept for later). Returns the count.
     fn queue_prewarm_pipelines(&mut self, records: Vec<PrewarmPipeline>) -> usize {
         let mut queued = 0;
+        // Program of each module of the list (the shader objects the game
+        // creates move their pipelines to the front: `super::created`).
+        let programs: crate::fxhash::HashMap<u64, u64> = if super::created::enabled() {
+            self.t.prewarm.modules.iter().filter_map(|m| Some((m.key, m.source.as_ref()?.program.address))).collect()
+        } else {
+            Default::default()
+        };
+        let program = |k: u64| programs.get(&k).copied().unwrap_or(0);
         for r in records {
             let waits = |k: u64| k != 0 && self.t.prewarm_translating.contains(&k);
-            let (job, tag): (Box<dyn FnOnce() -> Compiled + Send>, u64) = match r {
+            let (job, tag, of): (Box<dyn FnOnce() -> Compiled + Send>, u64, [u64; 2]) = match r {
                 PrewarmPipeline::Graphics(g) => {
                     if waits(g.vs) || waits(g.ps) {
                         self.t.prewarm_deferred.w().push(PrewarmPipeline::Graphics(g));
@@ -3670,7 +3683,8 @@ impl ShaderPipelines {
                         continue;
                     }
                     let tag = hash_of(&key);
-                    (Box::new(graphics_job(self.dev.clone(), self.t.disk.cache, key, vs, ps, tess, g.mesh, None, self.fast_builds())), tag)
+                    let of = [program(g.vs), program(g.ps)];
+                    (Box::new(graphics_job(self.dev.clone(), self.t.disk.cache, key, vs, ps, tess, g.mesh, None, self.fast_builds())), tag, of)
                 }
                 PrewarmPipeline::Compute(c) => {
                     if waits(c.cs) {
@@ -3692,11 +3706,12 @@ impl ShaderPipelines {
                         continue;
                     }
                     let variant = self.spill_variant_inputs(key.cs, key.cs);
-                    (Box::new(compute_job(self.dev.clone(), self.t.disk.cache, key, cs, None, self.fast_builds(), variant)), hash_of(&key))
+                    (Box::new(compute_job(self.dev.clone(), self.t.disk.cache, key, cs, None, self.fast_builds(), variant)), hash_of(&key), [program(c.cs), 0])
                 }
             };
             if let Some(pool) = &*self.t.pool {
                 pool.submit_prewarm(job, tag);
+                super::created::register(tag, &of);
                 queued += 1;
             }
         }
@@ -3744,7 +3759,10 @@ impl ShaderPipelines {
             self.t.prewarm_counts.w().background_total = 0;
             crate::osd::set_prewarm_progress(None);
             let built = self.t.graphics.len() + self.t.compute.len();
-            log::info!("ps5gpu: shader prewarm: the list was built in the background ({built} pipelines in the provider)");
+            let (created, promoted) = super::created::counts();
+            log::info!(
+                "ps5gpu: shader prewarm: the list was built in the background ({built} pipelines in the provider; {promoted} jobs moved to the front for {created} shaders the game created)"
+            );
             self.t.disk.w().save_in_background();
             return;
         }
@@ -7483,6 +7501,7 @@ impl ShaderPipelines {
             let system = super::write_extent::SystemSgprs { work_group: [system.work_group_x, system.work_group_y, system.work_group_z], thread_group_size: system.thread_group_size };
             self.bound_writes(&prepared, d, system, wave == 64, groups, threads);
         }
+        let span = crate::backend::profile::dstart();
         let mut ranges = RangeList::new();
         self.stage_ranges(&prepared, &mut ranges);
         if !direct {
@@ -7493,6 +7512,7 @@ impl ShaderPipelines {
         for &(a, n, _, _) in &ranges {
             ctx.buffers.find_or_create(ctx.sched, a, n)?;
         }
+        crate::backend::profile::dend(52, span);
         let mut bound = [BoundStage { stage: ShaderStage::Compute, prepared }];
         let mut writes = std::mem::take(&mut self.writes);
         writes.clear();
@@ -7579,11 +7599,14 @@ impl ShaderPipelines {
         let bind = self.bind_stage(ctx, &mut bound[0], writes);
         self.patch_shader_data = None;
         bind?;
+        let span = crate::backend::profile::dstart();
         let layout = self.draw_layout(&bound[..], false, vk::ShaderStageFlags::COMPUTE)?;
         let invocations = threads[0] * threads[1] * threads[2];
         let subgroup32 = self.subgroup32(threads, wave, module);
         let pipeline = self.compute_pipeline(ComputeKey { cs: cs_key, layout: layout.pipeline_layout, subgroup32 }, module)?;
         let args = if direct { None } else { Some(ctx.buffers.obtain(ctx.sched, d.packet.indirect_address, 12, false)?) };
+        crate::backend::profile::dend(53, span);
+        let span = crate::backend::profile::dstart();
 
         // Only the hazards that exist get a full barrier: work recorded
         // through `cmd` (it may have written anything), shader writes of
@@ -7717,6 +7740,8 @@ impl ShaderPipelines {
                 m.before_dispatch(ctx, program, table, &self.t.fault);
             }
         }
+        crate::backend::profile::dend(54, span);
+        let span = crate::backend::profile::dstart();
         let cb = ctx.sched.ordered_cmd();
         // SAFETY: recording buffer; compatible pipeline.
         crate::scheduler::disturb_state();
@@ -7763,6 +7788,8 @@ impl ShaderPipelines {
                 }
             }
         }
+        crate::backend::profile::dend(55, span);
+        let span = crate::backend::profile::dstart();
         if guest_run {
             // Later work that reads what this dispatch wrote, or writes
             // what it read, waits for it; later members of its run do not.
@@ -7789,6 +7816,7 @@ impl ShaderPipelines {
         self.overwrites.clear();
         self.overwrites.extend_from_slice(&writes.overwritten);
         self.compressed_stores.extend_from_slice(&writes.compressed_stores);
+        crate::backend::profile::dend(56, span);
         Ok(DrawOutcome::Recorded)
     }
 
@@ -8696,10 +8724,12 @@ impl ShaderPipelines {
             self.stats.needs_shader += 1;
             return DrawOutcome::NeedsShader;
         }
+        let span = crate::backend::profile::dstart();
         self.zero_buffers(ctx.sched);
         self.load_prewarm();
         self.harvest();
         self.retire_swapped(ctx.sched);
+        crate::backend::profile::dend(51, span);
         let compiler = self.compiler.clone();
         self.wait_class = WaitClass::Dispatch;
         let mut r = self.try_dispatch(ctx, dispatch, compiler.clone());

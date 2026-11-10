@@ -129,6 +129,12 @@ impl Timeline {
         let at = std::panic::Location::caller();
         let sites = crate::backend::profile::wait_sites();
         let ab = crate::backend::ab::enabled() && crate::perf::sys::is_recorder();
+        if crate::perf::idle::enabled() && !self.is_complete(tick) {
+            let prev = crate::perf::idle::enter(crate::perf::idle::GPU_WAIT, 0);
+            self.wait_inner(tick);
+            crate::perf::idle::leave(prev);
+            return;
+        }
         if (sites || ab) && !self.is_complete(tick) {
             let t = std::time::Instant::now();
             self.wait_inner(tick);
@@ -154,6 +160,24 @@ impl Timeline {
             return;
         }
         crate::slice_shadow::hole(crate::slice_shadow::Hole::FlushWait);
+        if let Some(limit) = spin_limit() {
+            // The recording thread has a core of its own: it polls the
+            // counter instead of sleeping in the driver, and goes on the
+            // moment the GPU is done (a blocking wait wakes tens of
+            // microseconds later, every one of them GPU idle time).
+            let start = std::time::Instant::now();
+            let mut n = 0u32;
+            loop {
+                if self.refresh() >= tick {
+                    return;
+                }
+                n = n.wrapping_add(1);
+                if n % 64 == 0 && start.elapsed() >= limit {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        }
         let sems = [self.semaphore];
         let values = [tick];
         let info = vk::SemaphoreWaitInfo::default().semaphores(&sems).values(&values);
@@ -201,6 +225,32 @@ impl Timeline {
         }
         self.completed.fetch_max(tick, Ordering::AcqRel);
     }
+}
+
+std::thread_local! {
+    /// The calling thread polls GPU waits ([`allow_spin_waits`]).
+    static SPIN_WAITS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The calling thread (the recording thread, on a core of its own) may
+/// poll its GPU waits instead of blocking (`RPS5E_GPU_WAIT_SPIN`).
+pub fn allow_spin_waits() {
+    SPIN_WAITS.with(|s| s.set(true));
+}
+
+/// `RPS5E_GPU_WAIT_SPIN=<us>` (default 20000; `0`/`off`: never): a GPU
+/// wait of the recording thread polls the timeline for up to this long
+/// before it blocks in the driver (A/B release name `gpu-wait-spin`).
+/// Polling ends the wait as the GPU finishes; a blocking wait returns
+/// only when the driver wakes the thread, and the GPU idles meanwhile.
+fn spin_limit() -> Option<Duration> {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *US.get_or_init(|| match std::env::var("RPS5E_GPU_WAIT_SPIN").as_deref() {
+        Ok("0") | Ok("off") => 0,
+        Ok(v) => v.parse().unwrap_or(20_000),
+        Err(_) => 20_000,
+    });
+    (us != 0 && !crate::backend::ab::safe() && SPIN_WAITS.try_with(|s| s.get()).unwrap_or(false) && crate::backend::ab::release_fast("gpu-wait-spin")).then(|| Duration::from_micros(us))
 }
 
 /// How long the GPU may complete no work at all while a thread waits for
@@ -1431,6 +1481,7 @@ impl Scheduler {
         );
         let chain = std::mem::take(&mut self.chain);
         gpu_timer::wait_trace::submitted(tick, chain.len(), std::mem::take(&mut self.launch_kernels));
+        crate::perf::idle::submitted(tick);
         let cbis: Vec<vk::CommandBufferSubmitInfo> = prologue
             .iter()
             .chain(chain.iter().map(|(c, _)| c))

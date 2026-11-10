@@ -1686,6 +1686,8 @@ pub struct ImageCache {
     /// A cutoff before which an eviction pass found no idle image (see
     /// `evict_idle`).
     no_idle_below: u64,
+    /// No unpinned image was last used before this tick (see [`IdleFloor`]).
+    idle_floor: IdleFloor,
     /// Barriers being collected (reused).
     barriers: Vec<vk::ImageMemoryBarrier2<'static>>,
     /// Colour to multisampled depth reinterpretation (created on first
@@ -2027,6 +2029,119 @@ fn shader_write_rule_base() -> bool {
     *ON.get_or_init(|| std::env::var("RPS5E_SHADER_WRITE_INVALIDATE").is_ok_and(|v| v == "base"))
 }
 
+/// `RPS5E_IMAGE_IDLE_FLOOR=0`: every eviction pass over the budget walks
+/// all cached images for idle ones, also when none can be idle (A/B
+/// release name `image-idle-floor`).
+fn idle_floor_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_IMAGE_IDLE_FLOOR")) && crate::backend::ab::release_fast("image-idle-floor")
+}
+
+/// A lower bound of the last use of every unpinned image: an eviction
+/// pass whose cutoff is at or below it finds no idle image and is skipped
+/// (above the budget the cache is collected every 256 items, and GTA V
+/// keeps ~11 k images there, most of them pinned by bindless tables: the
+/// walk found nothing almost every time, ~1.5 % of the recording thread).
+///
+/// Uses only move an image's last use forward, to the current tick, and new
+/// images start at it, so the bound set by a pass (the oldest use it saw,
+/// at most the tick then) stays valid until an image is unpinned: its
+/// last use then lowers the bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleFloor(u64);
+
+impl IdleFloor {
+    /// An unpinned image may have been last used before `cutoff`.
+    pub(crate) fn may_be_idle(&self, cutoff: u64) -> bool {
+        cutoff > self.0
+    }
+
+    /// A pass saw `oldest` as the oldest use of an unpinned image (`u64::MAX`:
+    /// none) at `tick`.
+    pub(crate) fn walked(&mut self, oldest: u64, tick: u64) {
+        self.0 = oldest.min(tick);
+    }
+
+    /// An image last used at `last_use` lost its last pin.
+    pub(crate) fn unpinned(&mut self, last_use: u64) {
+        self.0 = self.0.min(last_use);
+    }
+}
+
+#[cfg(test)]
+mod idle_floor_tests {
+    use super::IdleFloor;
+
+    /// Random image lives (uses, pins, deletions) against eviction passes:
+    /// a pass the floor skips never had an unpinned image last used before
+    /// its cutoff, and passes are skipped at all. A floor that is not told
+    /// about unpins skips a pass that had an idle image.
+    #[test]
+    fn the_idle_floor_skips_only_passes_without_idle_images() {
+        // (last use, pins) per live image.
+        let run = |tell_unpins: bool| -> (u64, u64, bool) {
+            let mut images: Vec<(u64, u32)> = Vec::new();
+            let mut floor = IdleFloor::default();
+            let (mut tick, mut skipped, mut walked, mut wrong) = (1u64, 0u64, 0u64, false);
+            let mut rng = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for _ in 0..200_000 {
+                let r = next();
+                match r % 9 {
+                    0 => tick += 1 + (r >> 8) % 3,
+                    1 => images.push((tick, 0)),
+                    2 | 3 if !images.is_empty() => {
+                        let i = (r >> 8) as usize % images.len();
+                        images[i].0 = tick;
+                    }
+                    4 if !images.is_empty() => {
+                        let i = (r >> 8) as usize % images.len();
+                        images[i].1 += 1;
+                    }
+                    5 if !images.is_empty() => {
+                        let i = (r >> 8) as usize % images.len();
+                        if images[i].1 > 0 {
+                            images[i].1 -= 1;
+                            if images[i].1 == 0 && tell_unpins {
+                                floor.unpinned(images[i].0);
+                            }
+                        }
+                    }
+                    6 if !images.is_empty() && images.len() > 50 => {
+                        let i = (r >> 8) as usize % images.len();
+                        images.swap_remove(i);
+                    }
+                    7 | 8 => {
+                        let cutoff = tick.saturating_sub((r >> 8) % 40);
+                        let idle = images.iter().any(|&(u, p)| p == 0 && u < cutoff);
+                        if !floor.may_be_idle(cutoff) {
+                            skipped += 1;
+                            wrong |= idle;
+                            continue;
+                        }
+                        walked += 1;
+                        let oldest = images.iter().filter(|i| i.1 == 0).map(|i| i.0).min().unwrap_or(u64::MAX);
+                        floor.walked(oldest, tick);
+                        // The pass evicts some idle images.
+                        images.retain(|&(u, p)| !(p == 0 && u < cutoff && next() % 2 == 0));
+                    }
+                    _ => {}
+                }
+            }
+            (skipped, walked, wrong)
+        };
+        let (skipped, walked, wrong) = run(true);
+        assert!(!wrong, "a skipped pass had an idle image");
+        assert!(skipped > walked / 10, "passes skipped {skipped}, walked {walked}");
+        assert!(run(false).2, "unpins must lower the floor");
+    }
+}
+
 /// `RPS5E_IMAGE_GENERATIONS=0`: a change to one image (a render target
 /// written, an image refreshed, created or cleared) invalidates every
 /// memoised texture lookup, not only those of the image and its aliases.
@@ -2202,6 +2317,7 @@ impl ImageCache {
             stencil_views: Default::default(),
             orphan_views: Vec::new(),
             no_idle_below: 0,
+            idle_floor: IdleFloor::default(),
             pinned_log: Vec::new(),
             pinned_base: 0,
             pinned_read: std::sync::atomic::AtomicU64::new(0),
@@ -2313,6 +2429,7 @@ impl ImageCache {
             i.pins = i.pins.saturating_sub(1);
             if i.pins == 0 {
                 self.table.set_pinned(id, false);
+                self.idle_floor.unpinned(i.last_use);
             }
         }
     }
@@ -5556,8 +5673,23 @@ impl ImageCache {
         if cutoff <= self.no_idle_below {
             return;
         }
+        let floor = idle_floor_enabled();
+        if floor && !self.idle_floor.may_be_idle(cutoff) {
+            return;
+        }
         // Images a bindless table holds are in use while it is.
-        let mut idle: Vec<(u64, u64, u64)> = self.images.values().filter(|i| i.last_use < cutoff && i.pins == 0).map(|i| (i.last_use, i.id, i.key.size())).collect();
+        let mut oldest = u64::MAX;
+        let mut idle: Vec<(u64, u64, u64)> = Vec::new();
+        for i in self.images.values().filter(|i| i.pins == 0) {
+            oldest = oldest.min(i.last_use);
+            if i.last_use < cutoff {
+                idle.push((i.last_use, i.id, i.key.size()));
+            }
+        }
+        if floor {
+            // Evictions below only raise the oldest use.
+            self.idle_floor.walked(oldest, sched.current_tick());
+        }
         if idle.is_empty() {
             self.no_idle_below = cutoff;
             return;

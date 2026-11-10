@@ -436,7 +436,9 @@ impl GpuQueue {
                     let t = Instant::now();
                     let st = self.lock();
                     if st.count == 0 && !ps5vm::shutdown::requested() {
+                        ps5gpu::perf::idle::interpreter(ps5gpu::perf::idle::CP_NO_WORK);
                         let _ = self.cv.wait_timeout(st, Duration::from_millis(500));
+                        ps5gpu::perf::idle::interpreter(ps5gpu::perf::idle::CP_RUN);
                     }
                     IDLE_NO_WORK_US.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -450,7 +452,10 @@ impl GpuQueue {
                     let mut st = if wake_enabled() && Self::select(&st).is_some() {
                         st
                     } else {
-                        self.cv.wait_timeout(st, RETRY_INTERVAL).unwrap_or_else(|e| e.into_inner()).0
+                        ps5gpu::perf::idle::interpreter(ps5gpu::perf::idle::CP_BLOCKED);
+                        let g = self.cv.wait_timeout(st, RETRY_INTERVAL).unwrap_or_else(|e| e.into_inner()).0;
+                        ps5gpu::perf::idle::interpreter(ps5gpu::perf::idle::CP_RUN);
+                        g
                     };
                     Self::unblock_all(&mut st);
                     IDLE_BLOCKED_US.fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
