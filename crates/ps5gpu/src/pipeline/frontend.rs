@@ -1108,6 +1108,18 @@ impl ShaderFrontend {
         self.memory.read_backing(address, &mut self.code_scratch) && self.code_scratch[..] == *code
     }
 
+    /// [`Self::code_unchanged`] without this front end's scratch buffer.
+    pub(crate) fn code_equals(&self, address: u64, code: &[u8]) -> bool {
+        let mut now = vec![0u8; code.len()];
+        self.memory.read_backing(address, &mut now) && now[..] == *code
+    }
+
+    /// Decode and plan the program of `key` from guest memory, outside
+    /// this front end's caches (programs of created shaders).
+    pub(crate) fn build_key(&self, key: &ProgramKey, stage: ShaderStage) -> Result<Arc<StageProgram>, FrontendError> {
+        self.build(key.address, key.continuation, stage, key.user_data_base, key.user_data_count, key.wave_size)
+    }
+
     fn decode(&self, address: u64, continuation: u64) -> Result<(Program, u64, Vec<u8>, super::sources::CodeImage), FrontendError> {
         // Every word read is kept: the program can be decoded again from it.
         let read = std::cell::RefCell::new(Vec::new());
@@ -1195,7 +1207,17 @@ impl ShaderFrontend {
                 }
             }
         }
-        let result = self.build(address, continuation, stage, user_data_base, user_data_count, wave_size);
+        // The program built when its shader was created, when the code
+        // is still the code it was built from (a capture decodes itself:
+        // it must hold every word a decode reads).
+        let created = if crate::capture::active() { None } else { super::created::built(&key) };
+        let result = match created {
+            Some(p) if self.code_unchanged(address, &p.code) => {
+                super::created::note_used();
+                Ok(p)
+            }
+            _ => self.build(address, continuation, stage, user_data_base, user_data_count, wave_size),
+        };
         match &result {
             Err(FrontendError::Decode(_)) => self.stats.decode_failures += 1,
             Err(_) => self.stats.plan_failures += 1,

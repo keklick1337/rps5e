@@ -443,7 +443,8 @@ impl Tracker<'_> {
         if node.kind != ValueKind::BufferHandle || node.operands.len() != 4 {
             return false;
         }
-        if !node.operands.iter().all(|&d| self.is_runtime_descriptor_dword(d, &mut HashSet::new())) {
+        let mut walk = DerivableWalk::default();
+        if !node.operands.iter().all(|&d| self.is_runtime_descriptor_dword(d, &mut walk)) {
             // A fetch shader can combine one scalar address load with words
             // produced in the vector path: the shader still owns the whole
             // descriptor in its registers, so lower it through device
@@ -457,18 +458,28 @@ impl Tracker<'_> {
     /// may have no host record), or one derivable from such words. (The
     /// derivability check runs with the word not yet visited: marking it
     /// first would reject every non-phi word, e.g. a constant stride dword.)
-    fn is_runtime_descriptor_dword(&self, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
+    fn is_runtime_descriptor_dword(&self, value: ValueId, walk: &mut DerivableWalk) -> bool {
         if matches!(self.node_kind(value), ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord) {
             return true;
         }
-        self.is_runtime_derivable(value, visiting)
+        self.is_runtime_derivable(value, walk)
     }
 
     /// Known at plan time (constant, user data, shader base, a flattened
     /// table word) or ultimately a guest-memory read; a phi, select or
     /// operation qualifies when every operand does.
-    fn is_runtime_derivable(&self, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
-        if !visiting.insert(value) {
+    ///
+    /// Each value is walked once: a value met again while its own operands
+    /// are being walked closes a loop, which qualifies through a phi only;
+    /// a value whose walk finished qualified (the first that does not ends
+    /// the whole walk), wherever it is met again. Walking shared operands
+    /// once per path to them takes time exponential in the depth of the
+    /// sharing.
+    fn is_runtime_derivable(&self, value: ValueId, walk: &mut DerivableWalk) -> bool {
+        if walk.derivable.contains(&value) {
+            return true;
+        }
+        if !walk.visiting.insert(value) {
             return self.node_kind(value) == ValueKind::Phi;
         }
         let node = self.graph().node(value);
@@ -478,33 +489,37 @@ impl Tracker<'_> {
             }
             ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord => node.memory_index() < self.graph().memory.len(),
             ValueKind::Phi | ValueKind::Select | ValueKind::Operation | ValueKind::FirstLane => {
-                node.operands.iter().all(|&o| self.is_runtime_derivable(o, visiting))
+                node.operands.iter().all(|&o| self.is_runtime_derivable(o, walk))
             }
             _ => false,
         };
-        visiting.remove(&value);
+        walk.visiting.remove(&value);
+        if result {
+            walk.derivable.insert(value);
+        }
         result
     }
 
-    fn has_read_kind(&self, value: ValueId, kind: ValueKind, visiting: &mut HashSet<ValueId>) -> bool {
-        if !visiting.insert(value) {
+    /// A value of `kind` is reachable from `value` through operands.
+    /// `seen` holds every value already walked: a value reached again
+    /// (shared operands, loops) was searched without a find, since a find
+    /// ends the whole search, so each value is walked once.
+    fn has_read_kind(&self, value: ValueId, kind: ValueKind, seen: &mut HashSet<ValueId>) -> bool {
+        if !seen.insert(value) {
             return false;
         }
         let node = self.graph().node(value);
-        let result = node.kind == kind || node.operands.iter().any(|&o| self.has_read_kind(o, kind, visiting));
-        visiting.remove(&value);
-        result
+        node.kind == kind || node.operands.iter().any(|&o| self.has_read_kind(o, kind, seen))
     }
 
-    fn has_runtime_read(&self, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
-        if !visiting.insert(value) {
+    /// A guest-memory read is reachable from `value` (see
+    /// [`Self::has_read_kind`] for `seen`).
+    fn has_runtime_read(&self, value: ValueId, seen: &mut HashSet<ValueId>) -> bool {
+        if !seen.insert(value) {
             return false;
         }
         let node = self.graph().node(value);
-        let result = matches!(node.kind, ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord)
-            || node.operands.iter().any(|&o| self.has_runtime_read(o, visiting));
-        visiting.remove(&value);
-        result
+        matches!(node.kind, ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord) || node.operands.iter().any(|&o| self.has_runtime_read(o, seen))
     }
 
     // ---- dense tables ----
@@ -1811,4 +1826,13 @@ fn reads_active_lane(instructions: &[Instruction], read_lane_index: usize) -> bo
         }
         _ => false,
     }
+}
+
+/// State of one [`Tracker::is_runtime_derivable`] walk.
+#[derive(Default)]
+struct DerivableWalk {
+    /// The values whose operands are being walked.
+    visiting: HashSet<ValueId>,
+    /// Values whose walk finished: they qualified.
+    derivable: HashSet<ValueId>,
 }

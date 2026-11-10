@@ -180,12 +180,31 @@ pub enum DispatchBarrier {
     /// stages that read what the dispatch writes; its destination is the
     /// compute stage and indirect-argument reads.
     Compute { graphics: bool, transfer: bool },
+    /// A barrier whose source is the transfer stage only: the dispatch
+    /// writes what earlier copies read and has no other dependency, so it
+    /// waits for those copies and not for the compute work before it.
+    Transfer,
+}
+
+/// `RPS5E_TRANSFER_WRITE_BARRIER=0`: a dispatch whose only dependency is
+/// on copies that read what it writes waits for all earlier compute work
+/// as well (a barrier from the compute and transfer stages). A/B scope
+/// release `transfer-write-barrier`.
+pub fn transfer_write_barrier_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_TRANSFER_WRITE_BARRIER")) && crate::backend::ab::release_fast("transfer-write-barrier")
 }
 
 /// Ranges written by dispatches and read by work recorded since the last
 /// full barrier (see the module documentation).
 #[derive(Clone, Debug, Default)]
 pub struct Hazards {
+    /// Why the last dispatch asked for its barrier (diagnostics; bits:
+    /// 0 unranged reads after compute writes, 1 any access after a compute
+    /// write, 2 write after unranged compute reads, 3 write after a compute
+    /// read, 4 write after unranged graphics reads, 5 write after a
+    /// graphics read, 6 write after a transfer read).
+    pub last_reasons: u32,
     /// Written since the last full barrier: not yet visible to graphics,
     /// host or command-processor work.
     pub writes: RangeSet,
@@ -320,16 +339,32 @@ impl Hazards {
         if !self.graphics_reads_unknown && writes.iter().any(|w| w.1 != 0) {
             self.settle_graphics_reads();
         }
-        let raw = (unknown_reads && !self.compute_writes.is_empty()) || self.compute_writes.overlaps_any(reads.iter().chain(writes).copied());
+        let raw_unknown = unknown_reads && !self.compute_writes.is_empty();
+        let raw = raw_unknown || self.compute_writes.overlaps_any(reads.iter().chain(writes).copied());
         let writing = writes.iter().any(|w| w.1 != 0);
         let war_compute = writing && (self.compute_reads_unknown || self.compute_reads.overlaps_any(writes.iter().copied()));
         let graphics = writing && (self.graphics_reads_unknown || self.graphics_reads.overlaps_any(writes.iter().copied()));
         let transfer = writing && self.transfer_reads.overlaps_any(writes.iter().copied());
-        if raw || war_compute || graphics || transfer {
+        self.last_reasons = raw_unknown as u32
+            | (raw as u32) << 1
+            | ((writing && self.compute_reads_unknown) as u32) << 2
+            | (war_compute as u32) << 3
+            | ((writing && self.graphics_reads_unknown) as u32) << 4
+            | (graphics as u32) << 5
+            | (transfer as u32) << 6;
+        if transfer && !(raw || war_compute || graphics) && transfer_write_barrier_enabled() {
+            DispatchBarrier::Transfer
+        } else if raw || war_compute || graphics || transfer {
             DispatchBarrier::Compute { graphics, transfer }
         } else {
             DispatchBarrier::None
         }
+    }
+
+    /// The [`DispatchBarrier::Transfer`] barrier was recorded: the copies
+    /// recorded so far are ordered before every later write.
+    pub fn transfer_write_barrier_recorded(&mut self) {
+        self.transfer_reads.clear();
     }
 
     /// Compute writes not yet visible to compute shaders overlap
@@ -566,7 +601,14 @@ mod tests {
         // Reads of transfers.
         h.note_transfer_reads(&[(0x6000, 0x1000)]);
         assert_eq!(h.dispatch_barrier(&[(0x6000, 4)], &[], false), DispatchBarrier::None, "read after read");
-        assert_eq!(h.dispatch_barrier(&[], &[(0x6ffc, 4)], false), DispatchBarrier::Compute { graphics: false, transfer: true });
+        // Only the copies order the writer: it does not wait for compute
+        // work, and the compute accesses stay recorded.
+        assert_eq!(h.dispatch_barrier(&[], &[(0x6ffc, 4)], false), DispatchBarrier::Transfer);
+        h.note_dispatch(&[], &[(0x7000, 4)], false);
+        assert_eq!(h.dispatch_barrier(&[(0x7000, 4)], &[(0x6ffc, 4)], false), DispatchBarrier::Compute { graphics: false, transfer: true }, "also after a write");
+        h.transfer_write_barrier_recorded();
+        assert_eq!(h.dispatch_barrier(&[], &[(0x6ffc, 4)], false), DispatchBarrier::None, "the copies are ordered");
+        assert_ne!(h.dispatch_barrier(&[(0x7000, 4)], &[], false), DispatchBarrier::None, "the compute write is not");
         // Unknown reads of a dispatch: every later writer waits.
         h.note_dispatch(&[], &[], true);
         assert_ne!(h.dispatch_barrier(&[], &[(0x9_0000, 4)], false), DispatchBarrier::None);
@@ -664,7 +706,9 @@ mod tests {
             let war_compute = writing && (self.compute_reads_unknown || self.compute_reads.overlaps_any(writes.iter().copied()));
             let graphics = writing && (self.graphics_reads_unknown || self.graphics_reads.overlaps_any(writes.iter().copied()));
             let transfer = writing && self.transfer_reads.overlaps_any(writes.iter().copied());
-            if raw || war_compute || graphics || transfer {
+            if transfer && !(raw || war_compute || graphics) {
+                DispatchBarrier::Transfer
+            } else if raw || war_compute || graphics || transfer {
                 DispatchBarrier::Compute { graphics, transfer }
             } else {
                 DispatchBarrier::None
@@ -762,9 +806,16 @@ mod tests {
                         let unknown = next() % 20 == 0;
                         let b = lazy.dispatch_barrier(&reads, &writes, unknown);
                         assert_eq!(b, eager.dispatch_barrier(&reads, &writes, unknown), "round {round}");
-                        if let DispatchBarrier::Compute { graphics, transfer } = b {
-                            lazy.compute_barrier_recorded(graphics, transfer);
-                            eager.compute_barrier_recorded(graphics, transfer);
+                        match b {
+                            DispatchBarrier::Compute { graphics, transfer } => {
+                                lazy.compute_barrier_recorded(graphics, transfer);
+                                eager.compute_barrier_recorded(graphics, transfer);
+                            }
+                            DispatchBarrier::Transfer => {
+                                lazy.transfer_write_barrier_recorded();
+                                eager.transfer_reads.clear();
+                            }
+                            DispatchBarrier::None => {}
                         }
                         lazy.note_dispatch(&reads, &writes, unknown);
                         eager.note_dispatch(&reads, &writes, unknown);

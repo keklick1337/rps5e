@@ -64,6 +64,7 @@ const TYPE_HS_BACK: u8 = 7;
 
 const SPECIAL_GE_CNTL: u64 = 0x00;
 const SPECIAL_VGT_SHADER_STAGES_EN: u64 = 0x08;
+const SPECIAL_DISPATCH_MODIFIER: u64 = 0x10;
 const SPECIAL_VGT_GS_OUT_PRIM_TYPE: u64 = 0x20;
 const SPECIAL_GE_USER_VGPR_EN: u64 = 0x28;
 const STAGES_HS_W32_EN: u32 = 1 << 21;
@@ -87,6 +88,9 @@ const SPI_SHADER_PGM_RSRC1_HS: u32 = 0x10A;
 const SPI_SHADER_PGM_RSRC2_HS: u32 = 0x10B;
 const SPI_SHADER_PGM_LO_LS: u32 = 0x148;
 const COMPUTE_PGM_LO: u32 = 0x20C;
+const COMPUTE_PGM_RSRC2: u32 = 0x213;
+const SPI_SHADER_PGM_RSRC2_PS: u32 = 0x0B;
+const SPI_PS_IN_CONTROL: u32 = 0x1B6;
 
 const INTERPOLANT_COUNT: usize = 32;
 
@@ -179,8 +183,41 @@ fn create_shader(ctx: &mut CpuContext) -> HleResult {
     SHADERS_BY_CODE.lock().unwrap().get_or_insert_with(HashMap::new).insert(code, header);
     // The prewarm work of this program goes to the front of the list.
     ps5gpu::pipeline::created::note(code);
+    note_created_program(header);
     super::shader_dump::on_create_shader(header);
     OK
+}
+
+/// Hand the program of a created shader to the GPU side, which decodes
+/// and plans it before the first draw or dispatch: its address and RSRC2
+/// from the shader register table, and the word its wave size comes from.
+fn note_created_program(header: u64) {
+    use ps5gpu::pipeline::created::{note_program, CreatedStage};
+    let read = || {
+        let (regs, ty, count) = (mem::r64(header + OFF_SH_REGS)?, mem::r8(header + OFF_TYPE)?, mem::r8(header + OFF_NUM_SH_REGS)? as usize);
+        let specials = mem::r64(header + OFF_SPECIALS)?;
+        let (stage, lo_reg, rsrc2_reg) = match ty {
+            TYPE_CS => (CreatedStage::Compute, COMPUTE_PGM_LO, COMPUTE_PGM_RSRC2),
+            TYPE_PS => (CreatedStage::Pixel, SPI_SHADER_PGM_LO_PS, SPI_SHADER_PGM_RSRC2_PS),
+            TYPE_GS => (CreatedStage::Vertex, SPI_SHADER_PGM_LO_ES, SPI_SHADER_PGM_RSRC2_GS),
+            _ => return None,
+        };
+        let lo = find_register(regs, count, lo_reg, 0)?;
+        let address = (mem::r32(lo + 4)? as u64) << 8 | ((mem::r32(lo + 12)? & 0xFF) as u64) << 40;
+        let rsrc2 = mem::r32(find_register(regs, count, rsrc2_reg, 0)? + 4)?;
+        let wave_word = match stage {
+            CreatedStage::Compute => mem::r32(specials + SPECIAL_DISPATCH_MODIFIER)?,
+            CreatedStage::Pixel => {
+                let (cx, n) = (mem::r64(header + OFF_CX_REGS)?, mem::r8(header + OFF_NUM_CX_REGS)? as usize);
+                mem::r32(find_register(cx, n, SPI_PS_IN_CONTROL, 0)? + 4)?
+            }
+            CreatedStage::Vertex => mem::r32(specials + SPECIAL_VGT_SHADER_STAGES_EN + 4)?,
+        };
+        Some((address, stage, rsrc2, wave_word))
+    };
+    if let Some((address, stage, rsrc2, wave_word)) = read() {
+        note_program(address, stage, rsrc2, wave_word);
+    }
 }
 
 fn is_fused_pair(front: u8, back: u8) -> bool {

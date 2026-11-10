@@ -19,6 +19,11 @@ pub struct RuntimeValueValidator<'g> {
     table_read_count: usize,
     active_mask: Option<ValueId>,
     visiting: HashSet<ValueId>,
+    /// Values already accepted: an accepted value never met a value being
+    /// walked (that fails), so it is accepted wherever it is met again.
+    /// Without it operands shared by many values are walked once per path
+    /// to them, exponential in the depth of the sharing.
+    valid: HashSet<ValueId>,
     /// Set when a failure traces back to a phi that is not loop-invariant
     /// (e.g. a hash-table probe): the value genuinely has no single source,
     /// as opposed to an operation or memory shape that is not recognised.
@@ -44,12 +49,13 @@ impl<'g> RuntimeValueValidator<'g> {
             table_read_count,
             active_mask,
             visiting: HashSet::new(),
+            valid: HashSet::new(),
             control_dependent: false,
         }
     }
 
     pub fn validate(&mut self, value: ValueId) -> bool {
-        if self.graph.is_constant(value) {
+        if self.graph.is_constant(value) || self.valid.contains(&value) {
             return true;
         }
         if !self.visiting.insert(value) {
@@ -57,6 +63,9 @@ impl<'g> RuntimeValueValidator<'g> {
         }
         let result = self.validate_node(value);
         self.visiting.remove(&value);
+        if result {
+            self.valid.insert(value);
+        }
         result
     }
 

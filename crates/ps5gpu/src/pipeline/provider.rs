@@ -2649,6 +2649,7 @@ impl ShaderPipelines {
         });
         let p = Self::with_tables(dev, memory, t, compiler, STAGING_BYTES, false)?;
         super::frontend::set_prefetch_memory(memory, binding_limit_of(u64::MAX, dev.caps.max_storage_buffer_range));
+        super::created::start(memory);
         Ok(p)
     }
 
@@ -7684,22 +7685,28 @@ impl ShaderPipelines {
             launch = Some(self.record_thread_launch(ctx, d, threads, &bound[0].prepared, args.unwrap(), Launch::Early)?);
         }
         let barriers_before = barrier_count(ctx);
+        let order = crate::backend::profile::note_dispatch_order;
+        let program = d.shader.address;
         if launch.is_some() && !early_launch {
             // A member of the launch batch: ordered by the batch.
+            order("batch", 0, program);
         } else if precise && crate::scheduler::hazard::range_barriers_enabled() {
             // Ordered only against the earlier work whose ranges overlap:
             // read or write after a dispatch's write (memory dependency),
             // write after a read (the readers' stages finish first).
             if ctx.sched.has_unordered_work() {
                 ctx.sched.full_barrier();
+                order("unordered-work", 0, program);
             } else if guest_run {
                 let b = barrier.unwrap_or_else(|| ctx.sched.guest_dispatch_barrier(&touched, &writes.written_ranges, reads_unranged, follow));
                 if follow {
                     self.stats.unsynced_dispatches += 1;
                 }
+                order(if follow { "follow" } else { "guest" }, ctx.sched.dispatch_barrier_reasons(), program);
                 ctx.sched.dispatch_barrier_record(b);
             } else {
                 let b = ctx.sched.dispatch_barrier(&touched, &writes.written_ranges, reads_unranged);
+                order("ranges", ctx.sched.dispatch_barrier_reasons(), program);
                 ctx.sched.dispatch_barrier_record(b);
             }
         } else if !precise
@@ -9008,7 +9015,10 @@ impl PipelineProvider for ShaderPipelines {
             s.bda_mirrored,
             s.bda_materialized,
             self.take_faults()
-        ) + " " + &self.t.compile_times.format() + &crate::shader::stats::line()
+        ) + &{
+            let (built, used) = super::created::program_counts();
+            format!(" created-programs={built}/{used}used")
+        } + " " + &self.t.compile_times.format() + &crate::shader::stats::line()
             + &self.bindless_stats().map_or(String::new(), |b| {
                 format!(
                     " bindless=[binds {} reads {} records {} looks {} maps {} slots {} tables {} all-memory {} all-uses {} entries {}u/{}m first {} quick {} lookups {} same {} failed {} uncovered {} page-reads {}]",

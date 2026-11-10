@@ -1188,3 +1188,19 @@ fn replay_defers_a_gpu_written_record_count() {
     assert_eq!(words(&r)[2], 64);
     assert!(r.deferred.is_empty());
 }
+
+#[test]
+fn descriptor_words_sharing_operands_are_walked_once() {
+    // s_load_dwordx4 s[4:7], s[0:1] ; 48 x (s_add_u32 s4, s4, s4) ;
+    // buffer_load_dword v0, v0, s[4:7]. Every sum uses the previous one
+    // twice: a walk of the descriptor that follows each path to the
+    // loaded word takes 2^48 steps.
+    let mut words = smem(SMEM_LOAD_DWORDX4, 4, 0, 0).to_vec();
+    words.extend(std::iter::repeat_n(sop2(OP_S_ADD_U32, 4, 4, 4), 48));
+    words.extend(buffer_load_dword(0, 0, 4));
+    words.push(S_ENDPGM);
+    let p = plan(assemble(&[&words]), ShaderStage::Compute, 8);
+    // The V# is made of words the draw can evaluate: it is bound.
+    let source = &p.descriptor_sources[p.info.buffers.last().unwrap().source as usize];
+    assert!(p.validate_runtime_value(source.dwords[0]));
+}

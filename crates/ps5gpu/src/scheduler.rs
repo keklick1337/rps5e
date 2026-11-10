@@ -429,6 +429,9 @@ pub struct SchedulerStats {
     /// barriers ordering transfer reads after compute writes.
     pub compute_barriers: u64,
     pub transfer_read_barriers: u64,
+    /// Barriers from the transfer stage alone before a dispatch that
+    /// writes what copies read ([`hazard::DispatchBarrier::Transfer`]).
+    pub transfer_write_barriers: u64,
     /// Barriers from transfers into staging memory to shader reads
     /// ([`Scheduler::staging_read_barrier`]).
     pub staging_read_barriers: u64,
@@ -1099,6 +1102,11 @@ impl Scheduler {
         self.hazards.guest_dispatch_barrier(reads, written, unknown_reads, follow)
     }
 
+    /// Why the last dispatch barrier was asked for ([`hazard::Hazards::last_reasons`]).
+    pub fn dispatch_barrier_reasons(&self) -> u32 {
+        self.hazards.last_reasons
+    }
+
     /// [`Self::note_dispatch`] of a guest dispatch ordered by
     /// [`Self::guest_dispatch_barrier`]: it joins the current run.
     pub fn note_guest_dispatch(&mut self, reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool) {
@@ -1114,6 +1122,19 @@ impl Scheduler {
     /// barrier): earlier compute writes become visible to compute shaders
     /// and indirect reads, and later compute work waits for the readers.
     pub fn dispatch_barrier_record(&mut self, b: hazard::DispatchBarrier) {
+        if b == hazard::DispatchBarrier::Transfer {
+            let cb = self.ordered_cmd();
+            let mb = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(vk::AccessFlags2::SHADER_WRITE);
+            // SAFETY: recording buffer outside any rendering scope.
+            unsafe { self.dev.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&mb))) };
+            self.hazards.transfer_write_barrier_recorded();
+            self.stats.transfer_write_barriers += 1;
+            return;
+        }
         let hazard::DispatchBarrier::Compute { graphics, transfer } = b else { return };
         let mut src = vk::PipelineStageFlags2::COMPUTE_SHADER;
         if graphics {

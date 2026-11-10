@@ -4415,6 +4415,16 @@ pub(crate) mod profile {
         let program = WORK.load(Ordering::Relaxed) & ((1 << 56) - 1);
         *g.get_or_insert_with(Default::default).entry((file, at.line(), program)).or_default() += 1;
     }
+    /// `RPS5E_BARRIER_SITES=1` (with the profile): how a dispatch of
+    /// `program` was ordered (`path`) and why (`reasons`, see
+    /// `Hazards::last_reasons`), counted next to the full barriers.
+    pub fn note_dispatch_order(path: &'static str, reasons: u32, program: u64) {
+        if !barrier_sites() || !on() {
+            return;
+        }
+        let mut g = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+        *g.get_or_insert_with(Default::default).entry((path, reasons, program)).or_default() += 1;
+    }
     /// Blocking GPU waits by call site: count and wall nanoseconds.
     static WAITS: std::sync::Mutex<Option<std::collections::HashMap<(&'static str, u32, u64), (u64, u64)>>> = std::sync::Mutex::new(None);
     /// `RPS5E_BARRIER_SITES=1` (with the profile) also counts the GPU waits
@@ -4469,7 +4479,7 @@ pub(crate) mod profile {
         let Some(m) = g.as_ref() else { return String::new() };
         let mut v: Vec<(&(&str, u32, u64), &u64)> = m.iter().collect();
         v.sort_unstable_by(|a, b| b.1.cmp(a.1));
-        v.iter().take(12).map(|((f, l, p), n)| if *p != 0 { format!("{f}:{l}<-p{p:#x}:{n}") } else { format!("{f}:{l}:{n}") }).collect::<Vec<_>>().join(" ")
+        v.iter().take(32).map(|((f, l, p), n)| if *p != 0 { format!("{f}:{l}<-p{p:#x}:{n}") } else { format!("{f}:{l}:{n}") }).collect::<Vec<_>>().join(" ")
     }
     fn download_line() -> String {
         let g = DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
