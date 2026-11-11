@@ -1678,7 +1678,7 @@ impl ps5gpu::render::RenderExecutor for LateGpu {
 /// The label mode of the test process is `cpu` (the default; another
 /// `RPS5E_LABELS_AT_EOP` value set for the run skips the `cpu` tests).
 fn cpu_labels_configured() -> bool {
-    interp::parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref(), ps5gpu::buffers::guest::bda_configured()) == interp::LabelMode::AfterGpuForCpu
+    interp::parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref()) == interp::LabelMode::AfterGpuForCpu
 }
 
 /// Runs a queue with a [`LateGpu`] over the commands built in `e`.
@@ -2443,13 +2443,12 @@ fn deferred_labels_keep_their_order() {
 #[test]
 fn label_modes_parse() {
     use interp::{parse_label_mode, LabelMode};
-    assert_eq!(parse_label_mode(None, false), LabelMode::AfterGpuForCpu);
-    assert_eq!(parse_label_mode(None, true), LabelMode::AfterGpu);
-    assert_eq!(parse_label_mode(Some("1"), false), LabelMode::AfterGpu);
-    assert_eq!(parse_label_mode(Some("0"), true), LabelMode::Recorded);
-    assert_eq!(parse_label_mode(Some(" through "), false), LabelMode::AfterWriteThroughs);
-    assert_eq!(parse_label_mode(Some("cpu"), false), LabelMode::AfterGpuForCpu);
-    assert_eq!(parse_label_mode(Some("yes"), false), LabelMode::AfterGpuForCpu);
+    assert_eq!(parse_label_mode(None), LabelMode::AfterGpuForCpu);
+    assert_eq!(parse_label_mode(Some("1")), LabelMode::AfterGpu);
+    assert_eq!(parse_label_mode(Some("0")), LabelMode::Recorded);
+    assert_eq!(parse_label_mode(Some(" through ")), LabelMode::AfterWriteThroughs);
+    assert_eq!(parse_label_mode(Some("cpu")), LabelMode::AfterGpuForCpu);
+    assert_eq!(parse_label_mode(Some("yes")), LabelMode::AfterGpuForCpu);
 }
 
 /// `sceAgcGetDefaultCxStateFlat`: version 8's context defaults as a flat

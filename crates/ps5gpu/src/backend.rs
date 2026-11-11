@@ -4951,6 +4951,11 @@ fn pipeline_route() -> bool {
 /// thread doing both (SILENT HILL's light rooms: recorder idle 31-37 %,
 /// -13 % fps); a CPU-bound one keeps its recorder busy (SILENT HILL's
 /// heavy room 0-3 % idle, +10-20 % fps; GTA V's city).
+/// A window in which the interpreter also waited for room in the queue
+/// for more than [`FULL_LIMIT`] is not such a pipeline: the recorder was
+/// the slower end for part of every frame and both threads worked at the
+/// same time, so its idle share is not held against it
+/// (`RPS5E_POLICY_FULL=0` judges the idle share alone).
 ///
 /// On: a 1 s window with the recorder idle more than [`IDLE_LIMIT`]
 /// twice in a row turns it off for a back-off (15 s, doubling to 120 s
@@ -4961,6 +4966,7 @@ mod pipeline_policy {
     use std::sync::Mutex;
 
     const IDLE_LIMIT: f64 = 0.20;
+    const FULL_LIMIT: f64 = 0.10;
     const WINDOW_MS: u64 = 1000;
     const PROBE_MS: u64 = 2000;
     const BACKOFF_MS: u64 = 15_000;
@@ -4983,11 +4989,12 @@ mod pipeline_policy {
     struct Window {
         start_ms: u64,
         idle_us: u64,
+        full_us: u64,
         items: u64,
         strikes: u8,
         backoff_ms: u64,
     }
-    static WINDOW: Mutex<Window> = Mutex::new(Window { start_ms: 0, idle_us: 0, items: 0, strikes: 0, backoff_ms: BACKOFF_MS });
+    static WINDOW: Mutex<Window> = Mutex::new(Window { start_ms: 0, idle_us: 0, full_us: 0, items: 0, strikes: 0, backoff_ms: BACKOFF_MS });
 
     /// Draws and dispatches handed to the executor (either route).
     pub(super) static ITEMS: AtomicU64 = AtomicU64::new(0);
@@ -5004,6 +5011,21 @@ mod pipeline_policy {
     fn quiet_ignored() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| super::ab::switch_on("RPS5E_POLICY_QUIET"))
+    }
+
+    fn full_counts() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| super::ab::switch_on("RPS5E_POLICY_FULL"))
+    }
+
+    /// The idle share a window is judged by: none when the interpreter
+    /// waited for queue room `full` of the window (see the module text).
+    pub(super) fn judged_idle(idle: f64, full: f64, full_counts: bool) -> f64 {
+        if full_counts && full > FULL_LIMIT {
+            0.0
+        } else {
+            idle
+        }
     }
 
     fn now_ms() -> u64 {
@@ -5049,6 +5071,16 @@ mod pipeline_policy {
             assert_eq!(decide(PROBE, 0.10, 0, 4 * BACKOFF_MS), (ON, 0, BACKOFF_MS));
         }
 
+        /// A recorder that idles while the interpreter also waits for
+        /// queue room is not judged idle.
+        #[test]
+        fn a_window_with_a_full_queue_is_not_idle() {
+            assert_eq!(judged_idle(0.30, 0.25, true), 0.0);
+            assert_eq!(judged_idle(0.30, 0.02, true), 0.30);
+            assert_eq!(judged_idle(0.30, 0.25, false), 0.30);
+            assert_eq!(decide(ON, judged_idle(0.30, 0.25, true), 1, BACKOFF_MS), (ON, 0, BACKOFF_MS));
+        }
+
         /// Windows that recorded next to nothing do not turn the thread off
         /// nor end a probe; an off thread still reaches its probe.
         #[test]
@@ -5072,7 +5104,10 @@ mod pipeline_policy {
         let Ok(mut w) = WINDOW.try_lock() else { return };
         let idle = super::PIPELINE_US[0].load(Relaxed);
         let span_ms = now.saturating_sub(w.start_ms).max(1);
-        let share = idle.saturating_sub(w.idle_us) as f64 / (span_ms * 1000) as f64;
+        let idle_share = idle.saturating_sub(w.idle_us) as f64 / (span_ms * 1000) as f64;
+        let full_us = super::PIPELINE_US[1].load(Relaxed);
+        let full_share = full_us.saturating_sub(w.full_us) as f64 / (span_ms * 1000) as f64;
+        let share = judged_idle(idle_share, full_share, full_counts());
         let state = STATE.load(Relaxed);
         let items = ITEMS.load(Relaxed);
         let rate = items.saturating_sub(w.items) * 1000 / span_ms;
@@ -5084,13 +5119,14 @@ mod pipeline_policy {
         w.backoff_ms = backoff;
         if next != state && next != PROBE {
             log::info!(
-                "ps5gpu: recording thread {} (recorder idle {:.0} % of the last {} ms){}",
+                "ps5gpu: recording thread {} (recorder idle {:.0} %, queue full {:.0} % of the last {} ms){}",
                 match next {
                     ON => "on",
                     OFF => "off",
                     _ => "probed",
                 },
-                share * 100.0,
+                idle_share * 100.0,
+                full_share * 100.0,
                 span_ms,
                 if next == OFF { format!(", next probe in {} s", w.backoff_ms / 1000) } else { String::new() }
             );
@@ -5099,6 +5135,7 @@ mod pipeline_policy {
         STATE.store(next, Relaxed);
         w.start_ms = now;
         w.idle_us = super::PIPELINE_US[0].load(Relaxed);
+        w.full_us = full_us;
         w.items = ITEMS.load(Relaxed);
         NEXT_MS.store(
             now + match next {

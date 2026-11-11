@@ -6,6 +6,8 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ### Changed
 
+- The automatic choice of the recording thread (`RPS5E_GPU_RECORD_THREAD=auto`) no longer turns it off while the command interpreter also has to wait for room in its queue (`RPS5E_POLICY_FULL`). SILENT HILL: The Short Message's heavy room about 10 fps instead of 8; GTA V with `RPS5E_BDA=1` 47 fps instead of 42.
+- `RPS5E_BDA=1` (experimental direct guest memory reads) no longer changes the default of `RPS5E_LABELS_AT_EOP`: with its old default (`1`) GTA V never left its start menu. GTA V's city in Performance mode with `RPS5E_BDA=1`: 47-48 fps against 37 without it; still off by default.
 - The emulator's own small writes into GPU-watched guest memory (memcpy/memset inside one page, packets of the command-buffer builders) mark the page written before the store instead of taking a page fault (`RPS5E_PREMARK_SMALL`). GTA V's city in Performance mode: write faults per frame ~1550 → ~320; over the same stretch of the scene the frame rate rises by about 2.5 % (36.6 → 37.4 fps).
 - Less overhead per draw in heavy scenes: the recording thread wakes the command interpreter once per half queue instead of once per command (`RPS5E_QUEUE_WAKE_BATCH`), and streams of page-sized buffer blocks share one buffer mirror instead of one per block (`RPS5E_STREAM_ADJACENT`). GTA V gains a few percent.
 - Shader programs are now decoded and planned on a worker thread as soon as the game creates the shader object (`sceAgcCreateShader`), not inside the first draw that uses them; the draw takes the finished program (`RPS5E_CREATE_TIME_SHADERS=0` turns it off).

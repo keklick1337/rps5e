@@ -165,10 +165,13 @@ pub(crate) fn is_gpu_label(addr: u64) -> bool {
 }
 
 /// End-of-pipe labels are written when the GPU finished the work before
-/// them (`RPS5E_LABELS_AT_EOP=1`), not once it was recorded. Required when
-/// the GPU reads guest memory where the CPU wrote it (`RPS5E_BDA=1`): a
-/// label the guest takes as "the GPU consumed this" lets it reuse that
-/// memory, which recorded-but-unexecuted work would then read.
+/// them (`RPS5E_LABELS_AT_EOP=1`), not once it was recorded. When the GPU
+/// reads guest memory where the CPU wrote it (`RPS5E_BDA=1`) the guest's
+/// CPU threads must not see a label earlier: a label the guest takes as
+/// "the GPU consumed this" lets it reuse that memory, which
+/// recorded-but-unexecuted work would then read. The `cpu` mode keeps
+/// that too (only the command processor, which reuses no memory, sees
+/// labels early).
 ///
 /// `RPS5E_LABELS_AT_EOP=through`: only the labels written while GPU
 /// results are still on their way to CPU-readable guest memory
@@ -198,13 +201,11 @@ pub(crate) enum LabelMode {
     AfterGpuForCpu,
 }
 
-pub(crate) fn parse_label_mode(v: Option<&str>, bda: bool) -> LabelMode {
+pub(crate) fn parse_label_mode(v: Option<&str>) -> LabelMode {
     match v.map(str::trim) {
         Some("1") => LabelMode::AfterGpu,
         Some("0") => LabelMode::Recorded,
         Some("through") => LabelMode::AfterWriteThroughs,
-        Some("cpu") => LabelMode::AfterGpuForCpu,
-        _ if bda => LabelMode::AfterGpu,
         _ => LabelMode::AfterGpuForCpu,
     }
 }
@@ -213,7 +214,7 @@ pub(crate) fn parse_label_mode(v: Option<&str>, bda: bool) -> LabelMode {
 /// RPS5E_AB_ONLY=cpu-labels` (slow periods write them when recorded).
 fn label_mode() -> LabelMode {
     static MODE: std::sync::OnceLock<LabelMode> = std::sync::OnceLock::new();
-    match *MODE.get_or_init(|| parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref(), ps5gpu::buffers::guest::bda_configured())) {
+    match *MODE.get_or_init(|| parse_label_mode(std::env::var("RPS5E_LABELS_AT_EOP").ok().as_deref())) {
         LabelMode::AfterGpuForCpu if !ps5gpu::backend::ab::release_fast("cpu-labels") => LabelMode::Recorded,
         m => m,
     }
