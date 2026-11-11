@@ -343,6 +343,30 @@ pub fn premark_writes_enabled() -> bool {
     *ON.get_or_init(|| crate::backend::ab::switch_on("RPS5E_PREMARK_WRITES"))
 }
 
+/// `RPS5E_PREMARK_SMALL` (default on; `0` off; A/B name `premark-small`
+/// in scope `release`): [`GuestGpuMemory::prepare_cpu_write`] also marks a
+/// single write-watched page, so a host write inside one page (the HLE
+/// memcpy of a few hundred bytes, a command-buffer builder's packet) takes
+/// no fault either. Games fill command and constant rings with thousands
+/// of such writes a frame, each first touch of a page a fault (GTA V:
+/// ~80 % of its write faults came from the emulator's own copies).
+///
+/// The page check is made once per page and thread: a thread remembers
+/// the page it checked last and the watch epoch
+/// ([`guard::WATCH_EPOCH`]) at that time, and checks again only for
+/// another page or after watches were added anywhere. A page watched
+/// again in between without the thread noticing faults as before.
+pub fn premark_small_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| premark_writes_enabled() && crate::backend::ab::switch_on("RPS5E_PREMARK_SMALL"))
+}
+
+thread_local! {
+    /// The page this thread checked last for a one-page host write and
+    /// the watch epoch then.
+    static SMALL_CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+}
+
 /// Diagnostics: host writes that marked their pages ahead, and the pages
 /// they marked (the write faults saved).
 pub static PREMARKED_WRITES: AtomicU64 = AtomicU64::new(0);
@@ -1059,12 +1083,25 @@ impl GuestGpuMemory {
     /// are left to their faults (their GPU bytes land first). Exact: the
     /// same state changes, made before the bytes change; a page the GPU
     /// side watches again in between faults as usual. Returns the pages
-    /// marked.
+    /// marked. A write inside one page is checked once per page and watch
+    /// epoch ([`premark_small_enabled`]).
     pub fn prepare_cpu_write(&self, addr: u64, len: u64) -> u64 {
-        if len < 2 * PAGE_BYTES && (addr % PAGE_BYTES) + len <= PAGE_BYTES {
-            return 0;
+        let one_page = (addr % PAGE_BYTES) + len <= PAGE_BYTES;
+        let small = premark_small_enabled();
+        if one_page {
+            if !small {
+                return 0;
+            }
+            let key = (addr & !(PAGE_BYTES - 1), guard::WATCH_EPOCH.load(Ordering::Acquire));
+            if SMALL_CHECKED.with(|c| c.replace(key)) == key {
+                return 0;
+            }
         }
         if !premark_writes_enabled() || !crate::backend::ab::release_fast("RPS5E_PREMARK_WRITES") {
+            return 0;
+        }
+        let small = small && crate::backend::ab::release_fast("premark-small");
+        if one_page && !small {
             return 0;
         }
         let (Some(buffers), Some(images)) = (self.buffers.get(), self.images.get()) else { return 0 };
@@ -1072,7 +1109,8 @@ impl GuestGpuMemory {
         let end = addr.saturating_add(len).div_ceil(PAGE_BYTES) * PAGE_BYTES;
         // Write-blocked, readable pages: (read watch, write watches).
         let blocked = |p: u64| matches!(self.pages.watchers(p), (false, w) if w != 0);
-        // Only worth a call with two such pages or more.
+        // Worth a call with two such pages or more, or with one when
+        // single pages are marked too.
         let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
         let mut count = 0u64;
         let mut p = first;
@@ -1088,7 +1126,7 @@ impl GuestGpuMemory {
                 p += PAGE_BYTES;
             }
         }
-        if count < 2 {
+        if count < if small { 1 } else { 2 } {
             return 0;
         }
         let mut marked = 0;

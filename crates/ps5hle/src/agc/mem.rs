@@ -72,6 +72,8 @@ pub fn write(addr: u64, data: &[u8]) -> bool {
     if addr == 0 || !accessible(addr, data.len() as u64, true) {
         return false;
     }
+    // Write-watched pages are marked written without a fault.
+    ps5gpu::memory::global().prepare_cpu_write(addr, data.len() as u64);
     // SAFETY: the range is a tracked, writable guest mapping.
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
     true
@@ -136,6 +138,7 @@ pub fn write_dwords(addr: u64, words: &[u32]) -> bool {
     if addr == 0 || !accessible(addr, len, true) {
         return false;
     }
+    ps5gpu::memory::global().prepare_cpu_write(addr, len);
     // SAFETY: the range is a tracked, writable guest mapping.
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, addr as *mut u8, len as usize) };
     true

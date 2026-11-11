@@ -72,6 +72,10 @@ unsafe impl Sync for PageBlock {}
 pub static PROTECT_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static PROTECT_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub static WATCH_ERRORS: AtomicU64 = AtomicU64::new(0);
+/// Bumped whenever watches are added: a page a thread found unwatched may
+/// be watched again from then on (see `GuestGpuMemory::prepare_cpu_write`).
+pub static WATCH_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Userfaultfd write protection found on unwatched pages and dropped.
 pub static STALE_WRITE_PROTECTION: AtomicU64 = AtomicU64::new(0);
 
@@ -619,6 +623,7 @@ impl PageGuard {
     }
 
     pub fn add_watch(&self, addr: u64, size: u64, block_reads: bool) {
+        WATCH_EPOCH.fetch_add(1, Ordering::Release);
         self.update(addr, size, true, block_reads, false);
     }
 
@@ -633,6 +638,7 @@ impl PageGuard {
 
     pub fn add_watch_mask(&self, block_base: u64, pages: &PageMask, block_reads: bool) {
         if let Some((first, end)) = pages.bounds() {
+            WATCH_EPOCH.fetch_add(1, Ordering::Release);
             self.update_block(block_base, first, end, Some(pages), true, block_reads, false);
         }
     }

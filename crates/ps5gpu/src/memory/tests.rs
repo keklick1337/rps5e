@@ -1124,6 +1124,44 @@ fn write_fault_opens_the_rewritten_run() {
     assert_eq!(tracker.page_state(page(15)), Some((false, false)));
 }
 
+/// A host write inside one write-watched page marks the page CPU-written
+/// without a fault (`RPS5E_PREMARK_SMALL`), and the page is checked once
+/// per thread until another page is written or watches are added: a page
+/// watched again is then marked again.
+#[test]
+fn premarked_small_host_write_takes_no_fault() {
+    if !super::premark_small_enabled() {
+        return;
+    }
+    let mem = test_memory();
+    let (view, _alias) = guest_mapping(mem, BLOCK_BYTES as usize);
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let buffers = Arc::new(TestBuffers { tracker: tracker.clone(), mem, downloads: AtomicUsize::new(0), gpu_byte: 0xAB });
+    mem.attach(buffers.clone(), Arc::new(NoImages), Arc::new(NoUnmap));
+    let dst = view + 40 * PAGE_BYTES;
+    tracker.for_each_upload_range(dst, 2 * PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true);
+    assert_eq!(perms(dst), "r--");
+    let before = mem.stats().write_faults;
+    assert_eq!(mem.prepare_cpu_write(dst + 16, 64), 1);
+    assert_eq!(tracker.page_state(dst), Some((true, false)));
+    assert_eq!(tracker.page_state(dst + PAGE_BYTES), Some((false, false)), "the next page stays watched");
+    // SAFETY: mapped guest view; the page is writable now.
+    unsafe { std::ptr::write_bytes((dst + 16) as *mut u8, 0x5A, 64) };
+    assert_eq!(mem.stats().write_faults, before, "no write fault on the marked page");
+    // The same page again: not checked, nothing to mark.
+    assert_eq!(mem.prepare_cpu_write(dst + 128, 64), 0);
+    // Uploaded and watched again: the watch epoch moved, so it is marked again.
+    tracker.for_each_upload_range(dst, PAGE_BYTES, false, None, &mut |_, _| {}, &mut || true);
+    assert_eq!(tracker.page_state(dst), Some((false, false)));
+    assert_eq!(mem.prepare_cpu_write(dst + 256, 64), 1);
+    // SAFETY: as above.
+    unsafe { std::ptr::write_bytes((dst + 256) as *mut u8, 0x5A, 64) };
+    assert_eq!(mem.stats().write_faults, before);
+    // A GPU-owned page is left to its fault.
+    tracker.for_each_upload_range(dst + PAGE_BYTES, PAGE_BYTES, true, None, &mut |_, _| {}, &mut || true);
+    assert_eq!(mem.prepare_cpu_write(dst + PAGE_BYTES + 8, 8), 0);
+}
+
 /// Host code that writes a guest range through the guest's view (the HLE
 /// memcpy/memset) marks its write-watched pages CPU-written in one call
 /// first: the write takes no fault, the pages are CPU-dirty and the next
@@ -1144,8 +1182,6 @@ fn premarked_host_write_takes_no_faults() {
     assert_eq!(perms(dst), "r--");
     assert_eq!(perms(dst + 6 * PAGE_BYTES), "---");
     let before = mem.stats().write_faults;
-    // A write inside one page is left to its fault.
-    assert_eq!(mem.prepare_cpu_write(dst + 16, 64), 0);
     assert_eq!(mem.prepare_cpu_write(dst + 100, len - 200), 7, "the seven write-watched pages, not the GPU's");
     for i in 0..8u64 {
         let want = if i == 6 { (false, true) } else { (true, false) };
