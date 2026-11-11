@@ -31,8 +31,11 @@
 //!
 //! With the switch off every entry point is one relaxed load and a branch.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+
+mod lanes;
+pub use lanes::Lanes;
 use std::sync::{Mutex, OnceLock};
 
 /// Slice sizes simulated (`RPS5E_SLICE_DRAWS` candidates).
@@ -191,10 +194,47 @@ struct Acc {
     changes: Vec<(u64, u64)>,
     read_ids: Vec<u64>,
     changed_ids: Vec<u64>,
+    /// Guest pages whose words the item's stage preparation read.
+    words: Vec<(u64, u64)>,
+    /// [`UNKNOWN_READS`] and [`UNKNOWN_WRITES`].
+    unknown: u8,
 }
+
+/// The item reads memory it has no ranges for.
+pub const UNKNOWN_READS: u8 = 1;
+/// The item writes memory it has no ranges for.
+pub const UNKNOWN_WRITES: u8 = 2;
 
 thread_local! {
     static ACC: RefCell<Acc> = RefCell::new(Acc::default());
+    /// The guest command queue of the draw or dispatch this thread
+    /// recorded last (the events after it belong to the same queue).
+    static QUEUE: Cell<u8> = const { Cell::new(0) };
+}
+
+/// The items this thread records from now on come from guest command
+/// queue `queue`.
+#[inline]
+pub fn set_queue(queue: usize) {
+    if enabled() {
+        QUEUE.with(|q| q.set(queue.min(255) as u8));
+    }
+}
+
+/// The open item's stage preparation read guest words in `[addr,
+/// addr+size)` (whole pages: what its validity is checked on).
+#[inline]
+pub fn read_words(addr: u64, size: u64) {
+    if size != 0 {
+        with_open(|a| a.words.push((addr, addr.saturating_add(size))));
+    }
+}
+
+/// The open item reads (`UNKNOWN_READS`) or writes (`UNKNOWN_WRITES`)
+/// memory it has no ranges for.
+#[inline]
+pub fn unknown(bits: u8) {
+    with_open(|a| a.unknown |= bits);
 }
 
 /// Apply `f` to this thread's open item (nothing outside items; never
@@ -311,6 +351,8 @@ pub fn item<R>(kind: Kind, rt: u64, f: impl FnOnce() -> R) -> R {
                 a.changes.clear();
                 a.read_ids.clear();
                 a.changed_ids.clear();
+                a.words.clear();
+                a.unknown = 0;
                 true
             } else {
                 false
@@ -336,6 +378,7 @@ pub fn item<R>(kind: Kind, rt: u64, f: impl FnOnce() -> R) -> R {
         let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
         log.current.push(kind, a.holes, ns, a.tail_ns, rt, &a.reads, &a.changes, &a.read_ids, &a.changed_ids);
         log.current.push_soft_reads(&a.soft_reads);
+        log.current.annotate_last(QUEUE.with(|q| q.get()), a.unknown, &a.words);
         if log.current.items.len() >= MAX_ITEMS {
             log.end_frame();
         }
@@ -381,6 +424,11 @@ pub struct ItemRec {
     changes: (u32, u32),
     read_ids: (u32, u32),
     changed_ids: (u32, u32),
+    /// The guest command queue the item came from.
+    pub queue: u8,
+    /// [`UNKNOWN_READS`] and [`UNKNOWN_WRITES`].
+    pub unknown: u8,
+    words: (u32, u32),
 }
 
 /// The items of one frame, ranges and ids in flat arrays.
@@ -409,7 +457,7 @@ impl Frame {
         let read_ids = ids(read_ids);
         let changed_ids = ids(changed_ids);
         let at = self.ranges.len() as u32;
-        self.items.push(ItemRec { kind, holes, ns, tail_ns, rt, reads, soft_reads: (at, at), changes, read_ids, changed_ids });
+        self.items.push(ItemRec { kind, holes, ns, tail_ns, rt, reads, soft_reads: (at, at), changes, read_ids, changed_ids, queue: 0, unknown: 0, words: (at, at) });
     }
 
     /// The composable (stream-copied) reads of the item pushed last.
@@ -420,6 +468,23 @@ impl Frame {
         if let Some(i) = self.items.last_mut() {
             i.soft_reads = (s, e);
         }
+    }
+
+    /// The queue, unknown accesses and word-read pages of the item pushed
+    /// last.
+    pub fn annotate_last(&mut self, queue: u8, unknown: u8, words: &[(u64, u64)]) {
+        let s = self.ranges.len() as u32;
+        self.ranges.extend_from_slice(words);
+        let e = self.ranges.len() as u32;
+        if let Some(i) = self.items.last_mut() {
+            i.queue = queue;
+            i.unknown = unknown;
+            i.words = (s, e);
+        }
+    }
+
+    fn words(&self, i: &ItemRec) -> &[(u64, u64)] {
+        &self.ranges[i.words.0 as usize..i.words.1 as usize]
     }
 
     fn reads(&self, i: &ItemRec) -> &[(u64, u64)] {
@@ -866,6 +931,8 @@ pub struct Totals {
     pub sims: [[Sim; KS.len()]; NS.len()],
     /// Speculative draws hit by a change, by source, at [`REFERENCE`].
     pub sources: Vec<u64>,
+    /// The frame recorded on two lanes by guest queue ([`lanes`]).
+    pub lanes: Lanes,
 }
 
 /// The (N, K) indices whose conflict sources are reported (N=128, K=6).
@@ -895,6 +962,7 @@ impl Totals {
             max_slice: [0; NS.len()],
             sims: [[Sim::ZERO; KS.len()]; NS.len()],
             sources: Vec::new(),
+            lanes: Lanes::ZERO,
         }
     }
 
@@ -939,6 +1007,7 @@ impl Totals {
             self.sources.resize(o.sources.len(), 0);
         }
         add_all(&mut self.sources, &o.sources);
+        self.lanes.add(&o.lanes);
     }
 }
 
@@ -988,6 +1057,7 @@ pub fn analyze(f: &Frame) -> Totals {
             _ => t.serial_ns += it.ns,
         }
     }
+    t.lanes = lanes::analyze(f);
     let s = t.s_ns();
     // Stage 3: upload-only holes become speculative (the whole hole time:
     // an upper bound of what moves).
@@ -1183,7 +1253,7 @@ pub fn compact(t: &Totals) -> String {
         })
         .collect();
     format!(
-        "frames={} draws={:.0} holes={:.0} ({:.1}%) P={:.2}ms S={:.2}ms (holes {:.2} tail {:.2} events {:.2}) par={:.1}% mem={:.2}ms N{} slices={:.0} waves/rolling: {} | holes: {}",
+        "frames={} draws={:.0} holes={:.0} ({:.1}%) P={:.2}ms S={:.2}ms (holes {:.2} tail {:.2} events {:.2}) par={:.1}% mem={:.2}ms N{} slices={:.0} waves/rolling: {} | holes: {} | {}",
         t.frames,
         t.draws as f64 / fr,
         t.hole_draws as f64 / fr,
@@ -1198,7 +1268,8 @@ pub fn compact(t: &Totals) -> String {
         NS[ni],
         t.slices[ni] as f64 / fr,
         preds.join(" "),
-        holes_line(t)
+        holes_line(t),
+        t.lanes.line(t.frames)
     )
 }
 
@@ -1280,6 +1351,7 @@ pub fn report(t: &Totals, gpu_ms: Option<f64>) -> String {
     sources.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
     let line: Vec<String> = sources.iter().map(|&(b, n)| format!("{}={:.1}", source_name(b), n as f64 / fr)).collect();
     let _ = writeln!(out, "  changes read by speculative draws at N={} K={} (draws/frame by source): {}", NS[REFERENCE.0], KS[REFERENCE.1], line.join(" "));
+    let _ = writeln!(out, "  {}", t.lanes.line(t.frames));
     out
 }
 

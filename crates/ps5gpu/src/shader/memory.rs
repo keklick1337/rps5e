@@ -29,6 +29,9 @@ pub struct Resources {
     /// Per hardware traversal slot (`RtOp`): the ray query and its state
     /// variables ([`super::bvh::emit_rt`]).
     pub rt_slots: HashMap<u16, [Word; 14]>,
+    /// The leaf lists each hardware traversal's invocation walked in the
+    /// instance it is in ([`super::bvh`], merged bottom pops).
+    pub rt_walked: HashMap<u16, [Word; super::bvh::WALKED_LISTS]>,
     /// The module reads the host BVH mirrors (`ShaderReflection::host_bvh`).
     pub host_bvh: bool,
     pub gds: Option<Word>,

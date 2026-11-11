@@ -279,6 +279,11 @@ pub struct EmitOptions {
     /// host queries to the end and hand the guest loop no node (the cost
     /// of the queries alone; the frames lose their ray-traced effects).
     pub hw_rt_probe: bool,
+    /// `RPS5E_HW_RT_MERGE` (on by default): at the bottom of a two-level
+    /// traversal copy a popped leaf list is walked by every invocation
+    /// with a candidate of the popped instance pending
+    /// (`ps5shader::opt::rt_loops::Options::merge_bottom`).
+    pub hw_rt_merge: bool,
     /// `RPS5E_WRITE_RANGE_CHECKS=1` (diagnostics): device-address stores
     /// with a planned written range note the addresses outside it
     /// (`Emitter::check_written_range`).
@@ -321,6 +326,7 @@ impl EmitOptions {
         hw_rt_stats: false,
         hw_rt_prune: false,
         hw_rt_probe: false,
+        hw_rt_merge: false,
         write_range_checks: false,
     };
     /// Every exact switch on, on a device with every feature they use
@@ -360,6 +366,7 @@ impl EmitOptions {
         hw_rt_stats: false,
         hw_rt_prune: false,
         hw_rt_probe: false,
+        hw_rt_merge: false,
         write_range_checks: false,
     };
 
@@ -406,6 +413,7 @@ impl EmitOptions {
                 hw_rt_stats: crate::rt::level() >= 2,
                 hw_rt_prune: opt_in("RPS5E_HW_RT_PRUNE"),
                 hw_rt_probe: opt_in("RPS5E_HW_RT_PROBE"),
+                hw_rt_merge: on("RPS5E_HW_RT_MERGE"),
                 write_range_checks: opt_in("RPS5E_WRITE_RANGE_CHECKS"),
             };
             if o.no_f32_flush {
@@ -1058,7 +1066,8 @@ impl SpirvCompiler {
         // Guest BVH traversal loops get a copy whose nodes come from the
         // host's ray queries.
         if feats.emit.hw_rt && stage == ShaderStage::Compute && mesh.is_none() && hw_traversals_enabled() {
-            let out = ps5shader::opt::rt_loops::replace_traversals(&mut compiled.function);
+            let options = ps5shader::opt::rt_loops::Options { merge_bottom: feats.emit.hw_rt_merge };
+            let out = ps5shader::opt::rt_loops::replace_traversals_with(&mut compiled.function, options);
             for (b, why) in &out.skipped {
                 log::debug!("[shader] cs {:#x}: BVH loop b{} keeps the guest traversal: {why}", r.program().address, b.0);
             }

@@ -42,7 +42,10 @@
 //! walks together); the top level's box queries return no children. An
 //! instance whose BLAS the host does not mirror is a box candidate: for it
 //! the bottom level walks the guest's own stack and box queries, as the
-//! original. A pop never takes the guest counter below its base (the
+//! original. With [`Options::merge_bottom`] a leaf list popped at the
+//! bottom of two levels is walked by every invocation that has a
+//! candidate of the popped instance pending, not only by those whose
+//! candidate is in that list. A pop never takes the guest counter below its base (the
 //! guest's own pushes and clamps stay consistent). At run time the copy
 //! runs when the host mirrors the BVH ([`RtOp::Lookup`], the same for the
 //! whole wave); otherwise the original nest does.
@@ -62,9 +65,29 @@ pub struct Outcome {
     pub skipped: Vec<(Block, String)>,
 }
 
+/// How [`replace_traversals_with`] builds the copies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options {
+    /// At the bottom of a two-level nest, a popped leaf list is walked by
+    /// every invocation with a candidate of the popped instance pending
+    /// (each with its own ray: the guest's triangle tests decide), not
+    /// only by those whose pending candidate is in that list. An
+    /// invocation keeps a pending candidate that is in another list, and
+    /// its query's later candidates in a list it walked are not handed out
+    /// again. The invocations' queries reach the lists of an instance in
+    /// different orders; walking a list once for all of them replaces a
+    /// pop per invocation or group of invocations.
+    pub merge_bottom: bool,
+}
+
 /// Add a hardware copy to every guest traversal nest of `func` that
 /// qualifies. The function stays valid either way.
 pub fn replace_traversals(func: &mut Function) -> Outcome {
+    replace_traversals_with(func, Options::default())
+}
+
+/// [`replace_traversals`] with `options`.
+pub fn replace_traversals_with(func: &mut Function, options: Options) -> Outcome {
     let mut out = Outcome::default();
     let mut done: HashSet<Block> = HashSet::default();
     let mut slot = 0u8;
@@ -76,7 +99,7 @@ pub fn replace_traversals(func: &mut Function) -> Outcome {
         done.insert(h);
         match analyse(func, &cfg, &users, h) {
             Ok(nest) => {
-                let copy = rewrite(func, &nest, slot);
+                let copy = rewrite(func, &nest, slot, options);
                 done.insert(copy);
                 slot = slot.wrapping_add(1);
                 out.replaced += 1;
@@ -557,7 +580,7 @@ fn index_in(func: &Function, b: Block, v: Value) -> usize {
 }
 
 /// Returns the copy's header.
-fn rewrite(func: &mut Function, n: &Nest, slot: u8) -> Block {
+fn rewrite(func: &mut Function, n: &Nest, slot: u8, options: Options) -> Block {
     let (h, x, pre) = (n.header, n.merge, n.pre);
     // New blocks: the selection header and the copy's prelude, the two
     // loops' own merges.
@@ -834,9 +857,17 @@ fn rewrite(func: &mut Function, n: &Nest, slot: u8) -> Block {
         let key = put(func, Op::RtQuery(RtOp::Get { slot, what }), Type::U32, vec![]);
         let wave_key = put(func, Op::ReadLane, Type::U32, vec![key, first]);
         let same = put(func, Op::ICmp(ICmp::Eq), Type::BOOL, vec![key, wave_key]);
-        let take = put(func, Op::And, Type::BOOL, vec![r, same]);
+        let own = put(func, Op::And, Type::BOOL, vec![r, same]);
+        // A merged bottom pop: every invocation with a candidate pending
+        // at the bottom (always one of the popped instance) walks the list.
+        let merge = options.merge_bottom && level == 1 && levels == 2;
+        let take = if merge { r } else { own };
         let taken = put(func, Op::Ballot, Type::U32X2, vec![take]);
         let mut take_args = vec![take];
+        if merge {
+            take_args.push(own);
+            take_args.push(wave_key);
+        }
         if level == 0 && levels == 2 {
             // Whether the popped instance's BLAS walks the guest's stack.
             let px = put(func, Op::RtQuery(RtOp::Get { slot, what: RtGet::Proxy }), Type::BOOL, vec![]);

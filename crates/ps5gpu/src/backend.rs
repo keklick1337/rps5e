@@ -4707,6 +4707,7 @@ fn hand_over(done: Box<dyn FnOnce() + Send>, queue: fn(&mut Backend, Box<dyn FnO
 impl RenderExecutor for GpuExecutor {
     fn draw(&self, draw: &ResolvedDraw) {
         let rt = if shadow::enabled() { shadow::target_key(draw) } else { 0 };
+        shadow::set_queue(draw.packet.queue);
         shadow::item(shadow::Kind::Draw, rt, || {
             let measured = ab::enabled().then(|| (ab::mode_fast(), profile::thread_cpu()));
             profile::set_work(profile::WORK_DRAW, if draw.shaders.ps.address != 0 { draw.shaders.ps.address } else { draw.shaders.vertex_program_address() });
@@ -4736,6 +4737,7 @@ impl RenderExecutor for GpuExecutor {
     }
 
     fn dispatch(&self, dispatch: &ResolvedDispatch) {
+        shadow::set_queue(dispatch.packet.queue);
         shadow::item(shadow::Kind::Dispatch, 0, || {
             profile::set_work(profile::WORK_DISPATCH, dispatch.shader.address);
             let measured = ab::enabled().then(|| (ab::mode_fast(), profile::thread_cpu()));

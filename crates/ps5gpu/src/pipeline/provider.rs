@@ -6769,6 +6769,7 @@ impl ShaderPipelines {
         let unranged_writes = unknown_hazards && bound.iter().any(|b| hazards::writes_unranged_memory(b.prepared.program.writes_device_memory, &b.prepared.snapshot.device_address_ranges));
         if bound.iter().any(|b| hazards::writes_unranged_memory(b.prepared.program.writes_device_memory, &b.prepared.snapshot.device_address_ranges)) {
             crate::buffers::written_words::note_unranged_write(ctx.sched.current_tick());
+            crate::slice_shadow::unknown(crate::slice_shadow::UNKNOWN_WRITES);
         }
         let isolated = !shared_rendering_scopes() || writes.gds || !writes.written_images.is_empty() || !writes.written_ranges.is_empty() || feedback || unranged_writes;
         if isolated {
@@ -7623,6 +7624,7 @@ impl ShaderPipelines {
         }
         if hazards::writes_unranged_memory(device_writes, &bound[0].prepared.snapshot.device_address_ranges) {
             crate::buffers::written_words::note_unranged_write(ctx.sched.current_tick());
+            crate::slice_shadow::unknown(crate::slice_shadow::UNKNOWN_WRITES);
         }
         let precise = precise_barriers() && !writes.gds && !device_writes;
         let writes_memory = !writes.written_ranges.is_empty() || !writes.written_images.is_empty();

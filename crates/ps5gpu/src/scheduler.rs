@@ -1074,6 +1074,7 @@ impl Scheduler {
     /// barrier before draws, work recorded through [`Self::cmd`] and host
     /// reads); images order themselves by their layouts.
     pub fn note_dispatch(&mut self, reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool) {
+        shadow_dispatch(reads, written, unknown_reads);
         self.shader_work = true;
         self.unfenced = true;
         self.hazards.note_dispatch(reads, written, unknown_reads);
@@ -1110,6 +1111,7 @@ impl Scheduler {
     /// [`Self::note_dispatch`] of a guest dispatch ordered by
     /// [`Self::guest_dispatch_barrier`]: it joins the current run.
     pub fn note_guest_dispatch(&mut self, reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool) {
+        shadow_dispatch(reads, written, unknown_reads);
         self.shader_work = true;
         self.unfenced = true;
         self.hazards.note_guest_dispatch(reads, written, unknown_reads);
@@ -2031,5 +2033,23 @@ mod tests {
             s.flush();
         }
         assert_eq!(ring.alloc(&s, 40_000, 16), Some(0));
+    }
+}
+
+/// The memory a recorded dispatch reads and writes, for the shadow
+/// analysis (`RPS5E_SLICE_SHADOW`).
+fn shadow_dispatch(reads: &[(u64, u64)], written: &[(u64, u64)], unknown_reads: bool) {
+    use crate::slice_shadow as shadow;
+    if !shadow::enabled() {
+        return;
+    }
+    for &(addr, size) in reads {
+        shadow::read(addr, size);
+    }
+    for &(addr, size) in written {
+        shadow::changed(addr, size);
+    }
+    if unknown_reads {
+        shadow::unknown(shadow::UNKNOWN_READS);
     }
 }

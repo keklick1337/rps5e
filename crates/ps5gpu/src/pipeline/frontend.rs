@@ -676,6 +676,7 @@ impl PrefetchedDraw {
             }
             CONTENT_REVALIDATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        shadow_words(&s.deps);
         Some(s.stage.clone())
     }
 }
@@ -816,6 +817,7 @@ impl PrefetchedDispatch {
             }
             CONTENT_REVALIDATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        shadow_words(&self.deps);
         self.stage.take()
     }
 }
@@ -845,6 +847,16 @@ pub(crate) fn prefetch_dispatch(d: &crate::render::ResolvedDispatch) -> Option<B
             deps,
         }))
     })
+}
+
+/// The pages a stage preparation read, for the shadow analysis
+/// (`RPS5E_SLICE_SHADOW`).
+fn shadow_words(deps: &PageDeps) {
+    if crate::slice_shadow::enabled() {
+        for page in deps.page_list() {
+            crate::slice_shadow::read_words(page, crate::memory::PAGE_BYTES);
+        }
+    }
 }
 
 /// Why a stage the recorder prepares was not taken from the prefetch
@@ -1513,6 +1525,7 @@ impl ShaderFrontend {
         });
         if let Some(i) = found {
             self.stats.prepared_reuses += 1;
+            shadow_words(&self.prepared[i].2);
             if let Some(spec) = buffers.spec() {
                 spec.note_deps(buffers.tracker(), &self.prepared[i].2);
                 if !pages {
@@ -1553,7 +1566,9 @@ impl ShaderFrontend {
         if self.prepared.len() >= RECENT_PREPARED {
             self.prepared.pop_back();
         }
-        self.prepared.push_front((key, stamp, deps.into_inner(), p.clone()));
+        let deps = deps.into_inner();
+        shadow_words(&deps);
+        self.prepared.push_front((key, stamp, deps, p.clone()));
         Ok(p)
     }
 

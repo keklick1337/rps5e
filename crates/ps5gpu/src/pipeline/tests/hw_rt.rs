@@ -795,12 +795,34 @@ fn two_instances(g: &mut Guest, a: u64, b: u64) -> u64 {
 #[test]
 #[ignore]
 fn hw_rt_two_level_traversals_walk_unmirrored_blases_themselves() {
+    for merge in [false, true] {
+        // BLAS a's root box stops at x = 0.7 (the guest misses what lies
+        // beyond); b has no host mirror (the guest's stack walks it).
+        let expect = |l: usize, box_x: f32| -> (u32, f32) {
+            let x = (l as f32 + 0.5) / 48.0;
+            if l >= 60 {
+                (0, 10000.0)
+            } else if (1.2..1.47).contains(&x) {
+                (1, 3.0)
+            } else {
+                expected(l, box_x, 0.918)
+            }
+        };
+        two_level_traversal(merge, |g| leaf_scene(g, 0.7), |l| expect(l, 0.7), |l| expect(l, f32::INFINITY));
+    }
+}
+
+/// Runs the two-level program over a TLAS of the BLAS `a` makes and the
+/// unmirrored one of [`proxy_scene`]: first with the guest's own
+/// traversal (`guest` per lane), then on the host's ray queries (`host`
+/// per lane), with or without merged bottom pops.
+fn two_level_traversal(merge: bool, a: impl FnOnce(&mut Guest) -> u64, guest_expect: impl Fn(usize) -> (u32, f32), host_expect: impl Fn(usize) -> (u32, f32)) {
     let mut g = Guest::new(16 << 20);
     let mut rig = Rig::with_compiler(
         &g,
         |dev| {
             let f = crate::shader::Features::of(dev);
-            let emit = crate::shader::EmitOptions { hw_rt: dev.caps.ray_query, hw_rt_prune: false, ..f.emit };
+            let emit = crate::shader::EmitOptions { hw_rt: dev.caps.ray_query, hw_rt_prune: false, hw_rt_merge: merge, ..f.emit };
             Arc::new(crate::shader::SpirvCompiler::new(crate::shader::Features { emit, ..f }, Some(g.mem)))
         },
         None,
@@ -811,9 +833,7 @@ fn hw_rt_two_level_traversals_walk_unmirrored_blases_themselves() {
         return;
     }
     let mem = g.mem;
-    // BLAS a's root box stops at x = 0.7 (the guest misses what lies
-    // beyond); b has no host mirror (the guest's stack walks it).
-    let a = leaf_scene(&mut g, 0.7);
+    let a = a(&mut g);
     let b = proxy_scene(&mut g);
     let tlas = two_instances(&mut g, a, b);
     let out = g.zeroed(512);
@@ -825,20 +845,10 @@ fn hw_rt_two_level_traversals_walk_unmirrored_blases_themselves() {
     let mut shader = stage(cs, &user);
     shader.rsrc1 = (0xC0 << 12) | (1 << 21) | 7;
     let d = ResolvedDispatch { packet: DispatchPacket { groups: [1, 1, 1], dispatch_initiator: 1, ..DispatchPacket::default() }, shader, rsrc3: 0, threads: [64, 1, 1], start: [0; 3] };
-    let expect = |l: usize, box_x: f32| -> (u32, f32) {
-        let x = (l as f32 + 0.5) / 48.0;
-        if l >= 60 {
-            (0, 10000.0)
-        } else if (1.2..1.47).contains(&x) {
-            (1, 3.0)
-        } else {
-            expected(l, box_x, 0.918)
-        }
-    };
     let near = |a: (u32, f32), b: (u32, f32)| a.0 == b.0 && (a.1 - b.1).abs() <= 1e-5 * b.1;
     let guest = lanes(&mut rig, mem, &d, out);
     for (l, r) in guest.iter().enumerate() {
-        assert!(near(*r, expect(l, 0.7)), "guest traversal, lane {l}: {r:?}");
+        assert!(near(*r, guest_expect(l)), "merge {merge}: guest traversal, lane {l}: {r:?}");
     }
     let mut host = None;
     for _ in 0..12 {
@@ -850,9 +860,83 @@ fn hw_rt_two_level_traversals_walk_unmirrored_blases_themselves() {
     }
     let host = host.expect("the traversal never ran on the host's ray queries");
     for (l, r) in host.iter().enumerate() {
-        assert!(near(*r, expect(l, f32::INFINITY)), "host traversal, lane {l}: {r:?}");
+        assert!(near(*r, host_expect(l)), "merge {merge}: host traversal, lane {l}: {r:?}");
     }
     assert_eq!(lanes(&mut rig, mem, &d, out), host);
+}
+
+/// A BLAS of five triangles (not opaque) under two leaf lists that every
+/// ray below x = 1.2 crosses. List A (the root's first child): primitive 0
+/// at z = 1.5 over x in [0.2, 0.4) (at y = 0.3) and primitive 1 at z = 1
+/// over [0, 1.2) (rejected by the program's rule). List B: primitive 2 at
+/// z = 1.75 over [0.45, 0.8), primitive 3 at z = 1.25 over [0, 1.2)
+/// (rejected) and primitive 4 at z = 2 over [0.9, 1.0). List B's box ends
+/// at x = `box_x` (the guest's traversal misses what lies beyond it).
+fn two_list_scene(g: &mut Guest, box_x: f32) -> u64 {
+    let mut b = vec![0u8; 1024];
+    put(&mut b, 0, crate::rt::layout::MAGIC[0]);
+    put(&mut b, 4, crate::rt::layout::MAGIC[1]);
+    put(&mut b, 16, 1024);
+    put(&mut b, 252, crate::rt::layout::VERSION);
+    // (x0, the x where it ends at y = 0.3, z)
+    let spans: [(f32, f32, f32); 5] = [(0.2, 0.4, 1.5), (0.0, 1.2, 1.0), (0.45, 0.8, 1.75), (0.0, 1.2, 1.25), (0.9, 1.0, 2.0)];
+    // Triangle nodes at 512 + 64 j (index 8 + j); leaf entries at 832
+    // (index 13): list A entries 0 and 1, list B entries 2 to 4.
+    put(&mut b, 124, 8);
+    put(&mut b, 104, 5);
+    put(&mut b, 88, 13);
+    put(&mut b, 40, 832 + 5 * 8);
+    for (j, &(x0, end, z)) in spans.iter().enumerate() {
+        let x1 = x0 + (end - x0) / 0.675;
+        let t = [[x0, -1.0, z], [x1, -1.0, z], [x0, 3.0, z]];
+        let node = 512 + 64 * j;
+        for (s, v) in t.iter().chain(&[t[2], t[2]]).enumerate() {
+            for k in 0..3 {
+                put(&mut b, node + s * 12 + k * 4, v[k].to_bits());
+            }
+        }
+        put(&mut b, 832 + j * 8, (node / 8) as u32);
+        put(&mut b, 836 + j * 8, j as u32 | if j == 1 || j == 4 { 1 << 31 } else { 0 });
+    }
+    put(&mut b, 256, 832);
+    put(&mut b, 260, 832 + 2 * 8);
+    for c in 2..4 {
+        put(&mut b, 256 + c * 4, u32::MAX);
+        put_box(&mut b, 272 + c * 24, [f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    }
+    put_box(&mut b, 272, [-0.1, -1.0, 0.9], [1.9, 3.0, 1.6]);
+    put_box(&mut b, 296, [-0.1, -1.0, 1.1], [box_x, 3.0, 2.1]);
+    g.alloc(&b)
+}
+
+/// Rays that cross two leaf lists of one instance have candidates in both,
+/// in the order the host's queries find them. Without merged pops the wave
+/// pops a list for the invocations whose pending candidate is in it; with
+/// them every invocation with a candidate of the instance pending walks
+/// the popped list, and its query's later candidates in that list are not
+/// handed out again. Both find the hits the triangles give.
+#[test]
+#[ignore]
+fn hw_rt_merged_bottom_pops_give_the_same_hits() {
+    let expect = |l: usize, box_x: f32| -> (u32, f32) {
+        let x = (l as f32 + 0.5) / 48.0;
+        if l >= 60 {
+            (0, 10000.0)
+        } else if (1.2..1.47).contains(&x) {
+            (1, 3.0)
+        } else if (0.2..0.4).contains(&x) {
+            (1, 1.5)
+        } else if (0.45..0.8).contains(&x) && x <= box_x {
+            (1, 1.75)
+        } else if (0.9..1.0).contains(&x) && x <= box_x {
+            (1, 2.0)
+        } else {
+            (0, 10000.0)
+        }
+    };
+    for merge in [false, true] {
+        two_level_traversal(merge, |g| two_list_scene(g, 0.7), |l| expect(l, 0.7), |l| expect(l, f32::INFINITY));
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -897,6 +981,25 @@ fn rt_loops_recognise_one_and_two_level_traversals() {
         // The guest's nest stays for BVHs the host does not mirror.
         let bvh = f.order.iter().flat_map(|&b| f.block(b).insts.iter()).filter(|&&v| matches!(f.op(v), ps5shader::ssa::Op::Image(a) if matches!(a.op, ps5shader::ssa::ImageOp::BvhIntersect { boxes: true, .. }))).count();
         assert!(bvh > 0);
+        // No pop is merged without the option.
+        let takes = |f: &ps5shader::ssa::Function| -> Vec<(u8, usize)> {
+            f.order
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter())
+                .filter_map(|&v| match f.op(v) {
+                    ps5shader::ssa::Op::RtQuery(RtOp::Take { level, .. }) => Some((level, f.args(v).len())),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(takes(&f).iter().all(|&(level, args)| args == if level == 0 && levels == 2 { 2 } else { 1 }), "{:?}", takes(&f));
+        // Merged bottom pops: the bottom pop of a two-level nest says
+        // which invocations' own candidate it is and names the list.
+        let mut f = ssa_of(&words);
+        let out = ps5shader::opt::rt_loops::replace_traversals_with(&mut f, ps5shader::opt::rt_loops::Options { merge_bottom: true });
+        assert_eq!(out.replaced, 1);
+        ps5shader::ssa::verify::verify(&f, true).expect("valid after the merged rewrite");
+        assert_eq!(takes(&f).iter().any(|&(level, args)| level == 1 && args == 3), levels == 2, "{:?}", takes(&f));
     }
 }
 

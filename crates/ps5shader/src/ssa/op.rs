@@ -654,7 +654,12 @@ pub enum RtOp {
     /// two-level traversal its leaf then waits for the bottom level (the
     /// leaves of the others are dropped), unless `guest` (nonzero: the
     /// popped instance's BLAS has no host mirror) says the bottom level
-    /// walks the guest's own stack for this instance.
+    /// walks the guest's own stack for this instance. A merged bottom pop
+    /// (`(take: bool, own: bool, entry: u32)`, see
+    /// [`crate::opt::rt_loops::Options::merge_bottom`]): the invocation
+    /// walks the wave's leaf list `entry` when `take`; its own pending
+    /// candidate is the popped one only when `own`, and stays pending
+    /// otherwise.
     Take { slot: u8, level: u8, levels: u8 },
 }
 

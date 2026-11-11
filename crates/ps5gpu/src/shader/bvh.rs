@@ -924,7 +924,11 @@ fn ray_query_hits(e: &mut Emitter, address: Word, q: &Query) -> (Word, Word) {
 /// in the BLAS's list starts through the table's starts map and the
 /// instance's custom index, the map slot) and leaf base. Returns whether it
 /// was taken.
-fn take_candidate(e: &mut Emitter, rq: Word, which: u32, slots: (Word, Word, Word, Word, Word, Word, Word)) -> Word {
+///
+/// `walked` (merged bottom pops: whether the invocation is inside an
+/// instance, that instance, and the keys of the lists it walked there):
+/// a candidate in one of those lists is not taken either.
+fn take_candidate(e: &mut Emitter, rq: Word, which: u32, slots: (Word, Word, Word, Word, Word, Word, Word), walked: Option<(Word, Word, [Word; WALKED_LISTS])>) -> Word {
     let (inst, prim, base, ready, last_inst, last_list, proxy) = slots;
     let (tu, tb) = (e.t_u32(), e.t_bool());
     let t64 = e.ty(Type::U64);
@@ -961,7 +965,22 @@ fn take_candidate(e: &mut Emitter, rq: Word, which: u32, slots: (Word, Word, Wor
     let ll = e.load(tu, last_list);
     let same_i = e.ieq(li, i);
     let same_l = e.ieq(ll, first);
-    let seen = e.land(same_i, same_l);
+    let mut seen = e.land(same_i, same_l);
+    if let Some((inside, here, lists)) = walked {
+        let key = entry_key(e, b, first);
+        let mut listed = e.cb(false);
+        for l in lists {
+            let k = e.load(tu, l);
+            let same = e.ieq(k, key);
+            listed = e.lor(listed, same);
+        }
+        let ins = e.load(tb, inside);
+        let h = e.load(tu, here);
+        let there = e.ieq(h, i);
+        let there = e.land(ins, there);
+        let walked = e.land(there, listed);
+        seen = e.lor(seen, walked);
+    }
     let fresh = e.lnot(seen);
     e.if_then(fresh, |e| {
         e.store(inst, i);
@@ -973,6 +992,45 @@ fn take_candidate(e: &mut Emitter, rq: Word, which: u32, slots: (Word, Word, Wor
     });
     let _ = tb;
     fresh
+}
+
+/// The key of a leaf list ([`RtGet::Entry`]): 64 * its BLAS's leaf base +
+/// 8 * the index of its first entry (a multiple of 8).
+fn entry_key(e: &mut Emitter, base: Word, first: Word) -> Word {
+    let six = e.cu(6);
+    let three = e.cu(3);
+    let b = e.shl(base, six);
+    let p = e.shl(first, three);
+    e.iadd(b, p)
+}
+
+/// Leaf lists an invocation remembers having walked in the instance it is
+/// in (merged bottom pops). A list forgotten is walked again when the
+/// invocation's query hands out another candidate in it: the same hits,
+/// one more pop.
+pub const WALKED_LISTS: usize = 4;
+/// No list ([`entry_key`] gives multiples of 8).
+const NO_LIST: u32 = u32::MAX;
+
+/// The walked-list memory of hardware traversal `slot` (per guest lane).
+fn rt_walked(e: &mut Emitter, slot: u8) -> [Word; WALKED_LISTS] {
+    let key = slot as u16 * 2 + e.half.min(1) as u16;
+    if let Some(&s) = e.res.rt_walked.get(&key) {
+        return s;
+    }
+    let tu = e.t_u32();
+    let none = e.cu(NO_LIST);
+    let s = std::array::from_fn(|_| e.global_init(tu, SC::Private, none));
+    e.res.rt_walked.insert(key, s);
+    s
+}
+
+/// Forget the lists walked (the invocation enters an instance).
+fn forget_walked(e: &mut Emitter, lists: [Word; WALKED_LISTS]) {
+    let none = e.cu(NO_LIST);
+    for l in lists {
+        e.store(l, none);
+    }
 }
 
 /// Take a proxy box candidate (an instance whose BLAS the host lacks: the
@@ -1177,6 +1235,10 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
             let none = e.cu(u32::MAX);
             e.store(last_inst, none);
             e.store(last_list, none);
+            if e.feat.emit.hw_rt_merge {
+                let lists = rt_walked(e, slot);
+                forget_walked(e, lists);
+            }
             let stop = e.lnot(finite);
             e.store(done, stop);
             if e.feat.emit.hw_rt_stats {
@@ -1213,6 +1275,7 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
         RtOp::Fetch { slot, level } => {
             let [rq, done, ready, leaf, inst, prim, base, taken, inside, here, last_inst, last_list, proxy, _] = rt_slot(e, slot);
             let slots = (inst, prim, base, ready, last_inst, last_list, proxy);
+            let walked = e.feat.emit.hw_rt_merge.then(|| (inside, here, rt_walked(e, slot)));
             let d0 = e.load(tb, done);
             let r0 = e.load(tb, ready);
             let l0 = e.load(tb, leaf);
@@ -1269,7 +1332,7 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                 let aabb_kind = e.cu(CANDIDATE_AABB);
                 let is_box = e.ieq(kind, aabb_kind);
                 let f = e.cb(false);
-                let took_tri = e.if_value(is_tri, tb, f, |e| take_candidate(e, rq, CANDIDATE, slots));
+                let took_tri = e.if_value(is_tri, tb, f, |e| take_candidate(e, rq, CANDIDATE, slots, walked));
                 let f = e.cb(false);
                 let took_box = if level == 0 { e.if_value(is_box, tb, f, |e| take_proxy(e, rq, slots)) } else { f };
                 let took = e.lor(took_tri, took_box);
@@ -1285,7 +1348,7 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                     let tri = e.cu(COMMITTED_TRIANGLE);
                     let hit = e.ieq(kind, tri);
                     e.if_then(hit, |e| {
-                        take_candidate(e, rq, COMMITTED, slots);
+                        take_candidate(e, rq, COMMITTED, slots, walked);
                     });
                 });
                 let is_tri = took;
@@ -1329,27 +1392,42 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                     // 64 * (first node after the triangle nodes) + 8 * primitive.
                     let b = e.load(tu, base);
                     let p = e.load(tu, prim);
-                    let six = e.cu(6);
-                    let three = e.cu(3);
-                    let b = e.shl(b, six);
-                    let p = e.shl(p, three);
-                    e.iadd(b, p)
+                    entry_key(e, b, p)
                 }
             }))
         }
         RtOp::Take { slot, level, levels } => {
             let [_, _, ready, leaf, inst, prim, _, _, inside, here, last_inst, last_list, _, in_guest] = rt_slot(e, slot);
             let take = e.arg(v, 0)?;
+            // A merged bottom pop: (take, own, the wave's list).
+            let merged = level == 1 && levels == 2 && _d.args.len() == 3;
+            // Its own candidate was popped.
+            let popped = if merged { e.arg(v, 1)? } else { take };
             // The leaf list the guest processes for the invocation now: its
             // later candidates in it are not handed out again.
             let processed = level == 1 || levels == 1;
             if processed {
-                e.if_then(take, |e| {
+                e.if_then(popped, |e| {
                     let tu = e.t_u32();
                     let i = e.load(tu, inst);
                     let p = e.load(tu, prim);
                     e.store(last_inst, i);
                     e.store(last_list, p);
+                });
+            }
+            if merged {
+                // Every list the invocation walks in this instance is
+                // remembered (the newest first).
+                let list = e.arg(v, 2)?;
+                let lists = rt_walked(e, slot);
+                e.if_then(take, |e| {
+                    let tu = e.t_u32();
+                    let mut carry = list;
+                    for l in lists {
+                        let old = e.load(tu, l);
+                        e.store(l, carry);
+                        carry = old;
+                    }
                 });
             }
             if level == 0 {
@@ -1371,6 +1449,10 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                     let mine = e.land(take, host);
                     e.store(leaf, mine);
                     e.store(inside, mine);
+                    if e.feat.emit.hw_rt_merge {
+                        let lists = rt_walked(e, slot);
+                        e.if_then(mine, |e| forget_walked(e, lists));
+                    }
                     let i = e.load(tu, inst);
                     e.store(here, i);
                     let walked = e.land(take, guest);
@@ -1384,7 +1466,7 @@ pub fn emit_rt(e: &mut Emitter, v: Value, _d: &ValueData, op: RtOp) -> R<Option<
                 }
             } else {
                 let l = e.load(tb, leaf);
-                let keep = e.lnot(take);
+                let keep = e.lnot(popped);
                 let l = e.land(l, keep);
                 e.store(leaf, l);
             }
