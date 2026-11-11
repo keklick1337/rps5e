@@ -30,7 +30,7 @@ RustPS5Emu is a compatibility layer for PS5 games, in the spirit of Wine:
 | SILENT HILL: The Short Message | PPSA10112 | 🟡 Playable, occasional shader glitches |
 | ASTRO BOT | PPSA21567 | 🟡 Playable, shader glitches |
 | Demon's Souls | PPSA01342 | 🟡 Playable, low fps |
-| Grand Theft Auto V | PPSA04263 | 🟡 Playable, low fps |
+| Grand Theft Auto V | PPSA04263 | 🟡 Playable; ~37 fps in the city in Performance mode (47-48 with the experimental direct guest memory reads), low fps in Fidelity mode |
 | Marvel's Spider-Man 2 | PPSA08338 | 🔴 Starts, but models render broken and without textures; not playable |
 
 The emulator runs **decrypted** game dumps (a folder with `eboot.bin` and `sce_sys/`), fake packages (`.pkg`, `.ffpkg`) and disk images of game dumps (`.exfat`, `.ffpfsc`, UFS2 `.ffpkg`), read in place without extracting. Retail-encrypted packages cannot be used. You need your own legally dumped games; none are provided.
@@ -42,7 +42,7 @@ The emulator runs **decrypted** game dumps (a folder with `eboot.bin` and `sce_s
 | | |
 |---|---|
 | ![SILENT HILL: The Short Message](media/silent-hill.png)<br>**SILENT HILL: The Short Message** — PPSA10112<br>🟡 occasional shader glitches | ![ASTRO BOT](media/astro-bot.png)<br>**ASTRO BOT** — PPSA21567<br>🟡 shader glitches |
-| ![Grand Theft Auto V](media/gta5.png)<br>**Grand Theft Auto V** — PPSA04263<br>🟡 low fps | ![Terminator 2D: NO FATE](media/terminator-2d.png)<br>**Terminator 2D: NO FATE** — PPSA25872<br>🟢 works perfectly |
+| ![Grand Theft Auto V](media/gta5.png)<br>**Grand Theft Auto V** — PPSA04263<br>🟡 ~37 fps in Performance mode | ![Terminator 2D: NO FATE](media/terminator-2d.png)<br>**Terminator 2D: NO FATE** — PPSA25872<br>🟢 works perfectly |
 | ![Demon's Souls](media/demons-souls.png)<br>**Demon's Souls** — PPSA01342<br>🟡 low fps | |
 
 All frames come from the emulator's own frame dump at the game's native resolution (4K, Terminator 2D 1080p), unscaled and lossless; click a picture for the full size.

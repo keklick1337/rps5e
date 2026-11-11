@@ -4,6 +4,8 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+## [0.1.5-alpha] - 2026-11-11
+
 ### Changed
 
 - The automatic choice of the recording thread (`RPS5E_GPU_RECORD_THREAD=auto`) no longer turns it off while the command interpreter also has to wait for room in its queue (`RPS5E_POLICY_FULL`). SILENT HILL: The Short Message's heavy room about 10 fps instead of 8; GTA V with `RPS5E_BDA=1` 47 fps instead of 42.
