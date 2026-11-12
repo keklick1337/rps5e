@@ -4,6 +4,8 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+## [0.1.6-alpha] - 2026-11-12
+
 ### Fixed
 
 - Windows: controllers work out of the box. The release archive now carries `SDL3.dll`: the emulator loads SDL at run time and Windows has none of its own, so no controller was found ("SDL3 not available") unless the file was added by hand. The message for a missing library now says where to put it ([#4](https://github.com/keklick1337/rps5e/issues/4)).
@@ -224,7 +226,9 @@ First public alpha.
 - The project is named RustPS5Emu (RPS5E): binaries `rps5e` and `rps5e-cli`, environment variables `RPS5E_*`, data, settings and caches under `rps5e` folders.
 - Release packages: `scripts/package.sh` (Linux tarball, Windows zip) with a `dist` build profile without debug info.
 
-[Unreleased]: https://github.com/keklick1337/rps5e/compare/v0.1.4-alpha...HEAD
+[Unreleased]: https://github.com/keklick1337/rps5e/compare/v0.1.6-alpha...HEAD
+[0.1.6-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.6-alpha
+[0.1.5-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.5-alpha
 [0.1.4-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.4-alpha
 [0.1.3-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.3-alpha
 [0.1.2-alpha]: https://github.com/keklick1337/rps5e/releases/tag/v0.1.2-alpha
