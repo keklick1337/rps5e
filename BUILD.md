@@ -34,7 +34,7 @@ Binaries: `target/release/rps5e` (launcher) and `target/release/rps5e-cli` (comm
 The Windows build runs natively on Windows 10 1803+ / Windows 11 and under Wine/Proton. Requirements to run:
 
 - an x86-64-v3 CPU and a Vulkan 1.3 driver (`vulkan-1.dll` comes with it);
-- optional: `SDL3.dll` next to the executables for controllers;
+- `SDL3.dll` next to the executables for controllers (the release archive carries it; a build of your own needs the one from `SDL3-<version>-win32-x64.zip` of the [SDL releases](https://github.com/libsdl-org/SDL/releases)); without it only keyboard and mouse work;
 - enough commit space: guest memory is a 13.5 GiB pagefile-backed section; Windows charges it up front, so RAM plus page file must cover it (the default system-managed page file grows as needed).
 
 Data go to `%LOCALAPPDATA%\rps5e` (saves, per-title data), settings to `%APPDATA%\rps5e`; `RPS5E_DATA_DIR` / `RPS5E_CONFIG_DIR` override them.

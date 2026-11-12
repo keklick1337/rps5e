@@ -10,10 +10,13 @@
 #
 #   linux    dist/rps5e-<version>-linux-x86_64.tar.gz
 #   windows  dist/rps5e-<version>-windows-x86_64.zip (x86_64-pc-windows-gnu;
-#            needs the MinGW-w64 cross toolchain, see BUILD.md)
+#            needs the MinGW-w64 cross toolchain, see BUILD.md), with
+#            SDL3.dll (controllers, audio) from the official SDL release
 #
 # Environment: CARGO (default cargo; e.g. a wrapper that sets up the Windows
-# cross toolchain), OUT (default <repo>/dist), BUILD=0 packs existing binaries.
+# cross toolchain), OUT (default <repo>/dist), BUILD=0 packs existing binaries,
+# SDL3_ZIP (an already downloaded SDL3-<version>-win32-x64.zip; otherwise it is
+# downloaded once into $OUT/cache).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO="${CARGO:-cargo}"
@@ -52,6 +55,32 @@ package_linux() {
     echo "$OUT/$name.tar.gz"
 }
 
+# The SDL release the Windows archive carries (the emulator loads SDL3.dll at
+# run time for controllers and audio; Windows has none of its own).
+SDL3_VERSION=3.4.20
+SDL3_SHA256=368bed8b24e44ad9ea372990814f2343fcfb9e468abb7f8f4a3bc146c7304752
+
+# Put SDL3.dll and its licence into directory $1.
+sdl3_windows() {
+    local dest="$1" zip="${SDL3_ZIP:-}" name="SDL3-$SDL3_VERSION-win32-x64.zip"
+    if [[ -z "$zip" ]]; then
+        zip="$OUT/cache/$name"
+        if [[ ! -f "$zip" ]]; then
+            mkdir -p "$OUT/cache"
+            curl -fL --retry 3 -o "$zip.part" "https://github.com/libsdl-org/SDL/releases/download/release-$SDL3_VERSION/$name"
+            mv "$zip.part" "$zip"
+        fi
+    fi
+    echo "$SDL3_SHA256  $zip" | sha256sum -c --quiet - || { echo "package: $zip is not the SDL $SDL3_VERSION release archive" >&2; exit 1; }
+    python3 -I - "$zip" "$dest" <<'PY'
+import os, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+for src, dst in (("SDL3.dll", "SDL3.dll"), ("LICENSE.txt", "SDL3-LICENSE.txt")):
+    with open(os.path.join(sys.argv[2], dst), "wb") as f:
+        f.write(z.read(src))
+PY
+}
+
 package_windows() {
     local triple=x86_64-pc-windows-gnu
     local name="rps5e-$VERSION-windows-x86_64" bin="$ROOT/target/$triple/dist"
@@ -62,6 +91,7 @@ package_windows() {
     rm -rf "$stage" && mkdir -p "$stage"
     install -m755 "$bin/rps5e.exe" "$bin/rps5e-cli.exe" "$stage/"
     common_files "$stage"
+    sdl3_windows "$stage"
     rm -f "$OUT/$name.zip"
     python3 -I - "$OUT" "$name" <<'PY'
 import os, sys, zipfile

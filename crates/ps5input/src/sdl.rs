@@ -293,7 +293,13 @@ unsafe impl Send for SdlGamepads {}
 
 impl SdlGamepads {
     pub fn new() -> Result<Self, String> {
-        let api = Api::load().map_err(|e| format!("SDL3 not available ({e})"))?;
+        let api = Api::load().map_err(|e| {
+            if cfg!(windows) {
+                format!("SDL3.dll not found ({e}): put SDL3.dll next to rps5e.exe (the release archive carries it)")
+            } else {
+                format!("SDL3 not available ({e})")
+            }
+        })?;
         unsafe {
             let hint = |k: &CStr, v: &CStr| (api.SDL_SetHint)(k.as_ptr(), v.as_ptr());
             // The emulator owns the process signal handlers.

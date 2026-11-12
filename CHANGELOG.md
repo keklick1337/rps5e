@@ -4,6 +4,10 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: controllers work out of the box. The release archive now carries `SDL3.dll`: the emulator loads SDL at run time and Windows has none of its own, so no controller was found ("SDL3 not available") unless the file was added by hand. The message for a missing library now says where to put it ([#4](https://github.com/keklick1337/rps5e/issues/4)).
+
 ## [0.1.5-alpha] - 2026-11-11
 
 ### Changed
