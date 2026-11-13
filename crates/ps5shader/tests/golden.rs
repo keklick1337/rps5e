@@ -370,6 +370,31 @@ fn movrel_offsets() {
     assert!(movrel::analyze(&p).is_empty());
 }
 
+/// An M0-relative VGPR read is one `pick` over the window and a relative
+/// write applies EXEC once (`RPS5E_RELATIVE_PICK`, default on): a window of
+/// 41 registers with an unbounded M0 (user data) costs one select per
+/// register for the write, not a compare-and-select chain for the read
+/// plus two selects per register for the write. Programs that keep a stack
+/// in VGPRs inflated to multi-million-word modules the old way.
+#[test]
+fn relative_moves_pick_from_the_window() {
+    if !ps5shader::translate::relative_pick_enabled() {
+        return;
+    }
+    use ps5shader::ssa::{Op, Stage};
+    use ps5shader::translate::{compile, TranslateOptions};
+    // s_mov_b32 m0, s4 ; v_mov_b32 v40, 0 ; v_movrels_b32 v1, v0 ;
+    // v_movreld_b32 v0, v2 ; s_endpgm
+    let p = program(&[0xBEFC_0304, 0x7E50_0280, 0x7E02_8700, 0x7E00_8502, S_ENDPGM]);
+    let mut opts = TranslateOptions::with_user_data(64, Stage::Unknown, 16);
+    opts.optimize = false;
+    let f = compile(&p, &opts, None).unwrap().function;
+    let count = |op: Op| f.order.iter().flat_map(|&b| f.block(b).insts.iter()).filter(|&&v| f.op(v) == op).count();
+    let window = 41;
+    assert_eq!(count(Op::Pick), 2, "one pick for the read, one for the written register's old value");
+    assert!(count(Op::Select) <= window + 4, "{} selects for a {window}-register window", count(Op::Select));
+}
+
 #[test]
 fn inline_constant_display() {
     assert_eq!(Operand::encoded(193).to_string(), "-1");

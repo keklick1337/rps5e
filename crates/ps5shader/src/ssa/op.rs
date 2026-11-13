@@ -393,6 +393,10 @@ pub enum Op {
     // ---- generic ----
     /// `(cond: bool, a, b)` -> a where cond, else b.
     Select,
+    /// `(index: u32, v0, ..., vN-1, fallback)` -> `v[index]` when
+    /// `index < N`, else `fallback`: one value of a register window chosen
+    /// by a run-time index (M0-relative VGPR reads and writes).
+    Pick,
     /// `(x)` reinterpret as the result type of the same bit width.
     Bitcast,
     /// `(c0, c1, ...)` -> vector.
@@ -782,6 +786,7 @@ impl Op {
             Op::GetReg(r) => format!("get {r}"),
             Op::SetReg(r) => format!("set {r}"),
             Op::Select => "select".into(),
+            Op::Pick => "pick".into(),
             Op::Bitcast => "bitcast".into(),
             Op::Construct => "construct".into(),
             Op::Extract(i) => format!("extract.{i}"),

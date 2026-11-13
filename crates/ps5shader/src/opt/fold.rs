@@ -90,6 +90,16 @@ fn simplify(f: &Function, v: Value) -> Option<Simplified> {
             }
             None
         }
+        Op::Pick => {
+            let n = d.args.len() - 2;
+            if let Some(k) = c(0) {
+                return Some(Simplified::Value(if (k as usize) < n { a(1 + k as usize) } else { a(n + 1) }));
+            }
+            if d.args[2..].iter().all(|&x| x == a(1)) {
+                return Some(Simplified::Value(a(1)));
+            }
+            None
+        }
         Op::And | Op::Or => {
             let is_and = d.op == Op::And;
             if a(0) == a(1) {

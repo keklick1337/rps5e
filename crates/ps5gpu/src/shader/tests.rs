@@ -40,7 +40,13 @@ fn spirv_val() -> Option<PathBuf> {
 /// Compile one blob; Err(message) on any failure (translation, emission
 /// or validation).
 fn compile_one(path: &Path, validator: Option<&Path>) -> Result<usize, String> {
-    compile_ext(path, validator, |_, _| true, None).map(|m| m.map_or(0, |m| m.spirv.len()))
+    let m = compile_ext(path, validator, |_, _| true, None)?;
+    // PS5SHADER_SPIRV_OUT=<dir>: each module is also written as <name>.spv.
+    if let (Some(dir), Some(m)) = (std::env::var_os("PS5SHADER_SPIRV_OUT"), &m) {
+        let bytes: Vec<u8> = m.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let _ = std::fs::write(Path::new(&dir).join(path.with_extension("spv").file_name().unwrap()), bytes);
+    }
+    Ok(m.map_or(0, |m| m.spirv.len()))
 }
 
 /// [`compile_one`] with the default specialization adjusted by `adjust`

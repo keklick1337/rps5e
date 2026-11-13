@@ -318,6 +318,17 @@ fn scalar_wave_jobs() -> Vec<Job> {
                 u.extend([7, data]);
                 u
             }));
+            // The same relative reads and writes with only the even lanes
+            // active (s_mov_b32 exec_lo, 0x55555555 first): a relative
+            // write leaves the inactive lanes' registers as they were.
+            let mut code = vec![0xBEFE_03FF, 0x5555_5555];
+            code.extend_from_slice(&ep::VECTOR_WINDOW_NARROWING);
+            jobs.push(Job::new(format!("vector window narrowing partial exec wave{wave} data {data}"), &code, wave, wave, vec![vec![POISON; 64 * 16]], &[0], move |b| {
+                let mut u = vec![0u32; 4];
+                u.extend(raw(b[0], 4096));
+                u.extend([7, data]);
+                u
+            }));
         }
     }
     jobs

@@ -337,6 +337,11 @@ pub fn eval(op: Op, ty: Type, args: &[(Type, Val)]) -> Result<Val, EvalError> {
     match op {
         Op::Const(c) => ret(c),
         Op::Select => Ok(if a(0) != 0 { args[1].1 } else { args[2].1 }),
+        Op::Pick => {
+            let n = args.len() - 2;
+            let i = a(0) as usize;
+            Ok(if i < n { args[1 + i].1 } else { args[n + 1].1 })
+        }
         Op::Bitcast => Ok(bitcast(&args[0].1, at(0), ty)),
         Op::Construct => {
             let mut out = [0u64; 4];

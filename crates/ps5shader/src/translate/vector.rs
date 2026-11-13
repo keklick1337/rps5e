@@ -1362,6 +1362,11 @@ impl<'a> Translator<'a> {
     /// VGPR `base + offset` (uniform offset). An index at or past the
     /// window reads v0 (measured on RDNA2).
     fn relative_read(&mut self, base: u32, offset: Value) -> Value {
+        if super::relative_pick_enabled() {
+            let window: Vec<Value> = (base..self.vector_limit).map(|reg| self.vgpr(reg)).collect();
+            let fallback = self.vgpr(0);
+            return self.b().pick(offset, &window, fallback);
+        }
         let mut acc = self.vgpr(0);
         for reg in base..self.vector_limit {
             let k = self.b().u32(reg - base);
@@ -1375,6 +1380,25 @@ impl<'a> Translator<'a> {
     /// Write VGPR `base + offset` under EXEC and the DPP write mask (and
     /// `enable`); an index past the window writes nothing.
     fn relative_write(&mut self, base: u32, offset: Value, value: Value, dm: &DstMods, enable: Option<Value>) {
+        if dm.dpp.is_none() && super::relative_pick_enabled() {
+            // EXEC (and `enable`) decide the value once: lanes that do not
+            // write keep the register's own value, so each register then
+            // needs only its index test.
+            let current = self.relative_read(base, offset);
+            let mut cond = self.exec_bit();
+            if let Some(e) = enable {
+                cond = self.b().land(cond, e);
+            }
+            let value = self.b().select(cond, value, current);
+            for reg in base..self.vector_limit {
+                let k = self.b().u32(reg - base);
+                let hit = self.b().icmp(ICmp::Eq, offset, k);
+                let old = self.vgpr(reg);
+                let v = self.b().select(hit, value, old);
+                self.write_vgpr_unmasked(reg, v);
+            }
+            return;
+        }
         let dm = DstMods { dpp: dm.dpp.clone(), ..DstMods::plain() };
         for reg in base..self.vector_limit {
             let k = self.b().u32(reg - base);

@@ -208,7 +208,10 @@ fn runtime_format_loads_match_specialised_ones() {
     let fixed = format_xyzw_reader(&mut g, false);
     let runtime = format_xyzw_reader(&mut g, true);
     let tex = g.zeroed(64 * 4 * 16);
-    let bytes: Vec<u8> = (0..64u32).map(|i| (i.wrapping_mul(0x9D) ^ 0x5A) as u8).collect();
+    // Two device-address pages (16 KiB each) of data: element 1 is read
+    // at the start of the buffer, and again from a base that puts it
+    // across the boundary of the two pages.
+    let bytes: Vec<u8> = (0..0x8000u32).map(|i| (i.wrapping_mul(0x9D) ^ 0x5A ^ (i >> 8)) as u8).collect();
     let data = g.alloc(&bytes);
     let vsharp = g.zeroed(16);
     let mut rig = Rig::with_compiler(&g, |dev| Arc::new(crate::shader::SpirvCompiler::for_device(dev, g.mem)), None, None);
@@ -225,15 +228,15 @@ fn runtime_format_loads_match_specialised_ones() {
     for format in 0..128u32 {
         for sel in [0xFAC, 6 | (1 << 3) | (4 << 9)] {
             // Element 1 in range, or past the records (zeros and ones).
-            for (stride, records) in [(16, 4), (6, 4), (16, 1)] {
-                let v = buffer_descriptor(data, stride, records, (format << 12) | sel);
+            for (stride, records, start) in [(16, 4, 0), (6, 4, 0), (16, 1, 0), (16, 4, 0x4000 - 16 - 8), (6, 4, 0x4000 - 6 - 2)] {
+                let v = buffer_descriptor(data + start as u64, stride, records, (format << 12) | sel);
                 assert!(g.mem.write_backing(vsharp, &asm::bytes(&v)));
                 rig.buffers.tracker.mark_cpu_dirty_pages(vsharp, 16);
                 let mut user = texture(tex).to_vec();
                 user.extend([vsharp as u32, (vsharp >> 32) as u32]);
                 let got = run(&mut rig, runtime, user);
                 if ps5shader::interp::buffer::FormatInfo::new(format).is_none() && records > 1 {
-                    let o = stride as usize;
+                    let o = start + stride as usize;
                     let d0 = u32::from_le_bytes(bytes[o & !3..(o & !3) + 4].try_into().unwrap());
                     assert_eq!(got, [d0; 4], "invalid format {format}");
                     continue;
@@ -246,7 +249,7 @@ fn runtime_format_loads_match_specialised_ones() {
                     assert_eq!(got, [0; 4], "invalid format {format} out of range");
                     continue;
                 }
-                assert_eq!(got, want, "format {format} sel {sel:#x} stride {stride} records {records}");
+                assert_eq!(got, want, "format {format} sel {sel:#x} stride {stride} records {records} start {start:#x}");
                 checked += 1;
             }
         }

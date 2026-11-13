@@ -64,6 +64,12 @@ struct Tracker<'p> {
     buffer_candidate_tables: Vec<BufferCandidateTablePlan>,
     uses: HashMap<ValueId, Vec<ValueId>>,
     reads_by_memory: HashMap<usize, Vec<ValueId>>,
+    /// Answers of [`Tracker::has_runtime_read`], kept for the whole track:
+    /// the value graph is immutable while it runs, so each value is walked
+    /// once however many descriptor dwords ask. The graphs of the largest
+    /// programs hold hundreds of thousands of values; one walk per dword
+    /// took minutes on them.
+    runtime_read: HashMap<ValueId, bool>,
 }
 
 pub(super) fn track(plan: &mut ShaderResourcePlan) -> Result<TrackResult, ResourcePlanError> {
@@ -95,6 +101,7 @@ pub(super) fn track(plan: &mut ShaderResourcePlan) -> Result<TrackResult, Resour
         buffer_candidate_tables: Vec::new(),
         uses,
         reads_by_memory,
+        runtime_read: HashMap::new(),
     }
     .run()
 }
@@ -437,7 +444,7 @@ impl Tracker<'_> {
     /// non-constant leaf is a read from guest memory (a descriptor read from
     /// a device address or from the SRT at a dynamic offset). A handle that
     /// is fully resolvable keeps the native binding.
-    fn is_runtime_descriptor_handle(&self, handle: Option<ValueId>, allow_computed_words: bool) -> bool {
+    fn is_runtime_descriptor_handle(&mut self, handle: Option<ValueId>, allow_computed_words: bool) -> bool {
         let Some(handle) = handle else { return false };
         let node = self.graph().node(handle);
         if node.kind != ValueKind::BufferHandle || node.operands.len() != 4 {
@@ -451,7 +458,8 @@ impl Tracker<'_> {
             // addresses.
             return allow_computed_words && node.operands.iter().any(|&d| self.has_read_kind(d, ValueKind::ScalarAddressWord, &mut HashSet::new()));
         }
-        node.operands.iter().any(|&d| self.has_runtime_read(d, &mut HashSet::new()))
+        let operands = self.graph().node(handle).operands.to_vec();
+        operands.iter().any(|&d| self.has_runtime_read(d, &mut HashSet::new()))
     }
 
     /// A word read from guest memory (consumed as a device-address word; it
@@ -512,14 +520,24 @@ impl Tracker<'_> {
         node.kind == kind || node.operands.iter().any(|&o| self.has_read_kind(o, kind, seen))
     }
 
-    /// A guest-memory read is reachable from `value` (see
-    /// [`Self::has_read_kind`] for `seen`).
-    fn has_runtime_read(&self, value: ValueId, seen: &mut HashSet<ValueId>) -> bool {
-        if !seen.insert(value) {
+    /// A guest-memory read is reachable from `value`. `path` holds the
+    /// values of the current recursion path: a loop through them answers
+    /// false (as before) and is not kept. Answers are kept in
+    /// [`Tracker::runtime_read`] for the whole track.
+    fn has_runtime_read(&mut self, value: ValueId, path: &mut HashSet<ValueId>) -> bool {
+        if let Some(&read) = self.runtime_read.get(&value) {
+            return read;
+        }
+        if !path.insert(value) {
             return false;
         }
         let node = self.graph().node(value);
-        matches!(node.kind, ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord) || node.operands.iter().any(|&o| self.has_runtime_read(o, seen))
+        let operands = node.operands.to_vec();
+        let read = matches!(node.kind, ValueKind::ScalarAddressWord | ValueKind::ScalarBufferWord)
+            || operands.iter().any(|&o| self.has_runtime_read(o, path));
+        path.remove(&value);
+        self.runtime_read.insert(value, read);
+        read
     }
 
     // ---- dense tables ----

@@ -408,6 +408,17 @@ impl<'f> Builder<'f> {
         self.emit(Op::Select, ty, vec![c, a, b])
     }
 
+    /// `values[index]`, or `fallback` when `index` is past them ([`Op::Pick`]).
+    pub fn pick(&mut self, index: Value, values: &[Value], fallback: Value) -> Value {
+        let ty = self.func.ty(fallback);
+        debug_assert!(values.iter().all(|&v| self.func.ty(v) == ty));
+        let mut args = Vec::with_capacity(values.len() + 2);
+        args.push(index);
+        args.extend_from_slice(values);
+        args.push(fallback);
+        self.emit(Op::Pick, ty, args)
+    }
+
     pub fn bitcast(&mut self, x: Value, ty: Type) -> Value {
         if self.func.ty(x) == ty {
             return x;

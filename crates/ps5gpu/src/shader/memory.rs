@@ -55,6 +55,11 @@ pub struct Resources {
     pub lens64: HashMap<Word, Word>,
     pub scratch: [Option<Word>; 2],
     pub scratch_dwords: u32,
+    /// The functions converting a preloaded formatted element through a
+    /// run-time format ([`format_function_enabled`]), without and with d16.
+    pub format_fns: [Option<Word>; 2],
+    /// Private arrays of [`Emitter::pick`], by (element type, length).
+    pub pick_arrays: HashMap<(Word, u32), (Word, Word)>,
     pub u32_block: Option<Word>,
     pub u64_block: Option<Word>,
     /// Runtime arrays of the blocks above (shared by their read-only views).
@@ -880,6 +885,9 @@ impl Emitter<'_, '_> {
     /// as vectors; otherwise one by one.
     pub fn device_load_span(&mut self, a0: Word, n: u32) -> R<Vec<Word>> {
         let page = ps5shader::resources::paging::PAGE_OFFSET_MASK as u32 + 1;
+        if span_two_pages_enabled() && !self.feat.emit.fault_log && n >= 2 && 4 * n <= page {
+            return self.device_load_span_two_pages(a0, n);
+        }
         let tu = self.t_u32();
         let t64 = self.ty(Type::U64);
         let (lo, _) = self.split64(a0);
@@ -947,6 +955,58 @@ impl Emitter<'_, '_> {
             },
         );
         err.into_inner().map_or(Ok(words), Err)
+    }
+
+    /// [`Self::device_load_span`] without a branch per page: the span
+    /// reaches at most two pages, the first dword's and the last one's, so
+    /// both are translated once and each dword takes its address and
+    /// residency from its page; one branch skips the loads when neither
+    /// page is resident, and a dword of a missing page reads 0 (its load
+    /// goes to the other page's address and is dropped), as
+    /// [`Self::device_load`] gives it.
+    fn device_load_span_two_pages(&mut self, a0: Word, n: u32) -> R<Vec<Word>> {
+        let page = ps5shader::resources::paging::PAGE_OFFSET_MASK as u32 + 1;
+        let tu = self.t_u32();
+        let tb = self.t_bool();
+        let t64 = self.ty(Type::U64);
+        let (lo, _) = self.split64(a0);
+        let mask = self.cu(page - 1);
+        let within = self.band(lo, mask);
+        let last_off = self.c64(4 * (n as u64 - 1));
+        let a_last = self.ins(S::IAdd, t64, &[a0, last_off]);
+        let (dev_first, res_first) = self.translate_address(a0)?;
+        let (dev_last, res_last) = self.translate_address(a_last)?;
+        let any = self.ins(S::LogicalOr, tb, &[res_first, res_last]);
+        let zeros = vec![self.cu(0); n as usize];
+        Ok(self.if_values(any, tu, &zeros, |e| {
+            let fallback = e.select(t64, res_first, dev_first, dev_last);
+            let page_c = e.cu(page);
+            (0..n)
+                .map(|k| {
+                    // Dword k is on the last dword's page when it starts at
+                    // or past the end of the first one's.
+                    let at = e.cu(4 * k);
+                    let byte = e.iadd(within, at);
+                    let second = e.ule(page_c, byte);
+                    let from_first = e.c64(4 * k as u64);
+                    let a_first = e.ins(S::IAdd, t64, &[dev_first, from_first]);
+                    let from_last = e.c64(4 * (n - 1 - k) as u64);
+                    let a_second = e.ins(S::ISub, t64, &[dev_last, from_last]);
+                    let dev = e.select(t64, second, a_second, a_first);
+                    let resident = e.select(tb, second, res_last, res_first);
+                    let dev = e.select(t64, resident, dev, fallback);
+                    let p = e.phys_ptr(dev);
+                    let v = if e.volatile {
+                        let (scope, semantics) = (e.cu(SCOPE_DEVICE), e.cu(0));
+                        e.ins(S::AtomicLoad, tu, &[p, scope, semantics])
+                    } else {
+                        e.ins_ops(S::Load, tu, vec![Operand::IdRef(p), Operand::MemoryAccess(rspirv::spirv::MemoryAccess::ALIGNED), Operand::LiteralBit32(4)])
+                    };
+                    let zero = e.cu(0);
+                    e.select(tu, resident, v, zero)
+                })
+                .collect()
+        }))
     }
 
     /// Store `values` as consecutive dwords from guest address `a0` (u64,
@@ -2798,14 +2858,20 @@ struct Preloaded {
     ok: HashMap<(u32, u32), Word>,
 }
 
+/// The memory spans `(byte, bytes)` of every component of every format,
+/// and dword 0, sorted: the range checks [`Preloaded`] makes up front.
+fn preload_spans() -> Vec<(u32, u32)> {
+    let mut spans: Vec<(u32, u32)> = (0..128).filter_map(FormatInfo::new).flat_map(|info| (0..info.count).map(move |c| info.component_span(c))).collect();
+    spans.push((0, 4));
+    spans.sort_unstable();
+    spans.dedup();
+    spans
+}
+
 impl Preloaded {
     fn read(e: &mut Emitter, base: Word, a: &BufferAddress) -> R<Preloaded> {
         let byte = a.byte;
-        let mut spans: Vec<(u32, u32)> = (0..128).filter_map(FormatInfo::new).flat_map(|info| (0..info.count).map(move |c| info.component_span(c))).collect();
-        spans.push((0, 4));
-        spans.sort_unstable();
-        spans.dedup();
-        let ok = spans.into_iter().map(|(b, n)| ((b, n), e.buffer_unit_ok(a, b, n))).collect();
+        let ok = preload_spans().into_iter().map(|(b, n)| ((b, n), e.buffer_unit_ok(a, b, n))).collect();
         let t64 = e.ty(Type::U64);
         let o64 = e.ins(S::UConvert, t64, &[byte]);
         let addr = e.ins(S::IAdd, t64, &[base, o64]);
@@ -2851,6 +2917,253 @@ impl Preloaded {
     }
 }
 
+/// `RPS5E_FORMAT_SWITCH_SPLIT=0`: a formatted load through a run-time
+/// descriptor converts its four components in one switch over the 128
+/// formats (the older form). On (default) each component has a switch of
+/// its own whose formats with the same conversion of that component share
+/// one case ([`format_components_runtime`]).
+pub fn format_switch_split() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_FORMAT_SWITCH_SPLIT").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
+/// The range check of a formatted element of unified format `f`: the
+/// memory spans of its components (`None`: an invalid format, whose x is
+/// its raw dword 0).
+fn element_spans(f: u32) -> Option<Vec<(u32, u32)>> {
+    FormatInfo::new(f).map(|info| (0..info.count).map(|k| info.component_span(k)).collect())
+}
+
+/// The field extraction of component `c` (`None` past the format's
+/// components or for an invalid format, whose x is its raw dword 0): the
+/// component's memory span, bit offset, width and signedness.
+fn field_case(f: u32, c: u32) -> Result<(bool, u32, u32, u32, bool), bool> {
+    let Some(info) = FormatInfo::new(f) else { return Err(c == 0) };
+    if c >= info.count {
+        return Err(false);
+    }
+    let i = c as usize;
+    Ok((info.packed, info.byte_offset[i], info.bit_offset[i], info.bits[i], matches!(info.kind, FormatKind::Snorm | FormatKind::Sscaled | FormatKind::Sint)))
+}
+
+/// The conversion of component `c`'s field (`None`: the field itself):
+/// the format's kind and the component's width.
+fn conversion_case(f: u32, c: u32) -> Option<(u8, u32)> {
+    let info = FormatInfo::new(f)?;
+    (c < info.count).then(|| (info.kind as u8, info.bits[c as usize]))
+}
+
+/// The four converted components of [`format_load_runtime`] (as its single
+/// switch computes them): one switch per component over the 128 formats,
+/// its field extracted once per distinct layout and converted once per distinct kind and width. GHOST OF YOTEI's compute
+/// programs with ~100 such loads were 2.7-3.2 million SPIR-V words with one
+/// switch converting all four components in every format's case.
+fn format_components_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, format: Word, d16: bool, pre: Option<&Preloaded>) -> R<Word> {
+    let tu = e.t_u32();
+    let tb = e.t_bool();
+    let t4 = e.ty(Type::U32X4);
+    // The element's range check: every component's bytes in range (an
+    // invalid format: its dword 0; read through the bound buffer, that
+    // load checks its own range).
+    let ok = e.switch_value_shared(format, 128, tb, element_spans, |e, f| match FormatInfo::new(f) {
+        Some(info) => {
+            let mut all: Option<Word> = None;
+            for c in 0..info.count {
+                let (byte, bytes) = info.component_span(c);
+                let (_, in_range) = match pre {
+                    Some(p) => p.unit(e, a, byte, bytes),
+                    None => e.buffer_unit(a, byte, bytes),
+                };
+                all = Some(match all {
+                    Some(o) => e.land(o, in_range),
+                    None => in_range,
+                });
+            }
+            all.expect("a format has components")
+        }
+        None => match pre {
+            Some(p) => p.unit(e, a, 0, 4).1,
+            None => e.cb(true),
+        },
+    });
+    let zero = e.cu(0);
+    let mut comps = Vec::with_capacity(4);
+    for c in 0..4u32 {
+        let mut err = None;
+        // The field: zero past the format's components, an invalid
+        // format's x its raw dword 0.
+        let field = e.switch_value_shared(format, 128, tu, |f| field_case(f, c), |e, f| {
+            let r = (|| -> R<Word> {
+                let Some(info) = FormatInfo::new(f) else {
+                    if c != 0 {
+                        return Ok(e.cu(0));
+                    }
+                    return match pre {
+                        Some(p) => Ok(p.word_at(e, 0)),
+                        None => raw_load(e, t, a, Access::Dwords(1), Type::U32),
+                    };
+                };
+                if c >= info.count {
+                    return Ok(e.cu(0));
+                }
+                Ok(component_field(e, t, a, &info, c, pre)?.0)
+            })();
+            r.unwrap_or_else(|m| {
+                err.get_or_insert(m);
+                e.cu(0)
+            })
+        });
+        if let Some(m) = err {
+            return Err(m);
+        }
+        let v = e.switch_value_shared(format, 128, tu, |f| conversion_case(f, c), |e, f| match FormatInfo::new(f) {
+            Some(info) if c < info.count => convert_component(e, &info, c, field, d16),
+            _ => field,
+        });
+        comps.push(e.select(tu, ok, v, zero));
+    }
+    Ok(e.construct(t4, &comps))
+}
+
+/// `RPS5E_SPAN_TWO_PAGES=0`: a span of device-address dwords branches on
+/// whether it lies in one page and, when not, loads each dword with a
+/// translation and a branch of its own (the older form). On (default) both
+/// pages are translated once ([`Emitter::device_load_span_two_pages`]).
+pub fn span_two_pages_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_SPAN_TWO_PAGES").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
+/// `RPS5E_FORMAT_FUNCTION=0`: every formatted load through a run-time
+/// descriptor read through its device address converts its element inline
+/// ([`format_components_runtime`]). On (default) the conversion is one
+/// function of the module ([`format_components_preloaded`]) each such load
+/// calls with the element's dwords: GHOST OF YOTEI's compute programs with
+/// ~130 of these loads were 1.5-3.2 million SPIR-V words inline, minutes in
+/// the driver.
+pub fn format_function_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_FORMAT_FUNCTION").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
+/// The converted components (u32x4) of a preloaded element through the
+/// module's conversion function: arguments are the format, the element's
+/// five dwords, its address's low two bits and the range checks of
+/// [`preload_spans`] as a bit mask.
+fn format_call(e: &mut Emitter, p: &Preloaded, format: Word, d16: bool) -> Word {
+    let tu = e.t_u32();
+    let t4 = e.ty(Type::U32X4);
+    let id = match e.res.format_fns[d16 as usize] {
+        Some(id) => id,
+        None => {
+            let id = e.b.id();
+            e.res.format_fns[d16 as usize] = Some(id);
+            id
+        }
+    };
+    let zero = e.cu(0);
+    let mut mask = zero;
+    for (i, span) in preload_spans().into_iter().enumerate() {
+        let bit = e.cu(1 << i);
+        let ok = p.ok[&span];
+        let b = e.select(tu, ok, bit, zero);
+        mask = e.bor(mask, b);
+    }
+    let mut args = vec![format];
+    args.extend(p.words.iter().copied());
+    args.push(p.low);
+    args.push(mask);
+    e.call(t4, id, &args)
+}
+
+/// Define the conversion functions [`format_call`] used.
+pub(super) fn emit_format_functions(e: &mut Emitter) -> R<()> {
+    for d16 in [false, true] {
+        let Some(id) = e.res.format_fns[d16 as usize] else { continue };
+        let tu = e.t_u32();
+        let t4 = e.ty(Type::U32X4);
+        let spans = preload_spans();
+        let words = 5;
+        let params = vec![tu; 1 + words + 2];
+        e.define_function(id, t4, &params, |e, args| {
+            let format = args[0];
+            let low = args[1 + words];
+            let mask = args[2 + words];
+            let tb = e.t_bool();
+            let zero = e.cu(0);
+            let ok = spans
+                .iter()
+                .enumerate()
+                .map(|(i, &span)| {
+                    let bit = e.cu(1 << i);
+                    let m = e.band(mask, bit);
+                    (span, e.ins(S::INotEqual, tb, &[m, zero]))
+                })
+                .collect();
+            let p = Preloaded { words: args[1..1 + words].to_vec(), low, ok };
+            Ok(format_components_preloaded(e, &p, format, d16))
+        })?;
+    }
+    Ok(())
+}
+
+/// [`format_components_runtime`] of a preloaded element from the
+/// preloaded dwords alone (the body of the conversion function).
+fn format_components_preloaded(e: &mut Emitter, p: &Preloaded, format: Word, d16: bool) -> Word {
+    let tu = e.t_u32();
+    let tb = e.t_bool();
+    let t4 = e.ty(Type::U32X4);
+    let ok = e.switch_value_shared(format, 128, tb, element_spans, |e, f| match FormatInfo::new(f) {
+        Some(info) => {
+            let mut all: Option<Word> = None;
+            for c in 0..info.count {
+                let in_range = p.ok[&info.component_span(c)];
+                all = Some(match all {
+                    Some(o) => e.land(o, in_range),
+                    None => in_range,
+                });
+            }
+            all.expect("a format has components")
+        }
+        None => p.ok[&(0, 4)],
+    });
+    let zero = e.cu(0);
+    let mut comps = Vec::with_capacity(4);
+    for c in 0..4u32 {
+        let field = e.switch_value_shared(format, 128, tu, |f| field_case(f, c), |e, f| {
+            let Some(info) = FormatInfo::new(f) else {
+                return if c == 0 { p.word_at(e, 0) } else { e.cu(0) };
+            };
+            if c >= info.count {
+                return e.cu(0);
+            }
+            // As [`component_field`] through `pre`: the low two bits of
+            // the component's address are those of the element plus its
+            // byte offset.
+            let (byte, bytes) = info.component_span(c);
+            let word = p.word_at(e, byte);
+            let raw = if info.packed || bytes == 4 {
+                word
+            } else {
+                let three = e.cu(3);
+                let off = e.cu(byte);
+                let s = e.iadd(p.low, off);
+                let low = e.band(s, three);
+                let eight = e.cu(8);
+                let sh = e.imul(low, eight);
+                e.shr(word, sh)
+            };
+            load_field(e, &info, c, raw)
+        });
+        let v = e.switch_value_shared(format, 128, tu, |f| conversion_case(f, c), |e, f| match FormatInfo::new(f) {
+            Some(info) if c < info.count => convert_component(e, &info, c, field, d16),
+            _ => field,
+        });
+        comps.push(e.select(tu, ok, v, zero));
+    }
+    e.construct(t4, &comps)
+}
+
 /// The output components of a formatted load through a descriptor the
 /// shader selects at run time (read through its device address): the
 /// format and each component's destination select come from the V# word
@@ -2869,7 +3182,12 @@ fn format_load_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, desc: Word
     let mut err = None;
     // The converted components (zero past the format's count); an invalid
     // format: the raw dword 0 of the element in x.
-    let values = e.switch_value(format, 128, t4, |e, f| {
+    let values = if let (Some(p), true) = (pre, format_switch_split() && format_function_enabled() && preload_spans().len() <= 32) {
+        format_call(e, p, format, d16)
+    } else if format_switch_split() {
+        format_components_runtime(e, t, a, format, d16, pre)?
+    } else {
+        e.switch_value(format, 128, t4, |e, f| {
         let r = (|| -> R<Word> {
             let zero = e.cu(0);
             let Some(info) = FormatInfo::new(f) else {
@@ -2891,13 +3209,33 @@ fn format_load_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, desc: Word
             let z = e.cu(0);
             e.construct(t4, &[z, z, z, z])
         })
-    });
+    })
+    };
     if let Some(m) = err {
         return Err(m);
     }
     // (component count, 0 for an invalid format; the constant one).
     let t2 = e.t_uvec(2);
-    let meta = e.switch_value(format, 128, t2, |e, f| {
+    let meta_of = |f: u32| match FormatInfo::new(f) {
+        None => (0, 0),
+        Some(info) => (
+            info.count,
+            match info.kind {
+                FormatKind::Uint | FormatKind::Sint => 1,
+                _ if d16 => 0x3C00,
+                _ => 0x3F80_0000,
+            },
+        ),
+    };
+    let meta_body = |e: &mut Emitter, f: u32| {
+        let (count, one) = meta_of(f);
+        let (c, o) = (e.cu(count), e.cu(one));
+        e.construct(t2, &[c, o])
+    };
+    let meta = if format_switch_split() {
+        e.switch_value_shared(format, 128, t2, meta_of, meta_body)
+    } else {
+        e.switch_value(format, 128, t2, |e, f| {
         let (count, one) = match FormatInfo::new(f) {
             None => (0, 0),
             Some(info) => (
@@ -2911,7 +3249,8 @@ fn format_load_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, desc: Word
         };
         let (c, o) = (e.cu(count), e.cu(one));
         e.construct(t2, &[c, o])
-    });
+    })
+    };
     let count = e.extract(tu, meta, 0);
     let one = e.extract(tu, meta, 1);
     let comps: Vec<Word> = (0..4).map(|i| e.extract(tu, values, i)).collect();
@@ -2941,6 +3280,61 @@ fn format_load_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, desc: Word
     Ok(out)
 }
 
+/// Component `c` of a formatted element of `info`, converted (not masked
+/// by the element's range check), and whether its own bytes are in range.
+#[allow(clippy::too_many_arguments)]
+fn format_component(e: &mut Emitter, t: Target, a: &BufferAddress, info: &FormatInfo, c: u32, d16: bool, pre: Option<&Preloaded>) -> R<(Word, Word)> {
+    let (field, in_range) = component_field(e, t, a, info, c, pre)?;
+    Ok((convert_component(e, info, c, field, d16), in_range))
+}
+
+/// The field of component `c` of a formatted element (sign-extended for
+/// signed kinds) and whether its bytes are in range: depends only on the
+/// component's memory span, bit offset, width and signedness.
+fn component_field(e: &mut Emitter, t: Target, a: &BufferAddress, info: &FormatInfo, c: u32, pre: Option<&Preloaded>) -> R<(Word, Word)> {
+    let (byte, bytes) = info.component_span(c);
+    let (off, in_range) = match pre {
+        Some(p) => p.unit(e, a, byte, bytes),
+        None => e.buffer_unit(a, byte, bytes),
+    };
+    let word = match pre {
+        Some(p) => p.word_at(e, byte),
+        None => e.target_load(t, off)?,
+    };
+    // Sub-dword components: shift by the byte position.
+    let raw = if info.packed || bytes == 4 {
+        word
+    } else {
+        let three = e.cu(3);
+        let low = match t {
+            Target::Bound { adjust, .. } => {
+                let b = e.iadd(off, adjust);
+                e.band(b, three)
+            }
+            Target::Device { base } => {
+                let (lo, _) = e.split64(base);
+                let s = e.iadd(lo, off);
+                e.band(s, three)
+            }
+        };
+        let eight = e.cu(8);
+        let sh = e.imul(low, eight);
+        e.shr(word, sh)
+    };
+    Ok((load_field(e, info, c, raw), in_range))
+}
+
+/// The register value of component `c` from its extracted field: depends
+/// only on the format's kind, the component's width and `d16`.
+fn convert_component(e: &mut Emitter, info: &FormatInfo, c: u32, field: Word, d16: bool) -> Word {
+    let value = convert_field(e, info, c, field);
+    if d16 {
+        super::convert::load_component_d16(e, info, c, field, value)
+    } else {
+        value
+    }
+}
+
 /// A formatted load of `info` whose output components come from `sources`
 /// (the element's dwords from `pre` when given, else loaded here).
 #[allow(clippy::too_many_arguments)]
@@ -2956,46 +3350,11 @@ fn format_load_sources(e: &mut Emitter, t: Target, a: &BufferAddress, info: &For
             if memory.contains_key(&c) {
                 continue;
             }
-            let (byte, bytes) = info.component_span(c);
-            let (off, in_range) = match pre {
-                Some(p) => p.unit(e, a, byte, bytes),
-                None => e.buffer_unit(a, byte, bytes),
-            };
+            let (value, in_range) = format_component(e, t, a, &info, c, d16, pre)?;
             ok = Some(match ok {
                 Some(o) => e.land(o, in_range),
                 None => in_range,
             });
-            let word = match pre {
-                Some(p) => p.word_at(e, byte),
-                None => e.target_load(t, off)?,
-            };
-            // Sub-dword components: shift by the byte position.
-            let raw = if info.packed || bytes == 4 {
-                word
-            } else {
-                let three = e.cu(3);
-                let low = match t {
-                    Target::Bound { adjust, .. } => {
-                        let b = e.iadd(off, adjust);
-                        e.band(b, three)
-                    }
-                    Target::Device { base } => {
-                        let (lo, _) = e.split64(base);
-                        let s = e.iadd(lo, off);
-                        e.band(s, three)
-                    }
-                };
-                let eight = e.cu(8);
-                let sh = e.imul(low, eight);
-                e.shr(word, sh)
-            };
-            let value = convert_load(e, &info, c, raw);
-            let value = if d16 {
-                let field = load_field(e, &info, c, raw);
-                super::convert::load_component_d16(e, &info, c, field, value)
-            } else {
-                value
-            };
             memory.insert(c, value);
         }
     }
@@ -3055,10 +3414,16 @@ fn load_field(e: &mut Emitter, info: &FormatInfo, c: u32, raw: Word) -> Word {
 /// Load conversion of component `c` whose field starts at bit 0 of `raw`
 /// (packed fields at their bit offset).
 pub(super) fn convert_load(e: &mut Emitter, info: &FormatInfo, c: u32, raw: Word) -> Word {
+    let field = load_field(e, info, c, raw);
+    convert_field(e, info, c, field)
+}
+
+/// [`convert_load`] of the field [`load_field`] extracted: depends only on
+/// the format's kind and component `c`'s width.
+fn convert_field(e: &mut Emitter, info: &FormatInfo, c: u32, field: Word) -> Word {
     let tu = e.t_u32();
     let tf = e.t_f32();
     let bits = info.bits[c as usize];
-    let field = load_field(e, info, c, raw);
     match info.kind {
         FormatKind::Uint | FormatKind::Sint => field,
         FormatKind::Uscaled => {
@@ -4194,6 +4559,30 @@ impl Emitter<'_, '_> {
                 v
             }
         }
+    }
+
+    /// `parts[min(index, len - 1)]` ([`ps5shader::ssa::Op::Pick`]; the
+    /// last part is the value past the window): the parts are stored in a
+    /// private array and the element at the index loaded back.
+    pub fn pick(&mut self, ty: Word, index: Word, parts: &[Word]) -> Word {
+        let len = parts.len() as u32;
+        let (arr, var) = match self.res.pick_arrays.get(&(ty, len)) {
+            Some(&found) => found,
+            None => {
+                let n = self.cu(len);
+                let arr = self.unique_array(ty, n);
+                let var = self.global(arr, SC::Private);
+                self.res.pick_arrays.insert((ty, len), (arr, var));
+                (arr, var)
+            }
+        };
+        let all = self.construct(arr, parts);
+        self.store(var, all);
+        let last = self.cu(len - 1);
+        let i = self.umin(index, last);
+        let p = self.ptr(SC::Private, ty);
+        let at = self.access(p, var, &[i]);
+        self.load(ty, at)
     }
 
     pub fn scratch_ptr(&mut self, byte: Word) -> R<Word> {

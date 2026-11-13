@@ -157,6 +157,11 @@ fn check_types(func: &Function, v: Value) -> Result<(), String> {
                 return err("select operand types");
             }
         }
+        Op::Pick => {
+            if d.args.len() < 2 || t(0) != Type::U32 || !(1..d.args.len()).all(same_as_result) || !matches!(d.ty, Type::Scalar(_)) {
+                return err("pick operand types");
+            }
+        }
         Op::ICmp(_) => {
             if d.ty != Type::BOOL || t(0) != t(1) || !(t(0).is_int()) {
                 return err("icmp operand types");

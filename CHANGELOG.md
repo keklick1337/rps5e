@@ -4,6 +4,17 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+## [0.1.7-alpha] - 2026-11-13
+
+### Fixed
+
+- Ghost of Yōtei no longer freezes after its shaders are compiled (#3). Two causes:
+  - Planning the resources of a shader walked the shader's whole value graph again for every word of every buffer descriptor; on this game's largest shaders that took minutes on the GPU command thread, with nothing submitted meanwhile. Each value is now walked once per shader.
+  - A few compute shaders became SPIR-V modules of 2.7-3.2 million words that the GPU driver compiled for 15 minutes and more while the game waited (the driver keeps the result, so only the first run on a machine stalled). The largest is now 0.6 million words and builds in about 40 s on an RTX 5090, once; the results are the same, bit for bit (device tests over every buffer format, page-crossing elements and partial EXEC):
+    - A buffer load whose format comes from a descriptor the shader reads at run time converted the element in a switch over all 128 formats at every such load (about 130 per shader). The conversion is now one function of the module that every load calls, its field extraction and number conversion in separate switches whose formats with the same layout or kind share one case (`RPS5E_FORMAT_FUNCTION`, `RPS5E_FORMAT_SWITCH_SPLIT`).
+    - The dwords of such an element that cross a page of guest memory are loaded with two address translations and one branch, instead of a translation and a branch per dword (`RPS5E_SPAN_TWO_PAGES`).
+    - An M0-relative VGPR read (`v_movrels`) is one indexed read of the register window instead of a compare and a select per register, and a relative write (`v_movreld`) applies EXEC once instead of per register (`RPS5E_RELATIVE_PICK`): shaders that keep a stack in VGPRs indexed by M0 have about half the selects.
+
 ## [0.1.6-alpha] - 2026-11-12
 
 ### Fixed

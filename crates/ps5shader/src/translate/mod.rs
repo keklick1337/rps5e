@@ -303,6 +303,17 @@ impl TranslateOptions {
 /// v_madak_f32, v_madmk_f32) do not support denormals: they flush inputs,
 /// product and result in every mode (LLVM forms them only with f32
 /// denormals flushed and ACO switches to v_fma_f32 when they are kept).
+/// `RPS5E_RELATIVE_PICK=0`: an M0-relative VGPR read selects among the
+/// window's registers with one compare and select per register, and a
+/// relative write masks every register with EXEC (the older form). On
+/// (default) a read is one [`crate::ssa::Op::Pick`] over the window and a
+/// write applies EXEC once; programs that keep a stack in VGPRs indexed by
+/// M0 translate to several times smaller modules.
+pub fn relative_pick_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_RELATIVE_PICK").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
 pub fn f32_denormal_flush(op: Opcode, mode: FloatMode) -> u32 {
     f32_denormal_flush_with(op, mode, float_rules::ALL)
 }

@@ -87,6 +87,10 @@ pub fn translator_stamp(features: &super::Features) -> u64 {
     features.amd_proprietary.hash(&mut h);
     features.emit.hash(&mut h);
     super::exec_run_minimum().hash(&mut h);
+    ps5shader::translate::relative_pick_enabled().hash(&mut h);
+    super::memory::format_switch_split().hash(&mut h);
+    super::memory::format_function_enabled().hash(&mut h);
+    super::memory::span_two_pages_enabled().hash(&mut h);
     super::storage_resinfo_mips_enabled().hash(&mut h);
     super::float_rules().hash(&mut h);
     super::log_series_enabled().hash(&mut h);

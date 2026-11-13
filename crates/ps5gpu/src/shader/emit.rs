@@ -1084,6 +1084,43 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.b.phi(ty, None, incoming).unwrap()
     }
 
+    /// [`Self::switch_value`] where the cases with the same `key` share one
+    /// body: `f` runs once per distinct key (for its first selector) and
+    /// must give the same value for every selector with that key. Any
+    /// other selector takes case 0's body.
+    pub fn switch_value_shared<K: Eq + std::hash::Hash>(&mut self, sel: Word, count: u32, ty: Word, key: impl Fn(u32) -> K, mut f: impl FnMut(&mut Self, u32) -> Word) -> Word {
+        let merge = self.b.id();
+        let mut group_of: HashMap<K, usize> = HashMap::new();
+        // (label, first selector) per group, in selector order.
+        let mut groups: Vec<(Word, u32)> = Vec::new();
+        let mut label_of = Vec::with_capacity(count as usize);
+        for k in 0..count {
+            let g = *group_of.entry(key(k)).or_insert_with(|| {
+                groups.push((self.b.id(), k));
+                groups.len() - 1
+            });
+            label_of.push(groups[g].0);
+        }
+        self.b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+        let default = label_of[0];
+        let targets: Vec<(Operand, Word)> = (1..count).filter(|&k| label_of[k as usize] != default).map(|k| (Operand::LiteralBit32(k), label_of[k as usize])).collect();
+        self.b.switch(sel, default, targets).unwrap();
+        let mut incoming = Vec::new();
+        for &(label, k) in &groups {
+            self.begin(label);
+            self.cse_scope_enter();
+            let v = f(self, k);
+            self.cse_scope_exit();
+            incoming.push((v, self.cur_label));
+            self.b.branch(merge).unwrap();
+        }
+        self.begin(merge);
+        if incoming.len() == 1 {
+            return incoming[0].0;
+        }
+        self.b.phi(ty, None, incoming).unwrap()
+    }
+
     /// `switch (sel) { case k: f(k) }` for `k < count`; any other selector
     /// does nothing.
     pub fn switch_then(&mut self, sel: Word, count: u32, mut f: impl FnMut(&mut Self, u32)) {
@@ -1179,10 +1216,37 @@ impl<'a, 'p> Emitter<'a, 'p> {
         }
         self.patch_phis()?;
         self.b.end_function().map_err(|e| format!("{e:?}"))?;
+        super::memory::emit_format_functions(self)?;
         if self.mesh.is_some() {
             self.entry = super::mesh::emit_entry(self, self.main)?;
         }
         Ok(())
+    }
+
+    /// Define function `id` (`ret (params)`) after the entry function:
+    /// `body` gets its parameters and returns the value it returns. Values
+    /// of other functions are out of reach, so instruction reuse is off
+    /// while it is emitted.
+    pub(super) fn define_function(&mut self, id: Word, ret: Word, params: &[Word], body: impl FnOnce(&mut Self, &[Word]) -> R<Word>) -> R<()> {
+        let fnty = self.b.type_function(ret, params.to_vec());
+        self.b.begin_function(ret, Some(id), spirv::FunctionControl::DONT_INLINE, fnty).map_err(|e| format!("{e:?}"))?;
+        let args = params.iter().map(|&t| self.b.function_parameter(t).map_err(|e| format!("{e:?}"))).collect::<R<Vec<_>>>()?;
+        let entry = self.b.id();
+        self.begin(entry);
+        let saved_label = self.cse_label;
+        self.cse_off += 1;
+        let r = body(self, &args);
+        self.cse_off -= 1;
+        self.cse_label = saved_label;
+        let v = r?;
+        self.b.ret_value(v).map_err(|e| format!("{e:?}"))?;
+        self.b.end_function().map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    }
+
+    /// `OpFunctionCall` of function `id` returning `ret`.
+    pub(super) fn call(&mut self, ret: Word, id: Word, args: &[Word]) -> Word {
+        self.b.function_call(ret, None, id, args.to_vec()).expect("function call")
     }
 
     fn prologue_init(&mut self) -> R<()> {
@@ -1511,6 +1575,12 @@ impl<'a, 'p> Emitter<'a, 'p> {
                 let t = self.ty(ty);
                 let parts = (0..d.args.len()).map(|i| self.arg(v, i)).collect::<R<Vec<_>>>()?;
                 self.construct(t, &parts)
+            }
+            Op::Pick => {
+                let t = self.ty(ty);
+                let index = self.arg(v, 0)?;
+                let parts = (1..d.args.len()).map(|i| self.arg(v, i)).collect::<R<Vec<_>>>()?;
+                self.pick(t, index, &parts)
             }
             Op::Extract(i) => {
                 let t = self.ty(ty);
