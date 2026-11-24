@@ -513,6 +513,7 @@ mod tests {
     /// measured on a PS5).
     #[test]
     fn param_get_string_errors_and_padding() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A6E_0000_0000;
         let base = BASE;
@@ -546,6 +547,7 @@ mod tests {
     /// answered with the firmware's fixed results.
     #[test]
     fn player_dialog_param_and_firmware_answers() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A6F_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -627,6 +629,7 @@ mod tests {
 
     #[test]
     fn load_exec_rejects_other_executables() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         use crate::context::CpuRegister::*;
         let root = crate::filesystem::tests::temp_root("load-exec");
         std::fs::write(root.join("other.elf"), b"ELF").unwrap();
@@ -666,6 +669,7 @@ mod tests {
 
     #[test]
     fn web_browser_is_unavailable() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A6D_0010_0000;
@@ -684,6 +688,7 @@ mod tests {
 
     #[test]
     fn entitlement_events_from_app_content_init() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C80_0000_0000;
@@ -744,6 +749,7 @@ mod tests {
 
     #[test]
     fn params_status_and_display_info() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4001000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D40_0100_0000;

@@ -398,6 +398,7 @@ pub(crate) mod tests {
 
     #[test]
     fn contexts_and_decoders() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ea000000000);
         let mut ctx = CpuContext::new(crate::sync::test_util::vm_arena(BASE));
         let (context, other, state, state2) = (BASE, BASE + 4, BASE + 0x1000, BASE + 0x2000);
         assert_eq!(call(&mut ctx, cb_initialize, &[0]), OPUSDEC_ERROR_INVALID_ARGUMENT);
@@ -455,6 +456,7 @@ pub(crate) mod tests {
     /// the float output is the S16 samples over 32768 (four bytes each).
     #[test]
     fn priority_and_float_variants() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ea000000000);
         let mut ctx = CpuContext::new(crate::sync::test_util::vm_arena(BASE + 0x50_0000));
         let b = BASE + 0x50_0000;
         let (context, state, reference_state, data, pcm, reference) = (b, b + 0x100, b + 0x400, b + 0x1000, b + 0x2000, b + 0x6000);
@@ -503,6 +505,7 @@ pub(crate) mod tests {
     /// Three stereo 20 ms packets, each prefixed with its 16-bit length.
     #[test]
     fn decodes_stereo_and_mono_packets() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ea000000000);
         if !cfg!(ps5_ffmpeg) {
             return;
         }

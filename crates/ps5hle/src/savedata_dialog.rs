@@ -325,6 +325,7 @@ mod tests {
 
     #[test]
     fn reference_status_polling() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3600000000);
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -346,6 +347,7 @@ mod tests {
     /// State errors and the progress bar, which runs until Close.
     #[test]
     fn states_and_progress_bar() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3600000000);
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D47_0300_0000;
@@ -382,6 +384,7 @@ mod tests {
 
     #[test]
     fn result_reports_mode_user_data_and_dir_name() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3600000000);
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D36_0000_0000;

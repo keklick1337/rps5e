@@ -196,6 +196,7 @@ mod tests {
 
     #[test]
     fn unload_internal_with_arg() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa700000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A7E_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -277,6 +278,7 @@ mod tests {
     /// time; a module without a kernel image or id 0 is refused.
     #[test]
     fn module_handle_internal() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa700000000);
         const RUDP: u32 = 0x0021;
         let find = |name: &str| (name == "libSceRudp.prx").then_some(42);
         assert_eq!(module_handle(RUDP, find), Err(ERR_UNLOADED));

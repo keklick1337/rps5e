@@ -950,6 +950,7 @@ mod tests {
     /// Reference GuestStrings strcasestr cases.
     #[test]
     fn strcasestr_cases() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1200300000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E12_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -975,6 +976,7 @@ mod tests {
     /// isatty on files, sockets and closed descriptors.
     #[test]
     fn mkstemp_and_isatty() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1200300000);
         let vm: &'static ps5vm::VirtualMemory = Box::leak(Box::new(ps5vm::VirtualMemory::new()));
         const BASE: u64 = 0x5E12_0010_0000;
         vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();
@@ -1093,6 +1095,7 @@ mod tests {
 
     #[test]
     fn resolver_guest_calls() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1200300000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E12_0020_0000;
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
@@ -1151,6 +1154,7 @@ mod tests {
 
     #[test]
     fn services() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1200300000);
         assert_eq!(find_service(b"www", Some(b"udp")).map(|s| (s.0, s.1, s.2)), Some(("http", 80, "udp")));
         assert_eq!(find_service(b"https", None).map(|s| (s.1, s.2)), Some((443, "tcp")));
         assert!(find_service(b"https", Some(b"xyz")).is_none());

@@ -677,6 +677,7 @@ mod tests {
     /// Parameter checks of the authorization calls and what they write.
     #[test]
     fn authorization_calls() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4309000000);
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_runtime_state();
         let vm = ps5vm::VirtualMemory::new();
@@ -747,6 +748,7 @@ mod tests {
 
     #[test]
     fn async_requests() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4309000000);
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_runtime_state();
         let vm = ps5vm::VirtualMemory::new();
@@ -836,6 +838,7 @@ mod tests {
 
     #[test]
     fn authorized_app_dialog() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4309000000);
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset_runtime_state();
         let vm = ps5vm::VirtualMemory::new();

@@ -33,3 +33,17 @@ fn test_scratch_bases_are_unique() {
     let dups: Vec<_> = bases.iter().filter(|(_, v)| v.len() > 1).collect();
     assert!(dups.is_empty(), "test BASE addresses shared between tests: {dups:#x?}");
 }
+
+/// Serialises the tests of one module that share the scratch memory at
+/// `base` (a module `const BASE` several tests map): held for the whole
+/// test, so they take turns while tests on other bases run in parallel.
+pub(crate) fn scratch_lock(base: u64) -> std::sync::MutexGuard<'static, ()> {
+    static LOCKS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, &'static std::sync::Mutex<()>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let lock = *LOCKS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(base)
+        .or_insert_with(|| Box::leak(Box::new(std::sync::Mutex::new(()))));
+    lock.lock().unwrap_or_else(|p| p.into_inner())
+}

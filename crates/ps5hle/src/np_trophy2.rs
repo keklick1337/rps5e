@@ -743,6 +743,7 @@ mod tests {
 
     #[test]
     fn guest_entry_points() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d2100000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);
@@ -789,6 +790,7 @@ mod tests {
 
     #[test]
     fn info_array_writes_strided_entries() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d2100000000);
         // Drive the array writer with a fixed service via the shared helper.
         let (mut s, dir) = fixture("array", PLAT_CONF, PLAT_META);
         let c = s.create_context(1, 0, 0).unwrap();

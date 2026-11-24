@@ -413,6 +413,7 @@ fn channel_gains() {
 
 #[test]
 fn zero_output_frequency() {
+    let _scratch = crate::test_bases::scratch_lock(0x5c4000000000);
     let vm = crate::sync::test_util::vm_arena(BASE);
     let mut ctx = CpuContext::new(vm);
     // sceAudioOutOpen(user 0, type 0, index 0, 256 frames, 0 Hz, float stereo)
@@ -440,6 +441,7 @@ fn invalid_batch_size() {
 
 #[test]
 fn public_port_lifecycle() {
+    let _scratch = crate::test_bases::scratch_lock(0x5c4000000000);
     let vm = crate::sync::test_util::vm_arena(BASE + 0x20_0000);
     let base = BASE + 0x20_0000;
     let mut ctx = CpuContext::new(vm);

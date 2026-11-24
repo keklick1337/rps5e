@@ -250,6 +250,7 @@ mod tests {
 
     #[test]
     fn encode_then_decode_round_trip() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C03_0000_0000;
         vm.map(BASE, 0x20000, ps5vm::MemProtect::RW).unwrap();
@@ -428,6 +429,7 @@ mod tests {
     /// The encoder tests share one scratch mapping, so they run as one test.
     #[test]
     fn encoder_reference_suite() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9000000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
         encoder_pixels(&vm);

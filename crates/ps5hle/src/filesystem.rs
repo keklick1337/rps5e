@@ -5461,6 +5461,7 @@ pub(crate) mod tests {
     /// results, cached sizes and PATH_MAX limits.
     #[test]
     fn apr_paths() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6b00000000);
         let root = temp_root("apr-paths");
         fs::write(root.join("apr.dat"), b"APR").unwrap();
         let _app0 = APP0_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -5628,6 +5629,7 @@ pub(crate) mod tests {
     /// getdents, read-only /app0, writable /temp0, AIO and APR resolve.
     #[test]
     fn random_devices() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6b00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A71_0000_0000;
@@ -5679,6 +5681,7 @@ pub(crate) mod tests {
     /// invalid descriptors with EBADF.
     #[test]
     fn file_descriptor_flags() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6b00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C61_0000_0000;
@@ -5728,6 +5731,7 @@ pub(crate) mod tests {
 
     #[test]
     fn end_to_end_exports() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6b00000000);
         let root = temp_root("e2e");
         let game = root.join("game");
         fs::create_dir_all(game.join("sce_sys")).unwrap();
@@ -5774,6 +5778,9 @@ pub(crate) mod tests {
         assert_eq!(&ctx.read_bytes(buf, 5).unwrap(), b"world");
         set(&mut ctx, &[fd as u64]);
         assert_eq!(cb_sce_close(&mut ctx), 0);
+        // A second close of a closed number: checked on a number nothing
+        // holds (a test running alongside may own the one just closed).
+        set(&mut ctx, &[0x7FFF_0000]);
         assert_eq!(cb_sce_close(&mut ctx), sce_error(EBADF));
 
         // /app0 is read-only; unknown absolute paths are denied
@@ -5968,6 +5975,7 @@ pub(crate) mod tests {
 
     #[test]
     fn package_image_at_app0() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6b00000000);
         let _app0 = APP0_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let root = temp_root("pkgimg");
         std::env::set_var("RPS5E_DATA_DIR", root.join("user"));

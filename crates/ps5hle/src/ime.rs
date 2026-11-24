@@ -1076,6 +1076,7 @@ mod tests {
 
     #[test]
     fn ime_session_events_and_filter() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3200000000);
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -1160,6 +1161,7 @@ mod tests {
 
     #[test]
     fn keyboard_never_connects() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3200000000);
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D32_0000_0000;

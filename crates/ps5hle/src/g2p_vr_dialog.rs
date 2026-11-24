@@ -213,6 +213,7 @@ mod tests {
 
     #[test]
     fn g2p_dialog_finishes_canceled() {
+        let _scratch = crate::test_bases::scratch_lock(0x6a1a00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x6A19_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -228,6 +229,7 @@ mod tests {
 
     #[test]
     fn vr_setup_dialog_finishes_canceled() {
+        let _scratch = crate::test_bases::scratch_lock(0x6a1a00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x6A1A_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

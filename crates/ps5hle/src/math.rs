@@ -902,6 +902,7 @@ mod tests {
     /// nan and nanf give the positive default quiet NaN for any tag.
     #[test]
     fn nan_ignores_the_tag() {
+        let _scratch = crate::test_bases::scratch_lock(0x7c6400000000);
         const BASE: u64 = 0x7B34_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
@@ -1273,6 +1274,7 @@ mod tests {
 
     #[test]
     fn sincos_writes_through_rdi_and_rsi() {
+        let _scratch = crate::test_bases::scratch_lock(0x7c6400000000);
         const BASE: u64 = 0x7B33_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
@@ -1323,6 +1325,7 @@ mod tests {
     /// NaN (reference cases, extended-precision bits).
     #[test]
     fn long_double_acosl_and_frexpl() {
+        let _scratch = crate::test_bases::scratch_lock(0x7c6400000000);
         const BASE: u64 = 0x7C64_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();

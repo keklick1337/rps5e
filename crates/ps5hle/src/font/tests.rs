@@ -168,6 +168,7 @@ fn open_font(ctx: &mut CpuContext) -> (u64, u64) {
 
 #[test]
 fn metrics_layout_and_render() {
+    let _scratch = crate::test_bases::scratch_lock(0x7c6300000000);
     let vm = ps5vm::VirtualMemory::new();
     vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
     let mut ctx = CpuContext::new(&vm);
@@ -548,6 +549,7 @@ mod extended {
     // they run as one test.
     #[test]
     fn extended_exports() {
+        let _scratch = crate::test_bases::scratch_lock(0x7c6300000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, SIZE, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);
@@ -944,6 +946,7 @@ mod writing_line {
 
     #[test]
     fn writing_line_orders_levels_and_spacing() {
+        let _scratch = crate::test_bases::scratch_lock(0x7c6300000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);

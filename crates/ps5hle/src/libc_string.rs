@@ -1188,6 +1188,7 @@ mod tests {
     /// the truncated text and ERANGE; strerror_r never touches errno.
     #[test]
     fn strerror_uses_the_freebsd_errlist() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         std::thread::spawn(|| {
             let vm: &'static ps5vm::VirtualMemory = Box::leak(Box::new(ps5vm::VirtualMemory::new()));
             const BASE: u64 = 0x6A10_0000_0000;
@@ -1253,6 +1254,7 @@ mod tests {
     /// start of a mapping never reads before it.
     #[test]
     fn memrchr_finds_the_last_match() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7C40_0000_0000;
         vm.map(BASE, 0x3000, ps5vm::MemProtect::RW).unwrap();
@@ -1283,6 +1285,7 @@ mod tests {
     /// last token (reference checks).
     #[test]
     fn strsep_splits_at_each_delimiter() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7C41_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1330,6 +1333,7 @@ mod tests {
     /// path is left as it was; 1024 bytes or more is ENAMETOOLONG.
     #[test]
     fn dirname_separator_and_boundary_cases() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         std::thread::spawn(|| {
             let vm: &'static ps5vm::VirtualMemory = Box::leak(Box::new(ps5vm::VirtualMemory::new()));
             const BASE: u64 = 0x7C42_0000_0000;
@@ -1387,6 +1391,7 @@ mod tests {
     /// larger (reference checks).
     #[test]
     fn memset_s_errors_follow_freebsd() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7C43_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1418,6 +1423,7 @@ mod tests {
     /// reassigns it (reference checks).
     #[test]
     fn getprogname_reads_the_progname_symbol() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7C44_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1449,6 +1455,7 @@ mod tests {
 
     #[test]
     fn narrow_helpers() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5DA0_0000_0000;
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
@@ -1496,6 +1503,7 @@ mod tests {
 
     #[test]
     fn stpcpy_returns_the_end_of_the_copy() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E63_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1522,6 +1530,7 @@ mod tests {
     /// FreeBSD inet_aton / inet_addr / inet_ntoa.
     #[test]
     fn inet_text_conversions() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let dotted_of = |text: &str| inet_aton_freebsd(text.as_bytes()).map(|a| {
             let b = a.to_be_bytes();
             format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
@@ -1595,6 +1604,7 @@ mod tests {
     /// message without a facility goes to LOG_USER.
     #[test]
     fn syslog_lines_follow_freebsd_vsyslog() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         struct Args(Vec<u64>);
         impl crate::printf::ArgSource for Args {
             fn next_gp(&mut self) -> u64 {
@@ -1690,6 +1700,7 @@ mod tests {
     /// wcsrtombs converts guest (16-bit) units in the C locale.
     #[test]
     fn wcsrtombs_converts_guest_units() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E66_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1793,6 +1804,7 @@ mod tests {
     /// wcstombs_s / wcsrtombs_s.
     #[test]
     fn wcstombs_s_bounds_and_errors() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         use crate::context::CpuRegister::R8;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F80_0000_0000;
@@ -1851,6 +1863,7 @@ mod tests {
     /// _WStoul over the ASCII prefix.
     #[test]
     fn wstoul_reads_the_ascii_prefix() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F81_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1887,6 +1900,7 @@ mod tests {
 
     #[test]
     fn wide_helpers() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da100000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5DA1_0000_0000;
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();

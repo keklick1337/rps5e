@@ -1922,6 +1922,7 @@ mod tests {
 
     #[test]
     fn get_info_and_privilege() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c8200000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FA4_0000_0000;
@@ -2316,6 +2317,7 @@ mod tests {
     /// the Kana LED changes nothing; both arrangements convert.
     #[test]
     fn keyboard_key2char_contract() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c8200000000);
         use crate::CpuRegister::{Rcx, Rdi, Rdx, Rsi, R8, R9};
         const BASE: u64 = 0x5C82_0100_0000;
         const SHIFT: u32 = 0x02;
@@ -2377,6 +2379,7 @@ mod tests {
 
     #[test]
     fn trigger_effect_state_argument_checks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c8200000000);
         const BASE: u64 = 0x5C82_0000_0000;
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();

@@ -241,6 +241,7 @@ mod tests {
 
     #[test]
     fn share_calls() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4006000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A5F_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -279,6 +280,7 @@ mod tests {
 
     #[test]
     fn share_play_lifecycle() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4006000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D40_0600_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

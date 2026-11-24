@@ -1704,6 +1704,7 @@ mod tests {
     /// 1970 is INVALID_VALUE.
     #[test]
     fn process_clock_setters() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D88_4000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1729,6 +1730,7 @@ mod tests {
 
     #[test]
     fn guest_tick_functions() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D88_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1946,6 +1948,7 @@ mod tests {
     /// most; a failed format leaves the buffer untouched.
     #[test]
     fn format_callbacks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FA5_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -2100,6 +2103,7 @@ mod tests {
     /// parse error.
     #[test]
     fn parse_date_time_callback() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FA6_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

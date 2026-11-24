@@ -423,6 +423,7 @@ mod tests {
     /// sceKernelOpenEventFlag finds a live flag by its exact name.
     #[test]
     fn open_by_name() {
+        let _scratch = crate::test_bases::scratch_lock(0x7b3000000000);
         const BASE: u64 = 0x7B3A_5000_0000;
         let vm = vm_arena(BASE);
         let mut ctx = CpuContext::new(vm);
@@ -445,6 +446,7 @@ mod tests {
 
     #[test]
     fn zero_timeout_sleeps_one_tick() {
+        let _scratch = crate::test_bases::scratch_lock(0x7b3000000000);
         const BASE: u64 = 0x7B31_0000_0000;
         let vm = vm_arena(BASE);
         let mut ctx = CpuContext::new(vm);
@@ -571,6 +573,7 @@ mod tests {
 
     #[test]
     fn wait_callback_writes_result_and_timeout() {
+        let _scratch = crate::test_bases::scratch_lock(0x7b3000000000);
         const BASE: u64 = 0x7B30_0000_0000;
         let vm = vm_arena(BASE);
         let mut ctx = CpuContext::new(vm);

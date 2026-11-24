@@ -334,6 +334,7 @@ mod tests {
     /// rbp ends the walk.
     #[test]
     fn backtrace_follows_frame_pointers() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E80_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -361,6 +362,7 @@ mod tests {
     /// it and returns.
     #[test]
     fn backtrace_name_is_bounded() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E81_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -380,6 +382,7 @@ mod tests {
     /// and unknown ids are refused.
     #[test]
     fn video_recording_info_round_trip() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E82_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -427,6 +430,7 @@ mod tests {
 
     #[test]
     fn random_limits() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a6000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A60_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

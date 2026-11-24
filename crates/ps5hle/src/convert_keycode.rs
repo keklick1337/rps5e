@@ -171,6 +171,7 @@ mod tests {
     /// layouts); the US layout maps keys to Windows-style virtual keys.
     #[test]
     fn virtual_keycodes_and_validation() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4603000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A6A_0100_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -218,6 +219,7 @@ mod tests {
 
     #[test]
     fn keyboard_type() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4603000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A6A_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -233,6 +235,7 @@ mod tests {
 
     #[test]
     fn us_characters() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d4603000000);
         let expect = [(0x04, 'a'), (0x1D, 'z'), (0x1E, '1'), (0x26, '9'), (0x27, '0'), (0x2C, ' '), (0x2D, '-'), (0x31, '\\'), (0x33, ';'), (0x38, '/'), (0x54, '/'), (0x59, '1'), (0x62, '0'), (0x63, '.'), (0x64, '\\')];
         for (key, c) in expect {
             assert_eq!(us_character(key), c as u16, "keycode {key:#x}");

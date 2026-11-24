@@ -383,6 +383,7 @@ mod tests {
     /// GuestUserService cases measured on a PS5).
     #[test]
     fn initialize_priority_and_lifecycle() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa800000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A70_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -455,6 +456,7 @@ mod tests {
     /// cleared and refused; a name fills the rest of the buffer with zeros.
     #[test]
     fn user_name_buffer() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa800000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D43_0300_0000;
@@ -482,6 +484,7 @@ mod tests {
 
     #[test]
     fn settings_presets_and_user_number() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa800000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D40_0200_0000;
@@ -523,6 +526,7 @@ mod tests {
     /// list, color and account id of the first local user.
     #[test]
     fn foreground_registered_color_account() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fa800000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FA8_0000_0000;

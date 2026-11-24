@@ -713,6 +713,7 @@ mod tests {
     /// only needs a value.
     #[test]
     fn internal_initializers_and_trace_tag() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0e00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D44_0900_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -796,6 +797,7 @@ mod tests {
 
     #[test]
     fn requests_and_push_contexts_offline() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0e00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C0E_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

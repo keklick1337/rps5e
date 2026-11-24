@@ -487,6 +487,7 @@ mod tests {
 
     #[test]
     fn msg_dialog_finishes_on_open() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3400000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D33_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -510,6 +511,7 @@ mod tests {
 
     #[test]
     fn error_dialog_state_machine() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d3400000000);
         let _g = SYSTEM_DIALOG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D34_0000_0000;

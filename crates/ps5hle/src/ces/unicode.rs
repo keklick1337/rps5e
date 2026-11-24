@@ -381,6 +381,7 @@ mod tests {
     /// Unicode scalars, and the error order of every conversion.
     #[test]
     fn unicode_scalar_conversions() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5a00000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);
@@ -507,6 +508,7 @@ mod tests {
     /// katakana; the three-byte JIS X 0212 form is not decoded here).
     #[test]
     fn euc_jp_to_utf8() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5a00000000);
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);

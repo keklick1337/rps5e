@@ -56,6 +56,13 @@ impl Drop for Fixture {
     }
 }
 
+/// A descriptor number nothing ever holds. The descriptor table is
+/// process-wide and a closed number is handed out again at once (the lowest
+/// free one, as on the console), so a test running alongside may own a
+/// number this test just closed: checks of a closed descriptor use this
+/// number, never one the test closed.
+const NEVER_OPEN: u64 = 0x7FFF_0000;
+
 fn call(ctx: &mut CpuContext, cb: HleCallback, args: &[u64]) -> HleResult {
     use CpuRegister::*;
     for (r, v) in [Rdi, Rsi, Rdx, Rcx, R8, R9].iter().zip(args) {
@@ -201,7 +208,7 @@ fn directory_stream_semantics() {
     assert_eq!(call(&mut ctx, cb_sce_read, &[fd, block, i32::MAX as u64 + 1]), sce_error(EINVAL), "oversized read");
     assert_eq!(call(&mut ctx, cb_sce_lseek, &[fd, 0, SEEK_CUR as u64]), end + 512);
     assert_eq!(call(&mut ctx, cb_sce_close, &[fd]), 0);
-    assert_eq!(call(&mut ctx, cb_sce_lseek, &[fd, 0, SEEK_SET as u64]), sce_error(EBADF));
+    assert_eq!(call(&mut ctx, cb_sce_lseek, &[NEVER_OPEN, 0, SEEK_SET as u64]), sce_error(EBADF));
 }
 
 #[test]
@@ -672,7 +679,7 @@ fn ioctl_fionread_and_fionbio() {
     assert_eq!(call(&mut ctx, cb_posix_read, &[server as u64, data, 8]), -1);
     assert_eq!(ctx.read_u32(errno), Some(35), "EAGAIN once non-blocking");
     assert_eq!(call(&mut ctx, cb_sce_close, &[server as u64]), 0);
-    assert_eq!(call(&mut ctx, cb_posix_ioctl, &[server as u64, FIONREAD as u64, out]), -1);
+    assert_eq!(call(&mut ctx, cb_posix_ioctl, &[NEVER_OPEN, FIONREAD as u64, out]), -1);
     assert_eq!(ctx.read_u32(errno), Some(9));
     assert_eq!(call(&mut ctx, cb_sce_close, &[client as u64]), 0);
     // A file: the bytes after the position.
@@ -1380,17 +1387,16 @@ fn kernel_socket_descriptors() {
     }
     assert_eq!(written, sce_error(32), "EPIPE without a peer");
     assert_eq!(call(&mut ctx, cb_sce_close, &[a]), 0);
-    // A closed number is free again: a test running alongside may have
-    // opened something on it meanwhile.
-    let closed = |r: FsResult<i64>, fd: i32| r == Err(EBADF) || (descriptor_open(fd) && !crate::net::is_kernel_socket(fd));
-    for fd in [a as i32, b as i32] {
-        assert!(closed(read_core(&ctx, fd, inb, 32), fd));
-        assert!(closed(read_core(&ctx, fd, inb, 0), fd), "zero-length read of a closed descriptor");
-        assert!(closed(write_core(&ctx, fd, out, 20), fd));
-        assert!(closed(fdatasync_core(fd), fd));
-        assert!(closed(fchmod_core(fd, 0o600), fd));
-        assert!(closed(fstatfs_core(&ctx, fd, fsbuf), fd));
-    }
+    // Calls on a closed number are EBADF (checked on a number nothing
+    // holds: a test running alongside may already own the numbers just
+    // closed).
+    let fd = NEVER_OPEN as i32;
+    assert_eq!(read_core(&ctx, fd, inb, 32), Err(EBADF));
+    assert_eq!(read_core(&ctx, fd, inb, 0), Err(EBADF), "zero-length read of a closed descriptor");
+    assert_eq!(write_core(&ctx, fd, out, 20), Err(EBADF));
+    assert_eq!(fdatasync_core(fd), Err(EBADF));
+    assert_eq!(fchmod_core(fd, 0o600), Err(EBADF));
+    assert_eq!(fstatfs_core(&ctx, fd, fsbuf), Err(EBADF));
     assert_eq!(call(&mut ctx, cb_sce_fdatasync, &[0x7fff_ffff]), sce_error(EBADF));
     assert_eq!(call(&mut ctx, cb_posix_read, &[0x7fff_ffff, inb, 0]), -1);
 
@@ -1517,9 +1523,9 @@ fn getdents_posix_exports() {
     assert_eq!(ctx.read_bytes(other, whole as usize), ctx.read_bytes(buf, whole as usize));
     assert_eq!(call(&mut ctx, cb_posix_getdents, &[fd, other, 4096]), 0, "end of the stream");
     assert_eq!(call(&mut ctx, cb_sce_close, &[fd]), 0);
-    assert_eq!(call(&mut ctx, cb_posix_getdents, &[fd, buf, 4096]), -1);
-    assert_eq!(getdirentries_core(&ctx, fd as i32, buf, 4096, 0), Err(EBADF));
-    assert_eq!(call(&mut ctx, cb_posix_getdirentries, &[fd, buf, 4096, 0]), -1);
+    assert_eq!(call(&mut ctx, cb_posix_getdents, &[NEVER_OPEN, buf, 4096]), -1);
+    assert_eq!(getdirentries_core(&ctx, NEVER_OPEN as i32, buf, 4096, 0), Err(EBADF));
+    assert_eq!(call(&mut ctx, cb_posix_getdirentries, &[NEVER_OPEN, buf, 4096, 0]), -1);
 }
 
 /// _fstatfs: the host volume of files and directories in the FreeBSD
@@ -1554,9 +1560,9 @@ fn fstatfs_reports_the_volume() {
     assert_eq!(fstatfs_core(&ctx, file as i32, 0), Err(EFAULT));
     assert_eq!(call(&mut ctx, cb_sce_close, &[file]), 0);
     ctx.write_bytes(buf, &[0x5a; KERNEL_STATFS_SIZE]);
-    assert_eq!(fstatfs_core(&ctx, file as i32, buf), Err(EBADF));
+    assert_eq!(fstatfs_core(&ctx, NEVER_OPEN as i32, buf), Err(EBADF));
     assert_eq!(fstatfs_core(&ctx, -1, buf), Err(EBADF));
-    assert_eq!(call(&mut ctx, cb_posix_fstatfs, &[file, buf]), -1);
+    assert_eq!(call(&mut ctx, cb_posix_fstatfs, &[NEVER_OPEN, buf]), -1);
     assert!(ctx.read_bytes(buf, KERNEL_STATFS_SIZE).unwrap().iter().all(|&b| b == 0x5a), "untouched on failure");
     assert_eq!(call(&mut ctx, cb_sce_close, &[dir]), 0);
     // fstatfs (libkernel_sys) is the same call as _fstatfs.
@@ -1569,6 +1575,7 @@ fn fstatfs_reports_the_volume() {
 /// O_EXCL, O_TRUNC, per-open access), with the accepted flag set enforced.
 #[test]
 fn shm_open_objects() {
+    let _scratch = crate::test_bases::scratch_lock(0x5ced00000000);
     const BASE: u64 = 0x5CEE_0000_0000;
     let vm: &'static VirtualMemory = Box::leak(Box::new(VirtualMemory::new()));
     vm.map(BASE, 0x10000, MemProtect::RW).unwrap();
@@ -1629,6 +1636,7 @@ fn shm_open_objects() {
 /// and thread; nothing is mounted under it.
 #[test]
 fn sandbox_random_word() {
+    let _scratch = crate::test_bases::scratch_lock(0x5ced00000000);
     const BASE: u64 = 0x5CED_0000_0000;
     let vm: &'static VirtualMemory = Box::leak(Box::new(VirtualMemory::new()));
     vm.map(BASE, 0x1000, MemProtect::RW).unwrap();

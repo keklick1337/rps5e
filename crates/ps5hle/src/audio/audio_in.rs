@@ -225,8 +225,17 @@ pub(crate) static EXPORTS: &[Export] = &[
 mod tests {
     use super::*;
 
+    /// The port table is process-wide and a closed port's handle is free
+    /// at once: tests that open ports or check closed handles run one at a
+    /// time, or one could take the handle another just closed.
+    fn ports_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn open_validation() {
+        let _ports = ports_lock();
         assert_eq!(validate_open(0, 0, 256, 16000, 1, false), Ok(2));
         assert_eq!(validate_open(1, 0, 128, 48000, 0x12, true), Ok(8));
         assert_eq!(validate_open(2, 0, 256, 48000, 1, false), Err(AUDIO_IN_ERROR_INVALID_TYPE));
@@ -249,6 +258,8 @@ mod tests {
     /// A 384-frame float stereo grain is all silence.
     #[test]
     fn async_open_delivers_a_384_frame_grain() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ce600000000);
+        let _ports = ports_lock();
         use crate::context::CpuRegister;
         const BASE: u64 = 0x5B01_0000_0000;
         let vm = crate::sync::test_util::vm_arena(BASE);
@@ -273,6 +284,8 @@ mod tests {
 
     #[test]
     fn busy_port_and_silence() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ce600000000);
+        let _ports = ports_lock();
         use crate::context::CpuRegister;
         const BASE: u64 = 0x5CE6_0000_0000;
         let vm = crate::sync::test_util::vm_arena(BASE);

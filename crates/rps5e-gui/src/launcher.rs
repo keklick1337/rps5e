@@ -508,14 +508,15 @@ mod tests {
         let st = r.child.wait().unwrap();
         r.exit = Some(st);
         assert_eq!(st.code(), Some(3));
-        // Reader threads may lag behind the exit.
-        for _ in 0..100 {
-            if log.lock().unwrap().lines.len() >= 3 {
+        // Reader threads may lag behind the exit, each stream on its own.
+        let mut text = String::new();
+        for _ in 0..500 {
+            text = log.lock().unwrap().text();
+            if text.contains("out-line") && text.contains("err-line") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        let text = log.lock().unwrap().text();
         assert!(text.contains("out-line") && text.contains("err-line"), "{text}");
         // The run's log file has the child's output too.
         let mut file = String::new();

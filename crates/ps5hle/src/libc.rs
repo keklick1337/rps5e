@@ -1802,6 +1802,7 @@ mod tests {
     /// (the native libc writes slot 64 too); the second u32 is cleared.
     #[test]
     fn heap_trace_info_table() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C27_4000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1821,6 +1822,7 @@ mod tests {
 
     #[test]
     fn string_functions_at_end_of_mapping() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C27_0000_0000;
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
@@ -1950,6 +1952,7 @@ mod tests {
     /// "0b101" reads "0" and stops at the 'b'.
     #[test]
     fn strtol_family_stops_at_a_binary_prefix() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D57_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -2008,6 +2011,7 @@ mod tests {
     /// formats return -1.
     #[test]
     fn swprintf_formats_16_bit_units() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         use crate::context::CpuRegister::{Rcx, Rsp, R8, R9};
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E62_0000_0000;
@@ -2126,6 +2130,7 @@ mod tests {
     /// and tm_zone "UTC" from the day count for any year that fits an int.
     #[test]
     fn gmtime_writes_the_56_byte_guest_tm() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D58_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -2180,6 +2185,7 @@ mod tests {
     /// the whole text and the terminator failing.
     #[test]
     fn strftime_formats_console_conversions() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7C45_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -2276,6 +2282,7 @@ mod tests {
     /// question-mark text and EINVAL.
     #[test]
     fn ctime_formats_like_asctime() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let epoch = utc_calendar(0).unwrap();
         assert_eq!(asctime_text(&epoch), "Thu Jan  1 00:00:00 1970\n");
         let leap = utc_calendar(951_782_400 + 13 * 3600 + 4 * 60 + 5).unwrap();
@@ -2308,6 +2315,7 @@ mod tests {
     /// and ENAMETOOLONG.
     #[test]
     fn gethostname_is_fixed_and_bounded() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         assert_eq!(GUEST_HOSTNAME, b"\0", "the console's host name is empty");
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F85_0000_0000;
@@ -2340,6 +2348,7 @@ mod tests {
 
     #[test]
     fn memcmp_compares_bytes_and_fills_unreadable_with_zero() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C28_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -2364,6 +2373,7 @@ mod tests {
 
     #[test]
     fn libc_fallback_string_functions() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         use crate::context::CpuRegister::Rcx;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D55_0000_0000;
@@ -2422,6 +2432,7 @@ mod tests {
 
     #[test]
     fn libc_snprintf_truncates_and_counts() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d5600000000);
         use crate::context::CpuRegister::{Rcx, Rsp};
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D56_0000_0000;

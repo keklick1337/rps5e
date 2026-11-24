@@ -455,6 +455,7 @@ fn readiness(fd: i32, _lw: u64) -> Option<ReadReadiness> {
 
 #[test]
 fn guest_callbacks() {
+    let _scratch = crate::test_bases::scratch_lock(0x5cfd00000000);
     const BASE: u64 = 0x5CF1_0000_0000;
     let vm = vm_arena(BASE);
     let mut ctx = CpuContext::new(vm);
@@ -518,6 +519,7 @@ fn guest_callbacks() {
 /// does not apply) and still refuses the write end.
 #[test]
 fn read_event_on_a_pipe() {
+    let _scratch = crate::test_bases::scratch_lock(0x5cfd00000000);
     use crate::filesystem::test_hooks as fs;
     const BASE: u64 = 0x5CF9_0000_0000;
     let vm = vm_arena(BASE);
@@ -552,6 +554,7 @@ fn read_event_on_a_pipe() {
 /// 0 events on every failure (libkernel_sys).
 #[test]
 fn wait_failures_store_no_events() {
+    let _scratch = crate::test_bases::scratch_lock(0x5cfd00000000);
     const BASE: u64 = 0x5CFD_0000_0000;
     let vm = vm_arena(BASE);
     let mut ctx = CpuContext::new(vm);

@@ -646,6 +646,7 @@ mod tests {
 
     #[test]
     fn initialize_validation_and_info() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c7000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C02_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -680,6 +681,7 @@ mod tests {
     /// block is refused before anything is written.
     #[test]
     fn opt_param_initialize_fills_the_block() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c7000000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C70_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

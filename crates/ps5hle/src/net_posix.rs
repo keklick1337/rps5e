@@ -408,6 +408,7 @@ mod tests {
     /// other names fail offline.
     #[test]
     fn gethostbyname_numeric_ipv4() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f8900000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E67_0000_0000;
         vm.map(BASE, 0x2000, ps5vm::MemProtect::RW).unwrap();
@@ -466,6 +467,7 @@ mod tests {
 
     #[test]
     fn listen_accept_recv_shutdown_on_loopback() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f8900000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7A20_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -546,6 +548,7 @@ mod tests {
     /// registrations.
     #[test]
     fn equeue_socket_read_and_write_events() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f8900000000);
         use crate::sync::equeue::{self, EV_EOF, FILTER_READ, FILTER_WRITE};
         let vm: &'static ps5vm::VirtualMemory = Box::leak(Box::new(ps5vm::VirtualMemory::new()));
         const BASE: u64 = 0x6A1B_0000_0000;
@@ -773,6 +776,7 @@ mod tests {
     /// and the argument checks.
     #[test]
     fn socketpair_ends_are_connected_sockets() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f8900000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x7A21_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -864,6 +868,7 @@ mod tests {
     /// data.
     #[test]
     fn arc4random_buf_fills_exactly_size_bytes() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f8900000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F89_0000_0000;
         vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();

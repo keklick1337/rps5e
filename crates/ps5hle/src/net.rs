@@ -4118,6 +4118,7 @@ mod tests {
 
     #[test]
     fn kernel_udp_loopback() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C04_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4173,6 +4174,7 @@ mod tests {
 
     #[test]
     fn byte_order_and_pton_in_guest_memory() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C00_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -4204,6 +4206,7 @@ mod tests {
     /// short buffers and NULL arguments fail without writing.
     #[test]
     fn ether_address_formatting() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C60_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4242,6 +4245,7 @@ mod tests {
 
     #[test]
     fn sce_net_udp_epoll_and_offline_policy() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let _ids = socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C06_0000_0000;
@@ -4357,6 +4361,7 @@ mod tests {
 
     #[test]
     fn empty_epoll_waits_abort_and_destroy() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C06_0010_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4426,6 +4431,7 @@ mod tests {
     /// failure also stores its errno.
     #[test]
     fn pools_resolvers_and_errno() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D00_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4518,6 +4524,7 @@ mod tests {
     /// counts at +320/+324, nothing written past 384 bytes or on errors.
     #[test]
     fn resolver_multiple_records_layout() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E7A_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4591,6 +4598,7 @@ mod tests {
 
     #[test]
     fn pton_mac_and_sockaddr_rules() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D01_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -4675,6 +4683,7 @@ mod tests {
     /// Socket creation, argument order and address reporting.
     #[test]
     fn socket_validation_and_names() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let _ids = socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D02_0000_0000;
@@ -4853,6 +4862,7 @@ mod tests {
     /// UDPP2P sockets: virtual port rules, shared transport, logical options.
     #[test]
     fn udp_p2p_sockets() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0300000000);
         let _ids = socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D03_0000_0000;

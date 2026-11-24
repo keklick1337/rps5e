@@ -596,6 +596,7 @@ mod tests {
     /// (result NO_ENTITLEMENT, info untouched), delete; an empty list poll.
     #[test]
     fn unified_info_and_list_through_exports() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fac00000000);
         const BASE: u64 = 0x5D41_0300_0000;
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -659,6 +660,7 @@ mod tests {
     /// consume request is polled like a unified one.
     #[test]
     fn service_info_and_consume_through_exports() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fac00000000);
         const BASE: u64 = 0x5FAC_0000_0000;
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

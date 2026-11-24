@@ -29,8 +29,16 @@ jobs:
         run: cargo build --release --locked
         env:
           RUSTFLAGS: "-D warnings"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Every test runs in a process of its own: the HLE keeps process-wide
+      # tables (descriptors, ports, GPU labels) as the console does, so tests
+      # sharing a process can see each other's objects.
       - name: Tests
-        run: cargo test --release --locked --workspace
+        run: cargo nextest run --release --locked --workspace --no-fail-fast
+      - name: Doc tests
+        run: cargo test --release --locked --workspace --doc
 
   windows:
     name: Windows cross build

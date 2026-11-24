@@ -412,6 +412,7 @@ mod tests {
 
     #[test]
     fn handle_and_empty_event_queries() {
+        let _scratch = crate::test_bases::scratch_lock(0x6a2f00000000);
         let _serial = TOUCH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         touches().clear();
         let vm = ps5vm::VirtualMemory::new();
@@ -477,6 +478,7 @@ mod tests {
     /// the handle. A bad handle leaves the event count alone.
     #[test]
     fn recognizer_calls_check_handle_and_pointers() {
+        let _scratch = crate::test_bases::scratch_lock(0x6a2f00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x6A1F_0000_0000;
         vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();
@@ -521,6 +523,7 @@ mod tests {
     /// missing from a report; the ended touch is gone at the next update.
     #[test]
     fn primitive_touches_follow_the_pad_reports() {
+        let _scratch = crate::test_bases::scratch_lock(0x6a2f00000000);
         let _serial = TOUCH_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x6A2F_0000_0000;

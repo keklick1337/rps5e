@@ -379,6 +379,7 @@ mod tests {
 
     #[test]
     fn mp3_decoder_lifecycle_and_validation() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ce060000000);
         const BASE: u64 = 0x5CE0_5000_0000;
         let mut ctx = CpuContext::new(crate::sync::test_util::vm_arena(BASE));
         let set = |ctx: &mut CpuContext, a: u64, b: u64| {
@@ -442,6 +443,7 @@ mod tests {
 
     #[test]
     fn at9_info_block() {
+        let _scratch = crate::test_bases::scratch_lock(0x5ce060000000);
         const BASE: u64 = 0x5CE0_6000_0000;
         let mut ctx = CpuContext::new(crate::sync::test_util::vm_arena(BASE));
         let (ctrl, param, bsi) = (BASE, BASE + 0x100, BASE + 0x200);

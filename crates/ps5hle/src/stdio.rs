@@ -1657,6 +1657,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fopen_exclusive_and_invalid_modes() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         let root = temp_root("modes");
         let mount = root.join("mnt");
         fs::create_dir_all(&mount).unwrap();
@@ -1703,6 +1704,7 @@ mod tests {
     /// the argument are the character. A read-only stream fails with EOF.
     #[test]
     fn fputwc_writes_utf8_units() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("fputwc");
         let mount = root.join("mnt");
@@ -1761,6 +1763,7 @@ mod tests {
     /// writes nothing; a null string and a read-only stream fail with EOF.
     #[test]
     fn fputws_writes_utf8_string() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("fputws");
         let mount = root.join("mnt");
@@ -1899,6 +1902,7 @@ mod tests {
 
     #[test]
     fn fopen_s_fscanf_ungetc_and_locks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("scan");
         let mount = root.join("mnt");
@@ -1990,6 +1994,7 @@ mod tests {
     /// result pointer.
     #[test]
     fn annex_k_stream_printf_scanf_and_freopen() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("annexk");
         let mount = root.join("mnt");
@@ -2130,6 +2135,7 @@ mod tests {
     /// gives the host descriptor of an open host file and -1 for a closed one.
     #[test]
     fn clearerr_clears_the_error_and_fileno_gives_the_descriptor() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("clearerr");
         assert!(crate::filesystem::register_guest_path_mount("/stdioclearerr0", &root));
@@ -2205,6 +2211,7 @@ mod tests {
     /// dropped, and the end-of-file and error indicators cleared.
     #[test]
     fn rewind_clears_the_indicators() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("rewind");
         assert!(crate::filesystem::register_guest_path_mount("/stdiorewind0", &root));
@@ -2260,6 +2267,7 @@ mod tests {
     /// thread holds the stream lock.
     #[test]
     fn unlocked_character_io() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("unlocked");
         assert!(crate::filesystem::register_guest_path_mount("/stdiounlocked0", &root));
@@ -2307,6 +2315,7 @@ mod tests {
 
     #[test]
     fn end_to_end_file_io() {
+        let _scratch = crate::test_bases::scratch_lock(0x5a5b00000000);
         use crate::context::CpuRegister::*;
         let root = temp_root("e2e");
         let mount = root.join("mnt");

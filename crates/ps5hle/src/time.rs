@@ -708,6 +708,7 @@ mod tests {
     /// with a 1 µs resolution, through both exports.
     #[test]
     fn clock_21_is_process_cpu_time_in_microseconds() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cca00000000);
         const BASE: u64 = 0x5CCB_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
@@ -732,6 +733,7 @@ mod tests {
 
     #[test]
     fn clock_exports_check_arguments() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cca00000000);
         const BASE: u64 = 0x5CCA_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x10000, MemProtect::RW).unwrap();

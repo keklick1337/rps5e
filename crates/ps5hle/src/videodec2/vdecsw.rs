@@ -764,6 +764,7 @@ mod tests {
     /// they were.
     #[test]
     fn generic_picture_info_copies_delivered_records() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f2200000000);
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F23_0000_0000;
@@ -808,6 +809,7 @@ mod tests {
 
     #[test]
     fn argument_checks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5f2200000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5F22_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

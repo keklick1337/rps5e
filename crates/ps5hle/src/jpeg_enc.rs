@@ -1004,6 +1004,7 @@ mod tests {
 
     #[test]
     fn query_and_create_report_their_errors() {
+        let _scratch = crate::test_bases::scratch_lock(0x7d2000000000);
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x10000, MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);
@@ -1043,6 +1044,7 @@ mod tests {
     /// A 16x16 RGBA gradient through Create, Encode and Delete in guest memory.
     #[test]
     fn encode_through_guest_memory() {
+        let _scratch = crate::test_bases::scratch_lock(0x7d2000000000);
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x10000, MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);

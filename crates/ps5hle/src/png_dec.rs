@@ -896,6 +896,7 @@ mod tests {
     /// and without one the call is INVALID_ADDR before anything is written.
     #[test]
     fn large_dimensions_need_the_image_info() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9301000000);
         const BASE: u64 = 0x6D10_0000_0000;
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x80_0000, ps5vm::MemProtect::RW).unwrap();
@@ -948,6 +949,7 @@ mod tests {
 
     #[test]
     fn guest_decode_bgra_with_pitch() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9301000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A61_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -1074,6 +1076,7 @@ mod tests {
 
     #[test]
     fn guest_validation_and_options() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9301000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D93_0000_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();
@@ -1210,6 +1213,7 @@ mod tests {
     /// size and pitch errors come first on both decoders.
     #[test]
     fn guest_decode_16_bit_needs_the_attribute() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d9301000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D93_0100_0000;
         vm.map(BASE, 0x10000, ps5vm::MemProtect::RW).unwrap();

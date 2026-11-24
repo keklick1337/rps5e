@@ -556,6 +556,7 @@ mod tests {
     /// Poll objects, the context options (reference GuestRudp cases).
     #[test]
     fn poll_objects_and_options() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0500000000);
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm: &'static ps5vm::VirtualMemory = Box::leak(Box::new(ps5vm::VirtualMemory::new()));
         const BASE: u64 = 0x5DA7_0000_0000;
@@ -627,6 +628,7 @@ mod tests {
 
     #[test]
     fn offline_lifecycle() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0500000000);
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C05_0000_0000;

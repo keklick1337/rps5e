@@ -810,6 +810,7 @@ mod tests {
     /// callback needs a function.
     #[test]
     fn bandwidth_test_and_premium_callback() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         const BASE: u64 = 0x5D42_0300_0000;
         let vm = ps5vm::VirtualMemory::new();
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -857,6 +858,7 @@ mod tests {
     /// REQUEST_NOT_FOUND and leaves the output alone.
     #[test]
     fn account_age_completes_its_request() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0B_4000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -894,6 +896,7 @@ mod tests {
     /// untouched, a local user is signed out with the output cleared.
     #[test]
     fn account_country_unknown_user() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0B_8000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -913,6 +916,7 @@ mod tests {
 
     #[test]
     fn signed_out_queries_and_requests() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0B_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -997,6 +1001,7 @@ mod tests {
 
     #[test]
     fn set_timeout_checks_arguments_then_request() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0B_0010_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -1062,6 +1067,7 @@ mod tests {
 
     #[test]
     fn check_np_availability_finds_no_user() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0b00200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0B_0020_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

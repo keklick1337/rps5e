@@ -2225,6 +2225,7 @@ mod tests {
 
     #[test]
     fn parse_into_guest_values() {
+        let _scratch = crate::test_bases::scratch_lock(0x5db800000000);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D80_0000_0000;
@@ -2308,6 +2309,7 @@ mod tests {
 
     #[test]
     fn constructors_setters_and_copies() {
+        let _scratch = crate::test_bases::scratch_lock(0x5db800000000);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D81_0000_0000;
@@ -2384,6 +2386,7 @@ mod tests {
 
     #[test]
     fn build_and_iterate_containers() {
+        let _scratch = crate::test_bases::scratch_lock(0x5db800000000);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D82_0000_0000;

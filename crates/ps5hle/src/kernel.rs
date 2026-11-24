@@ -450,6 +450,7 @@ mod tests {
     /// POSIX nanosleep reports failures as -1 (errno), never as kernel codes.
     #[test]
     fn posix_nanosleep_returns_minus_one() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         const BASE: u64 = 0x7A60_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x10000, MemProtect::RW).unwrap();
@@ -518,6 +519,7 @@ mod tests {
     /// and a NULL info is accepted (reference checks).
     #[test]
     fn get_app_info_writes_app_id_and_title_id() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         const BASE: u64 = 0x7C48_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
@@ -542,6 +544,7 @@ mod tests {
     /// mask and keeps the bits up to 07777 (reference checks).
     #[test]
     fn setsid_and_umask() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         std::thread::spawn(|| {
             const BASE: u64 = 0x7C4A_0000_0000;
             let vm: &'static VirtualMemory = Box::leak(Box::new(VirtualMemory::new()));
@@ -572,6 +575,7 @@ mod tests {
     /// patch bits set.
     #[test]
     fn system_sw_version_blocks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         std::thread::spawn(|| {
             const BASE: u64 = 0x7C55_0000_0000;
             let vm: &'static VirtualMemory = Box::leak(Box::new(VirtualMemory::new()));
@@ -619,6 +623,7 @@ mod tests {
     /// output EFAULT.
     #[test]
     fn dlsym_resolves_and_reports_kernel_errors() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         const BASE: u64 = 0x7C5F_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
@@ -677,6 +682,7 @@ mod tests {
 
     #[test]
     fn compiled_sdk_version_from_proc_param() {
+        let _scratch = crate::test_bases::scratch_lock(0x5da200000000);
         const BASE: u64 = 0x5DA2_0000_0000;
         let vm = VirtualMemory::new();
         vm.map(BASE, 0x1000, MemProtect::RW).unwrap();

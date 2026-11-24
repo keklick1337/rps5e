@@ -464,6 +464,7 @@ mod tests {
     /// never starts (reference GuestSceNet / GuestNetCtlAp cases).
     #[test]
     fn info_v6_and_access_point() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0800200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A5E_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -542,6 +543,7 @@ mod tests {
 
     #[test]
     fn info_state_and_nat() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0800200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5A5D_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -598,6 +600,7 @@ mod tests {
 
     #[test]
     fn callback_slots() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0800200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C08_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -620,6 +623,7 @@ mod tests {
 
     #[test]
     fn v6_callbacks_have_their_own_ids() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0800200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C08_0010_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -642,6 +646,7 @@ mod tests {
 
     #[test]
     fn if_stat_needs_a_connection() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0800200000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C08_0020_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

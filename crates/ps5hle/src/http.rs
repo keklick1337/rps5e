@@ -3009,6 +3009,7 @@ mod tests {
 
     #[test]
     fn uri_parse_absent_query() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D04_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3025,6 +3026,7 @@ mod tests {
 
     #[test]
     fn uri_parse_empty() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D05_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3042,6 +3044,7 @@ mod tests {
 
     #[test]
     fn uri_parse_present_query() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D06_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3062,6 +3065,7 @@ mod tests {
 
     #[test]
     fn uri_build_honours_option() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D07_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3107,6 +3111,7 @@ mod tests {
 
     #[test]
     fn uri_escape_sizes() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D08_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3130,6 +3135,7 @@ mod tests {
     /// the getters report it.
     #[test]
     fn http_objects_offline() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D09_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3811,6 +3817,7 @@ mod tests {
 
     #[test]
     fn http2_offline() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0A_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -3997,6 +4004,7 @@ mod tests {
     /// unknown request id is HTTP2_ERROR_INVALID_ID.
     #[test]
     fn http2_set_request_no_content_length() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0d00000000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0D_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

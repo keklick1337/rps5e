@@ -461,6 +461,7 @@ mod tests {
 
     #[test]
     fn boot_param_mounts_and_unmount() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         let _mount = TEMP0_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
@@ -503,6 +504,7 @@ mod tests {
     /// itself runs.
     #[test]
     fn exports_need_initialize() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FAD_0000_0000;
@@ -525,6 +527,7 @@ mod tests {
     /// The hit count is required and always 0; the list is left alone.
     #[test]
     fn addcont_info_list_needs_the_hit_count() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FAD_0100_0000;
@@ -548,6 +551,7 @@ mod tests {
     /// BUSY until it is unmounted; the option must be 0 or FORMAT.
     #[test]
     fn temporary_data_mounts_once() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         let _mount = TEMP0_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
@@ -577,6 +581,7 @@ mod tests {
     /// Unmount needs the mounted "/temp0"; a second unmount fails.
     #[test]
     fn temporary_data_unmount() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         let _mount = TEMP0_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
@@ -599,6 +604,7 @@ mod tests {
     /// downloadable; a null label is a parameter error.
     #[test]
     fn addcont_queries_without_content() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FAA_0000_0000;
@@ -633,6 +639,7 @@ mod tests {
     /// Only the "/download0" mount point can be formatted.
     #[test]
     fn download_data_format_mount_point() {
+        let _scratch = crate::test_bases::scratch_lock(0x5fab00000000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5FAB_0000_0000;

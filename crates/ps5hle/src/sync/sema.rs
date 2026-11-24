@@ -777,6 +777,7 @@ mod tests {
     /// PS5): bit 0x100 is allowed next to the queueing order.
     #[test]
     fn create_accepts_the_console_attribute_bits() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cf300000000);
         for attr in [0, 1, 2, 0x100, 0x101, 0x102] {
             assert!(valid_sema_attr(attr), "{attr:#x}");
         }
@@ -857,6 +858,7 @@ mod tests {
 
     #[test]
     fn posix_semaphores() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cf300000000);
         const BASE: u64 = 0x5CF2_0000_0000;
         let vm = vm_arena(BASE);
         let mut ctx = CpuContext::new(vm);
@@ -930,6 +932,7 @@ mod tests {
     /// arrives.
     #[test]
     fn cancelled_semaphore_wait_takes_no_token() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cf300000000);
         const BASE: u64 = 0x5F82_0000_0000;
         let vm = vm_arena(BASE);
         let ctx = CpuContext::new(vm);
@@ -956,6 +959,7 @@ mod tests {
 
     #[test]
     fn kernel_sema_callbacks() {
+        let _scratch = crate::test_bases::scratch_lock(0x5cf300000000);
         const BASE: u64 = 0x5CF3_0000_0000;
         let vm = vm_arena(BASE);
         let mut ctx = CpuContext::new(vm);

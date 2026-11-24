@@ -91,6 +91,7 @@ mod tests {
 
     #[test]
     fn social_feedback_count() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0c00100000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0C_0000_0000;
@@ -110,6 +111,7 @@ mod tests {
 
     #[test]
     fn current_status2_is_off_air() {
+        let _scratch = crate::test_bases::scratch_lock(0x5d0c00100000);
         use crate::context::CpuRegister::*;
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D0C_0010_0000;

@@ -1355,7 +1355,11 @@ fn mutex_hands_off_to_sleepers_in_fifo_order() {
                     let mut ctx = CpuContext::new(vm);
                     bind();
                     long_slices();
-                    let r = if k == timed { call(&mut ctx, cb_mutex_timedlock_usec, &[m, 100_000]) } else { call(&mut ctx, cb_mutex_lock, &[m]) };
+                    // The timed sleeper must still be queued while the
+                    // sleepers after it arrive (thread start-up takes long on
+                    // a loaded machine); the last one has nobody after it.
+                    let usec = if timed == 2 { 100_000 } else { 1_000_000 };
+                    let r = if k == timed { call(&mut ctx, cb_mutex_timedlock_usec, &[m, usec]) } else { call(&mut ctx, cb_mutex_lock, &[m]) };
                     if r == OK {
                         order.lock().unwrap().push(k);
                         let mut open = gate.0.lock().unwrap();

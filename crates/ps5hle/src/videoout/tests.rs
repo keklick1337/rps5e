@@ -46,6 +46,7 @@ fn nids_match_names() {
 
 #[test]
 fn attribute_layouts() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let a2 = buffer_attribute2_bytes(0x8000_0000_2200_0000, 0, 1920, 1080, 0x20, 7, 0x1234);
     assert_eq!(&a2[0x20..0x28], &0x8000_0000_2200_0000u64.to_le_bytes());
     assert_eq!(u32::from_le_bytes(a2[0x30..0x34].try_into().unwrap()), 7);
@@ -118,6 +119,7 @@ fn resolution_class_follows_the_display_and_attribute3() {
 
 #[test]
 fn attribute3_from_param_json() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let detect = PARAM_ATTRIBUTE3_RESOLUTION_DETECTION;
     // No param.json at all: treated as detecting the resolution.
     assert_eq!(param_attribute3(None), detect);
@@ -324,6 +326,7 @@ fn open_register_flip_and_events() {
 
 #[test]
 fn vblank_events_and_wait() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     let vm = ps5vm::VirtualMemory::new();
     const BASE: u64 = 0x5B30_0000_0000;
@@ -412,6 +415,7 @@ fn window_flip_smoke() {
 
 #[test]
 fn flip_master_attribute_option_and_event_count() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     const BASE: u64 = 0x5B50_0000_0000;
     let vm = ps5vm::VirtualMemory::new();
@@ -536,6 +540,7 @@ fn output_mode_queries_answer_console_codes() {
 
 #[test]
 fn resolution_status_layout() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     const BASE: u64 = 0x5B70_0000_0000;
     let vm = ps5vm::VirtualMemory::new();
@@ -612,6 +617,7 @@ fn gpu_flip_of_unregistered_buffer_presents_black_and_completes() {
 
 #[test]
 fn overlay_bus_flips_complete_without_being_shown() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     headless();
     const BASE: u64 = 0x5B90_0000_0000;
@@ -667,6 +673,7 @@ fn overlay_bus_flips_complete_without_being_shown() {
 
 #[test]
 fn pre_vblank_and_vrr_events_and_close_removes_events() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     const BASE: u64 = 0x5BA0_0000_0000;
     let vm = ps5vm::VirtualMemory::new();
@@ -771,6 +778,7 @@ fn wait_flip_done(h: u64, index: i32) {
 /// (reference VideoOutDriver.cpp SubmitEopFlip, Driver ReserveEopFlip).
 #[test]
 fn eop_flip_reservations() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     headless();
     const BASE: u64 = 0x5BE0_0000_0000;
@@ -831,6 +839,7 @@ fn eop_flip_reservations() {
 /// tests/Flip.cpp testLabels).
 #[test]
 fn buffer_labels() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     headless();
     const BASE: u64 = 0x5BC0_0000_0000;
@@ -890,6 +899,7 @@ fn buffer_labels() {
 /// conversion and blend space exports (reference Output.cpp / Event.cpp).
 #[test]
 fn output_vrr_and_color_exports() {
+    let _scratch = crate::test_bases::scratch_lock(0x5bd000000000);
     let _serial = serial();
     headless();
     const BASE: u64 = 0x5BD0_0000_0000;

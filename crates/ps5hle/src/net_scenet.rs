@@ -580,6 +580,7 @@ mod tests {
     /// Scatter/gather over UDP loopback (reference CheckMessages).
     #[test]
     fn messages_scatter_and_gather() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let _ids = super::super::tests::socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0000_0000;
@@ -716,6 +717,7 @@ mod tests {
     /// accepted-socket case).
     #[test]
     fn peer_names() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let _ids = super::super::tests::socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0010_0000;
@@ -765,6 +767,7 @@ mod tests {
     /// (FreeBSD accept inherits the mode); a blocking listener's is blocking.
     #[test]
     fn accepted_socket_inherits_non_blocking_mode() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let _ids = super::super::tests::socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0050_0000;
@@ -817,6 +820,7 @@ mod tests {
     /// descriptor too.
     #[test]
     fn kernel_socket_through_scenet() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0060_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -839,6 +843,7 @@ mod tests {
 
     #[test]
     fn resolver_ntoa6_offline() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0020_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
@@ -880,6 +885,7 @@ mod tests {
     /// Reference CheckNetstat: the dump lists the pool and its sockets.
     #[test]
     fn netstat_dump() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let _ids = super::super::tests::socket_ids();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0030_0000;
@@ -917,6 +923,7 @@ mod tests {
     /// EINVAL and change nothing; NULL goes back to none.
     #[test]
     fn dns_servers_set_and_read_back() {
+        let _scratch = crate::test_bases::scratch_lock(0x5e1100700000);
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5E11_0070_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

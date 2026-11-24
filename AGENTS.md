@@ -97,7 +97,7 @@ Games live outside the repository (`~/Downloads/ps5games/`); never move or copy 
 4. Speed measurements: A/B inside one run (`RPS5E_AB_PERIOD`, `RPS5E_AB_SCOPE`); separate runs vary with machine load.
 5. After changes:
    - `cargo build --release` without warnings, and the Windows target: `cargo build --release --target x86_64-pc-windows-gnu` (BUILD.md);
-   - tests: `cargo test --release -p ps5shader -p ps5gpu -p ps5hle -p ps5vm -p rps5e-gui` (device tests: `-- --ignored`). Under load a few tests can fail and pass alone: `ioctl_fionread_and_fionbio`, `fstatfs_reports_the_volume`, `kernel_socket_descriptors`, `mutex_hands_off_to_sleepers_in_fifo_order`, `fsync_flushes_and_reports_bad_descriptors`;
+   - tests: `cargo test --release -p ps5shader -p ps5gpu -p ps5hle -p ps5vm -p rps5e-gui` (device tests: `-- --ignored`). CI runs every test in a process of its own (`cargo nextest run --release --workspace`), and a test must also pass beside the others under `cargo test`. The HLE keeps process-wide state as the console does, so a test: maps scratch memory at a `const BASE` of its own, or takes `crate::test_bases::scratch_lock(BASE)` when tests of a module share one; checks a closed descriptor or handle on a number nothing holds (`NEVER_OPEN`), never on one it just closed (the number is handed out again at once); waits for other threads by condition with a generous deadline, not a fixed sleep or a short timeout;
    - run the affected games **one at a time** (input-test replays or smoke scenarios) and look at the frames;
    - commit.
 6. Keep notes in `local/docs/` (what was wrong, the root cause, the fix, measurements), not in tracked files. User-visible changes go into `CHANGELOG.md`.

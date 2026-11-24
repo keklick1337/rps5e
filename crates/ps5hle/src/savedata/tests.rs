@@ -606,7 +606,10 @@ fn classic_save_params() {
     use std::os::unix::fs::PermissionsExt;
     let writable = fs::metadata(saved.join("sce_sys")).unwrap().permissions();
     fs::set_permissions(saved.join("sce_sys"), fs::Permissions::from_mode(0o555)).unwrap();
-    assert_eq!(h.lib.set_param(&h.ctx, mounted, 0, param, PARAM_SIZE as u64), ERR_INTERNAL);
+    // Root writes into a read-only directory anyway (tests in a container).
+    if unsafe { libc::geteuid() } != 0 {
+        assert_eq!(h.lib.set_param(&h.ctx, mounted, 0, param, PARAM_SIZE as u64), ERR_INTERNAL);
+    }
     fs::set_permissions(saved.join("sce_sys"), writable).unwrap();
     fs::remove_dir(saved.join("sce_sys/param.bin.tmp")).unwrap();
     assert_eq!(h.lib.get_param(&h.ctx, mounted, 0, loaded, PARAM_SIZE as u64, 0), OK);

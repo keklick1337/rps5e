@@ -223,6 +223,7 @@ mod tests {
 
     #[test]
     fn check_reports_no_update() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0b00100000);
         let _turn = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C0B_0000_0000;
@@ -290,6 +291,7 @@ mod tests {
     /// check of an aborted request is ABORTED.
     #[test]
     fn requests_have_eight_slots_and_abort() {
+        let _scratch = crate::test_bases::scratch_lock(0x5c0b00100000);
         let _turn = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5C0B_0010_0000;
