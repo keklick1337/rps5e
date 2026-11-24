@@ -197,7 +197,9 @@ impl GuiSettings {
 
     pub fn parse(text: &str) -> Result<Self, String> {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
-        Self::deserialize(table).map_err(|e| e.to_string())
+        let mut s = Self::deserialize(table).map_err(|e| e.to_string())?;
+        s.emulator.migrate();
+        Ok(s)
     }
 
     pub fn to_toml(&self) -> String {

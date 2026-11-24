@@ -279,7 +279,7 @@ struct RunOptions {
     #[arg(long)]
     hdr: bool,
     /// Resolution of the emulated display: 720p, 1080p or 2160p (default
-    /// 2160p); games that detect the display pick their output size from it
+    /// 1080p); games that detect the display pick their output size from it
     /// [RPS5E_DISPLAY_RESOLUTION].
     #[arg(long, value_name = "RES")]
     display_resolution: Option<String>,

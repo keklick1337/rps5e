@@ -82,6 +82,10 @@ Games live outside the repository (`~/Downloads/ps5games/`); never move or copy 
 - **Memory** (`ps5hle/memory.rs`): memfd of 13 824 MiB (`TOTAL_BYTES`; flexible memory 1 GiB by default, `param.json` can change it) plus a 4 MiB system tail, aliasing. Every mapping is registered in `ps5vm::ranges` and in `ps5gpu::memory` (`note_mapped`). PRT aperture: unmapped pages read zeros.
 - **Process exit** (`ps5vm::shutdown`): never `std::process::exit` with live guest threads; use `shutdown::request` / `exit`; a new host thread with resources registers `shutdown::on_shutdown`.
 - **Input** works on physical keys (winit `PhysicalKey`); the keyboard layout does not matter.
+- **Shaders are compiled when the game hands them over, never first at a draw.** A module depends on the draw's resources, so the emulator keeps a per-game shader list (`$XDG_CACHE_HOME/rps5e/pipelines/<TITLE>.prewarm`, written during play) and builds every module and pipeline of it before they are needed: the launcher and `rps5e-cli precompile <game>` build it before the game starts (`RPS5E_PREWARM_WAIT=1`), `rps5e-cli run` builds it in the background from the start, a program the game creates (`sceAgcCreateShader`) moves its modules to the front of that work (`ps5gpu/src/pipeline/created.rs`, `RPS5E_CREATE_TIME_SHADERS`), and modules are kept on disk (`spirv-<translator stamp>/`). A draw translates only a module no list knows yet. Rules:
+  - Do not add draw-time compilation where a module can be built ahead, and do not drop modules from the list.
+  - A translator change (new stamp) or a cleared module cache makes the whole list translate again: run `rps5e-cli precompile <game>` (or let `input-test.sh replay` do it) before any run you measure or look at; a run that compiles at draws is not a measurement.
+  - Never delete or replace the user's `~/.cache/rps5e` (or `~/.local/share/rps5e`) unless asked; agents use private copies (`XDG_CACHE_HOME=local/tmp/<task>/cache`).
 - **Graphics**: CPU write tracking per page (protection + fault); image cache with aliasing and page merging, write-back only into memory the CPU did not touch; shaders RDNA → SSA → SPIR-V, one wave = one host subgroup; every acceleration has its own `RPS5E_*` switch (`grep -rn RPS5E_ crates/ps5gpu`).
 - **Names**: env variables `RPS5E_*`; app folders through `ps5vm::appenv::app_dir`.
 
@@ -93,7 +97,7 @@ Games live outside the repository (`~/Downloads/ps5games/`); never move or copy 
 4. Speed measurements: A/B inside one run (`RPS5E_AB_PERIOD`, `RPS5E_AB_SCOPE`); separate runs vary with machine load.
 5. After changes:
    - `cargo build --release` without warnings, and the Windows target: `cargo build --release --target x86_64-pc-windows-gnu` (BUILD.md);
-   - tests: `cargo test --release -p ps5shader -p ps5gpu -p ps5hle -p ps5vm -p rps5e-gui` (device tests: `-- --ignored`). Under load a few tests can fail and pass alone: `ioctl_fionread_and_fionbio`, `fstatfs_reports_the_volume`, `kernel_socket_descriptors`, `mutex_hands_off_to_sleepers_in_fifo_order`;
+   - tests: `cargo test --release -p ps5shader -p ps5gpu -p ps5hle -p ps5vm -p rps5e-gui` (device tests: `-- --ignored`). Under load a few tests can fail and pass alone: `ioctl_fionread_and_fionbio`, `fstatfs_reports_the_volume`, `kernel_socket_descriptors`, `mutex_hands_off_to_sleepers_in_fifo_order`, `fsync_flushes_and_reports_bad_descriptors`;
    - run the affected games **one at a time** (input-test replays or smoke scenarios) and look at the frames;
    - commit.
 6. Keep notes in `local/docs/` (what was wrong, the root cause, the fix, measurements), not in tracked files. User-visible changes go into `CHANGELOG.md`.

@@ -156,34 +156,32 @@ fn rewind_patch_set_rewind_state(ctx: &mut CpuContext) -> HleResult {
     status(mem::w32(body, if valid { b | (1 << 31) } else { b & !(1 << 31) }))
 }
 
-/// `sceAgc[Async]CondExecPatchSetCommandAddress(packet, predicateAddr)`.
+/// `sceAgc[Async]CondExecPatchSetCommandAddress(packet, predicateAddr)`:
+/// only the opcode is checked; the low two bits of dword 1 are kept and the
+/// whole high address dword is written (decrypted libSceAgc).
 fn cond_exec_patch_set_command_address(ctx: &mut CpuContext) -> HleResult {
     let (packet, addr) = (arg(ctx, 0), arg(ctx, 1));
     match identity(packet) {
-        Some((o, _, _)) if o == op::COND_EXEC && addr != 0 && addr & 3 == 0 => {}
-        _ => return ERR_INVALID_PACKET,
+        Some((o, _, _)) if o == op::COND_EXEC => {}
+        Some(_) => return ERR_INVALID_PACKET,
+        None => return if packet == 0 { ERR_INVALID_PACKET } else { ERR_MEMORY_FAULT },
     }
-    let Some(d1) = mem::r32(packet + 4) else { return ERR_MEMORY_FAULT };
-    status(mem::w32(packet + 4, (d1 & 3) | ((addr as u32) & !3)) && mem::w32(packet + 8, (addr >> 32) as u32))
+    status(patch_bits(packet + 4, !3, addr as u32) && mem::w32(packet + 8, (addr >> 32) as u32))
 }
 
-/// `sceAgc[Async]CondExecPatchSetEnd(packet, end)`: the skip count becomes
-/// the dwords between the packet's end and `end`.
+/// `sceAgc[Async]CondExecPatchSetEnd(packet, end)`: the skip count (low 14
+/// bits of dword 4) becomes the dwords between the packet's end and `end`,
+/// computed on the low 32 bits of the byte distance and wrapped to 14 bits;
+/// only the opcode is checked (decrypted libSceAgc).
 fn cond_exec_patch_set_end(ctx: &mut CpuContext) -> HleResult {
     let (packet, end) = (arg(ctx, 0), arg(ctx, 1));
     match identity(packet) {
-        Some((o, _, _)) if o == op::COND_EXEC && end != 0 => {}
-        _ => return ERR_INVALID_PACKET,
+        Some((o, _, _)) if o == op::COND_EXEC => {}
+        Some(_) => return ERR_INVALID_PACKET,
+        None => return if packet == 0 { ERR_INVALID_PACKET } else { ERR_MEMORY_FAULT },
     }
-    let packet_end = packet + 20;
-    if end < packet_end {
-        return ERR_INVALID_PACKET;
-    }
-    let n = (end - packet_end) / 4;
-    if n > 0x3FFF {
-        return ERR_INVALID_PACKET;
-    }
-    status(patch_bits(packet + 16, 0x3FFF, n as u32))
+    let dwords = ((end as u32).wrapping_sub(packet as u32) >> 2).wrapping_sub(5);
+    status(patch_bits(packet + 16, 0x3FFF, dwords))
 }
 
 /// Inferred: `sceAgcBranchPatchSetCompareAddress(packet, addr)` on the
@@ -260,18 +258,16 @@ fn jump_patch_retarget(ctx: &mut CpuContext) -> HleResult {
     )
 }
 
-/// `sceAgcJumpPatchSetTarget(packet, target, dwords)`.
+/// `sceAgcJumpPatchSetTarget(packet, target, dwords)`: keeps the low two
+/// bits of dword 1, writes the whole high address dword and the 20-bit size
+/// (decrypted libSceAgc).
 fn jump_patch_set_target(ctx: &mut CpuContext) -> HleResult {
     let (packet, target, dw) = (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2) as u32);
     match identity(packet) {
         Some((o, _, _)) if o == op::INDIRECT_BUFFER => {}
         _ => return ERR_INVALID_PACKET,
     }
-    status(
-        mem::w32(packet + 4, target as u32)
-            && patch_bits(packet + 8, 0xFFFF, (target >> 32) as u32)
-            && patch_bits(packet + 12, 0xFFFFF, dw),
-    )
+    status(patch_bits(packet + 4, !3, target as u32) && mem::w32(packet + 8, (target >> 32) as u32) && patch_bits(packet + 12, 0xFFFFF, dw))
 }
 
 #[derive(Clone, Copy, PartialEq)]

@@ -82,7 +82,52 @@ fn gpu() -> &'static queue::GpuQueue {
     q
 }
 
-/// `sceAgcDriver[Agr]SubmitDcb(const {u64 addr; u32 dwords}*)`.
+/// A multi-submission of no command buffers (checked before the pointers).
+const ERR_EMPTY_SUBMIT: HleResult = 0x8A6D_0109u32 as i32 as i64;
+/// An AGR submission while the asynchronous graphics queue is not set up.
+const ERR_AGR_QUEUE_UNAVAILABLE: HleResult = 0x8A6D_0003u32 as i32 as i64;
+
+/// The asynchronous graphics (AGR) queue is enabled by
+/// `sceAgcDriverSetupAsyncGraphics(nonzero)`; until then the AGR
+/// submissions fail without submitting anything (decrypted
+/// libSceAgcDriver: they test the flag SetupAsyncGraphics writes).
+static ASYNC_GRAPHICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn async_graphics_ready() -> bool {
+    let ready = ASYNC_GRAPHICS.load(std::sync::atomic::Ordering::Acquire);
+    if !ready {
+        crate::agc::log_once("agc.agr.unavailable", || log::warn!("[agc] AGR submission without sceAgcDriverSetupAsyncGraphics: refused"));
+    }
+    ready
+}
+
+/// `sceAgcDriverSetupAsyncGraphics(enable)`: sets the AGR queue flag to
+/// `enable != 0`. The driver opens the queue's kernel object first, which
+/// has nothing to do here.
+fn setup_async_graphics(ctx: &mut CpuContext) -> HleResult {
+    ASYNC_GRAPHICS.store(arg(ctx, 0) as u32 != 0, std::sync::atomic::Ordering::Release);
+    OK
+}
+
+/// `sceAgcDriverAgrSubmitDcb(const {u64 addr; u32 dwords}*)`: the graphics
+/// submission once the AGR queue is set up.
+fn agr_submit_dcb(ctx: &mut CpuContext) -> HleResult {
+    if !async_graphics_ready() {
+        return ERR_AGR_QUEUE_UNAVAILABLE;
+    }
+    submit_dcb(ctx)
+}
+
+/// `sceAgcDriverAgrSubmitMultiDcbs(addrs, dwords, count)`: as
+/// [`agr_submit_dcb`].
+fn agr_submit_multi_dcbs(ctx: &mut CpuContext) -> HleResult {
+    if !async_graphics_ready() {
+        return ERR_AGR_QUEUE_UNAVAILABLE;
+    }
+    submit_multi_dcbs(ctx)
+}
+
+/// `sceAgcDriverSubmitDcb(const {u64 addr; u32 dwords}*)`.
 fn submit_dcb(ctx: &mut CpuContext) -> HleResult {
     crate::pause::wait_if_paused();
     let p = arg(ctx, 0);
@@ -98,7 +143,7 @@ fn submit_multi_dcbs(ctx: &mut CpuContext) -> HleResult {
     crate::pause::wait_if_paused();
     let (addrs, sizes, n) = (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2) as u32);
     if n == 0 {
-        return OK;
+        return ERR_EMPTY_SUBMIT;
     }
     if addrs == 0 || sizes == 0 {
         return ERR_INVALID_ARGUMENT;
@@ -155,7 +200,7 @@ fn submit_multi_command_buffers(ctx: &mut CpuContext) -> HleResult {
     crate::pause::wait_if_paused();
     let (qctx, addrs, sizes, n) = (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2), arg(ctx, 3) as u32);
     if n == 0 {
-        return OK;
+        return ERR_EMPTY_SUBMIT;
     }
     if qctx == 0 || addrs == 0 || sizes == 0 {
         return ERR_INVALID_ARGUMENT;
@@ -183,7 +228,7 @@ fn route_command_buffer(queue: u32, addr: u64, dwords: u32) {
 fn submit_multi_acbs(ctx: &mut CpuContext) -> HleResult {
     let (owner, addrs, sizes, n) = (arg(ctx, 0) as u32, arg(ctx, 1), arg(ctx, 2), arg(ctx, 3) as u32);
     if n == 0 {
-        return OK;
+        return ERR_EMPTY_SUBMIT;
     }
     if addrs == 0 || sizes == 0 {
         return ERR_INVALID_ARGUMENT;
@@ -243,24 +288,25 @@ fn delete_eq_event(ctx: &mut CpuContext) -> HleResult {
     }
 }
 
-/// Graphics events: the ident; others: the data.
+/// `sceAgcDriverGetEqEventType(ev)`: the low 32 bits of the event data
+/// (sceKernelGetEventData), whatever the filter. A graphics interrupt
+/// carries `context id << 16 | event id` there (decrypted
+/// libSceAgcDriver).
 fn get_eq_event_type(ctx: &mut CpuContext) -> HleResult {
     let ev = arg(ctx, 0);
     if ev == 0 {
         return 0;
     }
-    let (Some(ident), Some(filter), Some(data)) = (mem::r64(ev), mem::r16(ev + 8), mem::r64(ev + 0x10)) else { return 0 };
-    (if filter as i16 == equeue::FILTER_GRAPHICS { ident } else { data }) as i32 as HleResult
+    mem::r64(ev + 0x10).map_or(0, |data| data as i32 as HleResult)
 }
 
-/// Graphics events: the data (the packet's context id); others: the ident.
+/// `sceAgcDriverGetEqContextId(ev)`: the event data shifted right by 16.
 fn get_eq_context_id(ctx: &mut CpuContext) -> HleResult {
     let ev = arg(ctx, 0);
     if ev == 0 {
         return 0;
     }
-    let (Some(ident), Some(filter), Some(data)) = (mem::r64(ev), mem::r16(ev + 8), mem::r64(ev + 0x10)) else { return 0 };
-    (if filter as i16 == equeue::FILTER_GRAPHICS { data } else { ident }) as u32 as HleResult
+    mem::r64(ev + 0x10).map_or(0, |data| (data >> 16) as u32 as HleResult)
 }
 
 // ---------------------------------------------------------------------------
@@ -517,16 +563,18 @@ fn register_workload_stream(ctx: &mut CpuContext) -> HleResult {
     if !(WORKLOAD_STREAM_MIN..=WORKLOAD_STREAM_MAX).contains(&id) {
         return ERR_DRIVER_INVALID_VALUE;
     }
+    // An id already registered is refused before the stream pointer is
+    // looked at (decrypted libSceAgcDriver).
+    let mut r = reg();
+    if r.workload_streams.contains_key(&id) {
+        return ERR_DRIVER_INVALID_VALUE;
+    }
     if stream == 0 {
         return ERR_DRIVER_INVALID_ARGUMENT;
     }
     let mut rec = [0u8; WORKLOAD_STREAM_RECORD];
     if !mem::read(stream, &mut rec) {
         return ERR_DRIVER_INVALID_ARGUMENT;
-    }
-    let mut r = reg();
-    if r.workload_streams.contains_key(&id) {
-        return ERR_DRIVER_INVALID_VALUE;
     }
     r.workload_streams.insert(id, rec);
     WORKLOAD_STREAM_MASK.fetch_or(1 << id, std::sync::atomic::Ordering::Relaxed);
@@ -768,9 +816,10 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("WHIOMbb+iIU", "sceAgcDriverGetSubmitValidationMode", LIB_AGC_DRIVER, validation_unavailable),
     ("chJWZcNSzjk", "sceAgcDriverSetSubmitValidationConfig", LIB_AGC_DRIVER, validation_unavailable),
     ("UglJIZjGssM", "sceAgcDriverSubmitDcb", LIB_AGC_DRIVER, submit_dcb),
-    ("AhGvpITrf4M", "sceAgcDriverAgrSubmitDcb", LIB_AGC_DRIVER, submit_dcb),
+    ("AhGvpITrf4M", "sceAgcDriverAgrSubmitDcb", LIB_AGC_DRIVER, agr_submit_dcb),
+    ("Vlaj1gwmIFA", "sceAgcDriverSetupAsyncGraphics", LIB_AGC_DRIVER, setup_async_graphics),
     ("6UzEidRZwkg", "sceAgcDriverSubmitMultiDcbs", LIB_AGC_DRIVER, submit_multi_dcbs),
-    ("+T8Xo6LtFJI", "sceAgcDriverAgrSubmitMultiDcbs", LIB_AGC_DRIVER, submit_multi_dcbs),
+    ("+T8Xo6LtFJI", "sceAgcDriverAgrSubmitMultiDcbs", LIB_AGC_DRIVER, agr_submit_multi_dcbs),
     ("gSRnr79F8tQ", "sceAgcDriverSubmitAcb", LIB_AGC_DRIVER, submit_acb),
     ("HF3YllT3mXU", "sceAgcDriverSubmitMultiAcbs", LIB_AGC_DRIVER, submit_multi_acbs),
     ("h9z6+0hEydk", "sceAgcSuspendPoint", LIB_AGC, suspend_point),

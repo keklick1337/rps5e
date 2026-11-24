@@ -612,6 +612,9 @@ fn fast_unlock_handoff(m: &HostMutex) {
     }
 }
 
+/// Trylock. A trylock by the owner: recursive mutexes count it, adaptive
+/// ones are EINVAL, error-checking and normal ones EBUSY (measured in a
+/// title process on a PS5).
 pub(super) fn mutex_trylock(m: &HostMutex) -> HleResult {
     if m.is_fast() {
         let me = owner_id();
@@ -619,25 +622,37 @@ pub(super) fn mutex_trylock(m: &HostMutex) -> HleResult {
             return OK;
         }
         let w = m.word.load(Ordering::Relaxed);
-        if w != 0 && w >> 1 == me && m.kind.load(Ordering::Relaxed) == MUTEX_RECURSIVE {
-            let d = m.depth.load(Ordering::Relaxed);
-            if d == u32::MAX {
-                return EAGAIN;
+        if w != 0 && w >> 1 == me {
+            match m.kind.load(Ordering::Relaxed) {
+                MUTEX_RECURSIVE => {
+                    let d = m.depth.load(Ordering::Relaxed);
+                    if d == u32::MAX {
+                        return EAGAIN;
+                    }
+                    m.depth.store(d + 1, Ordering::Relaxed);
+                    return OK;
+                }
+                MUTEX_ADAPTIVE => return EINVAL,
+                _ => {}
             }
-            m.depth.store(d + 1, Ordering::Relaxed);
-            return OK;
         }
         return EBUSY;
     }
     let me = current_handle();
     let mut s = lock(&m.state);
     if s.count > 0 {
-        if s.owner == me && m.kind.load(Ordering::Relaxed) == MUTEX_RECURSIVE {
-            if s.count == u32::MAX {
-                return EAGAIN;
+        if s.owner == me {
+            match m.kind.load(Ordering::Relaxed) {
+                MUTEX_RECURSIVE => {
+                    if s.count == u32::MAX {
+                        return EAGAIN;
+                    }
+                    s.count += 1;
+                    return OK;
+                }
+                MUTEX_ADAPTIVE => return EINVAL,
+                _ => {}
             }
-            s.count += 1;
-            return OK;
         }
         return EBUSY;
     }
@@ -1239,9 +1254,16 @@ pub(super) fn cb_posix_cond_timedwait(ctx: &mut CpuContext) -> HleResult {
         let now = crate::time::clock_now(clock)?;
         let target = sec as i128 * 1_000_000_000 + nsec as i128;
         let cur = now.as_nanos() as i128;
-        let delta = (target - cur).max(0) as u64;
-        Some(CondTimeout::Deadline(Instant::now() + Duration::from_nanos(delta)))
+        Some(deadline_after((target - cur).max(0)))
     })
+}
+
+/// The wait for `delta_ns` from now: a delta past what an `Instant` can
+/// hold (centuries) waits without a deadline instead of wrapping into a
+/// short one.
+fn deadline_after(delta_ns: i128) -> CondTimeout {
+    let delta = Duration::from_nanos(delta_ns.clamp(0, u64::MAX as i128) as u64);
+    Instant::now().checked_add(delta).map_or(CondTimeout::Infinite, CondTimeout::Deadline)
 }
 
 fn cond_wake(ctx: &CpuContext, target: Option<Option<u64>>) -> HleResult {

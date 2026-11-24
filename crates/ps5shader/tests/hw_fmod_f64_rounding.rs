@@ -28,6 +28,12 @@ const NAMES: [&str; 16] = [
 ];
 
 fn check(i: usize) {
+    // The "cvt f32" column is `v_cvt_f32_f64 ... mul:2` and its rows are the
+    // plain conversion: they come from a run whose float mode did not apply
+    // the output modifier, i.e. IEEE mode (the f32 rule ignores omod there).
+    if i == 12 {
+        fmod_set_float_mode(ps5shader::translate::FloatMode { ieee: true, ..Default::default() });
+    }
     fmod_check_rows(&CODE, &ROWS, &EXPECTED, None, i, NAMES[i], &fmod_exact);
 }
 

@@ -323,9 +323,16 @@ pub mod trigger_state {
     pub const VIBRATION_ACTIVE: i32 = 7;
 }
 
-/// State of one trigger under `command` at analog `value` (0..255).
+/// State of one trigger under `command` at analog `value` (0..255). An
+/// effect without force (a feedback or weapon effect of strength 0, a
+/// vibration without amplitude or frequency) runs on the controller as the
+/// off effect, and a controller running the off effect reports no state.
 pub fn trigger_effect_state(command: &TriggerCommand, value: u8, previous: i32) -> i32 {
     use trigger_state::*;
+    let mut effect = [0u8; 11];
+    if trigger_effect_to_dualsense(command, &mut effect, 1.0) && effect[0] == TRIGGER_OFF {
+        return OFF;
+    }
     let value = value as i32;
     let d = &command.data;
     // Trigger positions use nonuniform travel ranges, with endpoints at 0 and 255.
@@ -915,7 +922,7 @@ mod tests {
         check(&c, 2, 5, "feedback at position 0 was suppressed by a dead zone");
         param.command[0].data[1] = 0;
         c.set_trigger_effect(&param).unwrap();
-        check(&c, 1, 5, "zero-strength feedback reported active");
+        check(&c, OFF, 5, "zero-strength feedback reported an effect state");
 
         param.command[0] = cmd(4, &[4, 0, 4, 0, 0, 0, 0, 0, 4]);
         c.set_trigger_effect(&param).unwrap();
@@ -949,7 +956,7 @@ mod tests {
         check(&c, 7, 5, "vibration at position 0 was suppressed");
         param.command[0].data[2] = 0;
         c.set_trigger_effect(&param).unwrap();
-        check(&c, 6, 5, "zero-frequency vibration reported active");
+        check(&c, OFF, 5, "zero-frequency vibration reported an effect state");
 
         param.command[0] = TriggerCommand { mode: 6, ..Default::default() };
         param.command[0].data[0] = 20;
@@ -961,16 +968,46 @@ mod tests {
         check(&c, 7, 5, "multi-position vibration did not activate at position 9");
         param.command[0].data[0] = 0;
         c.set_trigger_effect(&param).unwrap();
-        check(&c, 6, 5, "zero-frequency multi-position vibration reported active");
+        check(&c, OFF, 5, "zero-frequency multi-position vibration reported an effect state");
 
         // Input reset (released triggers).
         axes(&mut c, 0, 0);
-        check(&c, 6, 3, "input reset retained a fired weapon");
+        check(&c, OFF, 3, "input reset retained a fired weapon");
         param.command[0].mode = 0;
         c.set_trigger_effect(&param).unwrap();
         check(&c, 0, 3, "off mode retained an effect state");
         c.out.reset();
         check(&c, 0, 0, "switching controllers retained effect states");
+    }
+
+    /// Effects without force run as the off effect and report no state: a
+    /// feedback at position 0 with strength 0 on L2 and a weapon effect
+    /// 2..3 with strength 0 on R2 (a title sets this pair every frame and
+    /// waits for the states to change before it aims and fires), a
+    /// multiple-position feedback without strength and a vibration
+    /// without frequency.
+    #[test]
+    fn forceless_trigger_effects_report_off() {
+        let mut c = Controller::new();
+        let mut param = TriggerEffectParam { trigger_mask: 3, ..Default::default() };
+        param.command[0] = cmd(1, &[0, 0]);
+        param.command[1] = cmd(2, &[2, 3, 0]);
+        c.set_trigger_effect(&param).unwrap();
+        for (l, r) in [(0, 0), (255, 255), (128, 80)] {
+            c.axis(0, l);
+            c.axis(1, r);
+            assert_eq!(c.out.trigger_state(), [OFF, OFF], "forceless feedback / weapon at {l}/{r}");
+        }
+        param.command[0] = cmd(4, &[0; 10]);
+        param.command[1] = cmd(3, &[0, 8, 0]);
+        c.set_trigger_effect(&param).unwrap();
+        c.axis(0, 200);
+        assert_eq!(c.out.trigger_state(), [OFF, OFF], "forceless multi-position feedback / vibration");
+        // With force they report again.
+        param.command[1] = cmd(2, &[2, 3, 1]);
+        c.set_trigger_effect(&param).unwrap();
+        c.axis(1, 10);
+        assert_eq!(c.out.trigger_state(), [OFF, WEAPON_STANDBY], "weapon with strength 1");
     }
 
     #[test]

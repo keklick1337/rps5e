@@ -299,8 +299,12 @@ fn nanosleep_core(ctx: &CpuContext, req: u64) -> Result<(), i32> {
         return Err(libc::EFAULT);
     }
     let (Some(s), Some(ns)) = (ctx.read_u64(req), ctx.read_u64(req + 8)) else { return Err(libc::EFAULT) };
-    if (s as i64) < 0 || ns >= 1_000_000_000 {
+    if ns >= 1_000_000_000 {
         return Err(libc::EINVAL);
+    }
+    // A negative interval is already over (FreeBSD kern_nanosleep).
+    if (s as i64) < 0 {
+        return Ok(());
     }
     let total = s.saturating_mul(1_000_000) + ns / 1000;
     sleep_micros(total.max((ns > 0) as u64));
@@ -461,6 +465,15 @@ mod tests {
         ctx.set(CpuRegister::Rsi, BASE + 16);
         assert_eq!(cb_nanosleep(&mut ctx), OK);
         assert_eq!(ctx.read_u64(BASE + 16), Some(7), "a completed sleep leaves rem alone");
+        // A negative second count returns at once; the nanoseconds are
+        // checked first.
+        ctx.write_u64(BASE, -1i64 as u64);
+        ctx.write_u64(BASE + 8, 5);
+        let t = std::time::Instant::now();
+        assert_eq!(cb_nanosleep(&mut ctx), OK);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        ctx.write_u64(BASE + 8, -1i64 as u64);
+        assert_eq!(cb_nanosleep(&mut ctx), -1);
         let _ = vm.unmap(BASE, 0x10000);
     }
 

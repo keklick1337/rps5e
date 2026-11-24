@@ -2594,7 +2594,10 @@ fn cb_get_page_table_stats(ctx: &mut CpuContext) -> HleResult {
 /// sceKernelDirectMemoryQuery(offset, flags, info*, info_size): { start, end, type }
 fn cb_direct_memory_query(ctx: &mut CpuContext) -> HleResult {
     let (offset, flags, info, info_size) = (ctx.rdi() as i64, ctx.rsi() as i32, ctx.rdx(), ctx.rcx());
-    if offset < 0 || (flags != 0 && flags != 1) || info_size != DIRECT_QUERY_INFO_SIZE || info == 0 {
+    // Any size from 1 is accepted; the first `min(size, 24)` bytes of the
+    // record are written (title-process measurement: sizes 1..256 succeed,
+    // nothing past the size changes).
+    if offset < 0 || (flags != 0 && flags != 1) || info_size == 0 || info == 0 {
         return EINVAL;
     }
     let offset = offset as u64;
@@ -2625,7 +2628,12 @@ fn cb_direct_memory_query(ctx: &mut CpuContext) -> HleResult {
         }
     };
     let Some((s, e, t)) = result else { return EACCES };
-    if !ctx.write_u64(info, s) || !ctx.write_u64(info + 8, e) || !ctx.write_u32(info + 16, t as u32) {
+    let mut record = [0u8; DIRECT_QUERY_INFO_SIZE as usize];
+    record[..8].copy_from_slice(&s.to_le_bytes());
+    record[8..16].copy_from_slice(&e.to_le_bytes());
+    record[16..20].copy_from_slice(&(t as u32).to_le_bytes());
+    let len = (info_size as usize).min(record.len());
+    if !ctx.write_bytes(info, &record[..len]) {
         return EFAULT;
     }
     OK
@@ -2741,11 +2749,23 @@ fn cb_map_named_direct_memory(ctx: &mut CpuContext) -> HleResult {
     map_direct_cb(ctx, a, l, p, f, s, al, &name, None)
 }
 
-/// sceKernelMapDirectMemory2(inout*, len, type, prot, flags, phys, align)
+/// The argument checks sceKernelMapDirectMemory2 makes in libkernel before
+/// the map system call (PS5 13.42): the flags compared as an unsigned
+/// 32-bit value below 0x1000000, and an alignment that is 0 or a power of
+/// two from 16 KiB to 1 GiB.
+fn map_direct2_arguments_valid(flags: u64, align: u64) -> bool {
+    (flags as u32) < 0x0100_0000 && align & (align.wrapping_sub(1) | 0x3FFF) == 0 && align.max(0x4000).ilog2() <= 30
+}
+
+/// sceKernelMapDirectMemory2(inout*, len, type, prot, flags, phys, align):
+/// bad flags or alignment are EINVAL before anything is looked at.
 fn cb_map_direct_memory2(ctx: &mut CpuContext) -> HleResult {
     let rsp = ctx.get(crate::context::CpuRegister::Rsp);
     let align = ctx.read_u64(rsp + 8).unwrap_or(0);
     let (a, l, t, p, f, s) = (ctx.rdi(), ctx.rsi(), ctx.rdx() as i32, ctx.rcx() as i32, ctx.r8(), ctx.r9() as i64);
+    if !map_direct2_arguments_valid(f, align) {
+        return EINVAL;
+    }
     map_direct_cb(ctx, a, l, p, f, s, align, "", (t != -1).then_some(t))
 }
 

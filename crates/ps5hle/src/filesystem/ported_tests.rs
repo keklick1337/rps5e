@@ -305,6 +305,13 @@ fn aio_cancel_requests_and_set_param() {
     assert_eq!(call(&mut ctx, cb_aio_set_param, &[param, 129, 4, 1, 0, 0]), sce_error(EINVAL));
     assert_eq!(call(&mut ctx, cb_aio_set_param, &[param, 8, 4, 2, 0, 0]), sce_error(EINVAL));
     assert_eq!(call(&mut ctx, cb_aio_set_param, &[param, 8, 4, 1, 0x100_0001, 0]), sce_error(EINVAL));
+
+    // The console's defaults: two scheduling structs with 1 MiB splits,
+    // the third without split.
+    ctx.write_bytes(param, &[7u8; AIO_INIT_PARAM_SIZE]);
+    assert_eq!(call(&mut ctx, cb_aio_initialize_param, &[param]), 0);
+    let words: Vec<u32> = (0..15).map(|i| ctx.read_u32(param + i * 4).unwrap()).collect();
+    assert_eq!(words, [32, 32, 1, 0x10_0000, 0x10_0000, 32, 32, 1, 0x10_0000, 0x10_0000, 32, 32, 0, 0, 0]);
 }
 
 #[test]

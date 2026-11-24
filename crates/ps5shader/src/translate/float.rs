@@ -2067,9 +2067,10 @@ impl<'a> Translator<'a> {
             VCvtF32F64 => {
                 let v = self.src_f64(ins, m, 0);
                 let r = self.b().fconvert(v, Type::F32, Rounding::Rte);
-                // The output modifier does not apply to f64-source results.
-                let m = Mods { omod: 0, ..m.clone() };
-                self.write_f32_result(ins, &m, r)?;
+                // The output modifier applies to the f32 result under the
+                // f32 rule (RDNA2 rows): without IEEE mode and with f32
+                // output denormals flushed.
+                self.write_f32_result(ins, m, r)?;
             }
             _ => return Ok(false),
         }

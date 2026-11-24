@@ -250,8 +250,12 @@ fn read_sleep_request(ctx: &CpuContext, req: u64) -> Result<Duration, HleResult>
         return Err(sce_error(EFAULT));
     };
     let (sec, nsec) = (sec as i64, nsec as i64);
-    if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
+    if !(0..1_000_000_000).contains(&nsec) {
         return Err(sce_error(EINVAL));
+    }
+    // A negative interval is already over (FreeBSD kern_nanosleep).
+    if sec < 0 {
+        return Ok(Duration::ZERO);
     }
     Ok(Duration::new(sec as u64, nsec as u32))
 }
@@ -1930,6 +1934,14 @@ mod tests {
         assert_eq!(cb_sce_nanosleep(&mut ctx), OK);
         assert_eq!(ctx.read_u64(base + 16), Some(7), "a completed sleep leaves rem alone");
         assert_eq!(ctx.read_u64(base + 24), Some(7));
+        // A negative second count returns at once; nanoseconds come first.
+        ctx.write_u64(base, -1i64 as u64);
+        ctx.write_u64(base + 8, 0);
+        let t = std::time::Instant::now();
+        assert_eq!(cb_sce_nanosleep(&mut ctx), OK);
+        assert!(t.elapsed() < Duration::from_millis(500));
+        ctx.write_u64(base + 8, 1_000_000_000);
+        assert_eq!(cb_sce_nanosleep(&mut ctx), sce_error(EINVAL));
     }
 
     #[test]

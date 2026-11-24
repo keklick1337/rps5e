@@ -373,9 +373,16 @@ fn cb_get_account_id_a(ctx: &mut CpuContext) -> HleResult {
     signed_out_output(ctx, ctx.rsi(), 8)
 }
 
-/// sceNpGetAccountCountryA(userId, SceNpCountryCode*)
+/// sceNpGetAccountCountryA(userId, SceNpCountryCode*): a null output is
+/// checked first; a user id that is not a local user is USER_NOT_FOUND with
+/// the output untouched (PS5 12.40, title process); a local user is signed
+/// out.
 fn cb_get_account_country_a(ctx: &mut CpuContext) -> HleResult {
-    signed_out_output(ctx, ctx.rsi(), COUNTRY_CODE_SIZE)
+    let (user, out) = (ctx.rdi() as i32, ctx.rsi());
+    if out != 0 && crate::user_service::user_index(user).is_none() {
+        return ERR_USER_NOT_FOUND as i64;
+    }
+    signed_out_output(ctx, out, COUNTRY_CODE_SIZE)
 }
 
 /// Clear an account output and report the user as signed out.
@@ -880,6 +887,28 @@ mod tests {
             args(&mut ctx, &[id as u64]);
             assert_eq!(cb_delete_request(&mut ctx), 0);
         }
+    }
+
+    /// sceNpGetAccountCountryA: null output first (INVALID_ARGUMENT for
+    /// user 0 too), an unknown user is USER_NOT_FOUND with the output
+    /// untouched, a local user is signed out with the output cleared.
+    #[test]
+    fn account_country_unknown_user() {
+        let vm = ps5vm::VirtualMemory::new();
+        const BASE: u64 = 0x5D0B_8000_0000;
+        vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
+        let mut ctx = CpuContext::new(&vm);
+        ctx.write_bytes(BASE, &[0xCC; 16]);
+        args(&mut ctx, &[0, 0]);
+        assert_eq!(cb_get_account_country_a(&mut ctx), ERR_INVALID_ARGUMENT as i64);
+        for user in [BASE as u32 as u64, 0, 1, u32::MAX as u64] {
+            args(&mut ctx, &[user, BASE]);
+            assert_eq!(cb_get_account_country_a(&mut ctx), ERR_USER_NOT_FOUND as i64, "user {user:#x}");
+            assert_eq!(ctx.read_bytes(BASE, 16).unwrap(), vec![0xCC; 16]);
+        }
+        args(&mut ctx, &[crate::user_service::PRIMARY_USER_ID as u64, BASE]);
+        assert_eq!(cb_get_account_country_a(&mut ctx), ERR_SIGNED_OUT as i64);
+        assert_eq!(ctx.read_bytes(BASE, COUNTRY_CODE_SIZE).unwrap(), vec![0; COUNTRY_CODE_SIZE]);
     }
 
     #[test]

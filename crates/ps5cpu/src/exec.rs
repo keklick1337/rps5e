@@ -639,6 +639,38 @@ fn read_rsp() -> u64 {
     rsp
 }
 
+/// MXCSR a thread starts guest code with on the console: flush-to-zero
+/// and denormals-are-zero, every exception masked (the console libc's
+/// default environment `__fe_dfl_env` holds the same value).
+pub const GUEST_INITIAL_MXCSR: u32 = 0x9FC0;
+
+/// The MXCSR guest threads start with: [`GUEST_INITIAL_MXCSR`], or
+/// `RPS5E_GUEST_MXCSR=<hex>` (e.g. `1f80`, the host default, to compare).
+fn guest_initial_mxcsr() -> u32 {
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("RPS5E_GUEST_MXCSR")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .map_or(GUEST_INITIAL_MXCSR, |v| v & 0xFFFF)
+    })
+}
+
+thread_local! {
+    static GUEST_MXCSR_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Give this host thread the console's initial MXCSR before its first
+/// guest call (once per thread; later calls keep what the guest set).
+fn init_thread_mxcsr() {
+    if GUEST_MXCSR_READY.with(|f| f.replace(true)) {
+        return;
+    }
+    let csr = guest_initial_mxcsr();
+    // SAFETY: loads MXCSR from a local; reserved bits are clear.
+    unsafe { std::arch::asm!("ldmxcsr [{p}]", p = in(reg) &csr, options(nostack, readonly, preserves_flags)) };
+}
+
 /// Run guest code with `regs` until it leaves through the sentinel or a
 /// thread exit. May be called from HLE callbacks (nested guest calls).
 #[inline(never)]
@@ -648,6 +680,7 @@ pub fn enter_guest(regs: &GuestRegs) -> GuestExit {
         crate::win::init();
         crate::win::init_thread_fpu();
     }
+    init_thread_mxcsr();
     let regs = *regs;
     let t = exec();
     assert!(t.depth < MAX_NESTING, "guest call nesting too deep");

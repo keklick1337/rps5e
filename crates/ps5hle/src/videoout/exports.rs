@@ -347,20 +347,20 @@ fn cb_allow_output_resolution_wqhd_detection(ctx: &mut CpuContext) -> HleResult 
     if lock().ports.contains_key(&handle_arg(ctx.rdi())) { OK } else { ERROR_INVALID_HANDLE }
 }
 
-/// sceVideoOutSetFlipRate(handle, rate) — 0: 60 Hz, 1: 30 Hz, 2: 20 Hz.
+/// sceVideoOutSetFlipRate(handle, rate): a flip waits `rate + 1` vblanks
+/// (0: 60 Hz, 1: 30 Hz, 2: 20 Hz, 3: 15 Hz). The handle is checked before
+/// the rate, and 0..=3 are accepted (measured on a PS5; what rate 3 does
+/// was not measured).
 fn cb_set_flip_rate(ctx: &mut CpuContext) -> HleResult {
     let handle = handle_arg(ctx.rdi());
     let rate = ctx.rsi() as i32;
-    if !(0..=2).contains(&rate) {
+    let mut s = lock();
+    let Some(p) = s.ports.get_mut(&handle) else { return ERROR_INVALID_HANDLE };
+    if !(0..=3).contains(&rate) {
         return ERROR_INVALID_VALUE;
     }
-    match lock().ports.get_mut(&handle) {
-        Some(p) => {
-            p.flip_rate = rate;
-            OK
-        }
-        None => ERROR_INVALID_HANDLE,
-    }
+    p.flip_rate = rate;
+    OK
 }
 
 /// sceVideoOutConfigureOutput(handle, mode, options*, reserved...)

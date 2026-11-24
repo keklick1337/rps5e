@@ -146,23 +146,29 @@ pub use ps5gpu::render::regfile::{
 /// VGT_INDEX_TYPE (user-config bank).
 pub const VGT_INDEX_TYPE: u32 = 0x243;
 
-/// libSceAgc private-data packets: SET_UCONFIG_REG (custom 1) writes to
-/// register 0x342 carrying a tag, bracketing multi-draws and user waits.
+/// libSceAgc private-data packets: SET_UCONFIG_REG writes to register 0x342
+/// carrying a tag, bracketing multi-draws and user waits. The header has
+/// custom bits 1 (R) in a DCB and 0 in an ACB.
 pub const INTERNAL_DATA_REGISTER: u32 = 0x342;
+pub const DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG: u32 = 0xC600_0005;
+pub const DRAW_INDEX_MULTI_INST_BEGIN_TAG: u32 = 0xC600_0006;
 pub const DRAW_INDIRECT_MULTI_BEGIN_TAG: u32 = 0xC600_0008;
-pub const DRAW_INDIRECT_MULTI_END_TAG: u32 = 0xC600_0000;
+pub const DRAW_END_TAG: u32 = 0xC600_0000;
 pub const WAIT_USER_DATA_BEGIN32_TAG: u32 = 0xC801_0000;
 pub const WAIT_USER_DATA_BEGIN64_TAG: u32 = 0xC802_0000;
 pub const WAIT_USER_DATA_END_TAG: u32 = 0xC800_0000;
 
 /// True for a libSceAgc private-data packet (`payload` excludes the header).
 pub fn is_internal_data_packet(h: u32, payload: &[u32]) -> bool {
-    if payload.len() < 2 || opcode(h) != op::SET_UCONFIG_REG || custom(h) != 1 || payload[0] != INTERNAL_DATA_REGISTER {
+    if payload.len() < 2 || opcode(h) != op::SET_UCONFIG_REG || custom(h) > 1 || payload[0] != INTERNAL_DATA_REGISTER {
         return false;
     }
     match length(h) {
         4 => matches!(payload[1] & 0xFFFF_0000, WAIT_USER_DATA_BEGIN32_TAG | WAIT_USER_DATA_BEGIN64_TAG),
-        3 => matches!(payload[1], WAIT_USER_DATA_END_TAG | DRAW_INDIRECT_MULTI_BEGIN_TAG | DRAW_INDIRECT_MULTI_END_TAG),
+        3 => matches!(
+            payload[1],
+            WAIT_USER_DATA_END_TAG | DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG | DRAW_INDEX_MULTI_INST_BEGIN_TAG | DRAW_INDIRECT_MULTI_BEGIN_TAG | DRAW_END_TAG
+        ),
         _ => false,
     }
 }

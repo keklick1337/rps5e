@@ -237,11 +237,20 @@ impl Equeue {
         }
         let Some(i) = Self::find(&mut s, ident, filter) else { return ERR_NOT_FOUND };
         let e = &mut s.events[i];
+        let was_triggered = e.triggered;
         if !e.disabled {
             match e.filter.trigger {
                 Some(f) => f(e, data),
                 None => e.triggered = true,
             }
+        }
+        // A user event that becomes active joins the tail of the active
+        // list, as the kernel enqueues a knote when it activates: a wait
+        // reports user events in the order they were triggered. Triggering
+        // an event that is already active keeps its place.
+        if filter == FILTER_USER && !was_triggered && s.events[i].triggered {
+            let e = s.events.remove(i);
+            s.events.push(e);
         }
         self.notify(&s);
         OK
@@ -940,9 +949,16 @@ fn cb_delete_write_event(ctx: &mut CpuContext) -> HleResult {
     delete_event(ctx.rdi(), ctx.rsi() as i32 as u32 as u64, FILTER_WRITE)
 }
 
-/// sceKernelAddAmprEvent(eq, int id, void* udata): always succeeds; an
-/// invalid queue is ignored.
+/// sceKernelAddAmprEvent(eq, int id, void* udata): a queue that is not
+/// live (null included) is EBADF (measured in a title process on a PS5).
 fn cb_add_ampr_event(ctx: &mut CpuContext) -> HleResult {
+    let (handle, id, udata) = (ctx.rdi(), ctx.rsi() as i32 as u64, ctx.rdx());
+    if handle != 0 && register_event(handle, id, FILTER_AMPR, udata, EV_ADD | EV_CLEAR, 0) { OK } else { ERR_BAD_QUEUE }
+}
+
+/// sceKernelAddAmprSystemEvent(eq, int id, void* udata): always succeeds;
+/// an invalid queue is ignored (unmeasured).
+fn cb_add_ampr_system_event(ctx: &mut CpuContext) -> HleResult {
     let (handle, id, udata) = (ctx.rdi(), ctx.rsi() as i32 as u64, ctx.rdx());
     if handle != 0 {
         register_event(handle, id, FILTER_AMPR, udata, EV_ADD | EV_CLEAR, 0);
@@ -1036,7 +1052,7 @@ pub(crate) static EXPORTS: &[Export] = &[
     ("R-tyYMpYaxY", "sceKernelAddWriteEvent", "libKernel", cb_add_write_event),
     ("cBGTk8S92XM", "sceKernelDeleteWriteEvent", "libKernel", cb_delete_write_event),
     ("bBfz7kMF2Ho", "sceKernelAddAmprEvent", "libKernel", cb_add_ampr_event),
-    ("vuae5JPNt9A", "sceKernelAddAmprSystemEvent", "libKernel", cb_add_ampr_event),
+    ("vuae5JPNt9A", "sceKernelAddAmprSystemEvent", "libKernel", cb_add_ampr_system_event),
     ("bMmid3pfyjo", "sceKernelDeleteAmprEvent", "libKernel", cb_delete_ampr_event),
     ("Ij+ryuEClXQ", "sceKernelDeleteAmprSystemEvent", "libKernel", cb_delete_ampr_event),
     ("QyrxcdBrb0M", "sceKernelGetKqueueFromEqueue", "libKernel", cb_get_kqueue_from_equeue),

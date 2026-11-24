@@ -4034,12 +4034,24 @@ fn cb_aio_set_param(ctx: &mut CpuContext) -> HleResult {
     sce(write_guest(ctx, p, &b).map(|_| 0))
 }
 
+/// The defaults `sceKernelAioInitializeParam` writes (console measurement):
+/// three scheduling structs `{window, delayed, enableSplit, splitSize,
+/// splitChunkSize}`, the first two with 1 MiB splits, the last without.
+fn aio_default_param() -> [u8; AIO_INIT_PARAM_SIZE] {
+    let mut b = [0u8; AIO_INIT_PARAM_SIZE];
+    let rows: [[u32; 5]; 3] = [[32, 32, 1, 0x10_0000, 0x10_0000], [32, 32, 1, 0x10_0000, 0x10_0000], [32, 32, 0, 0, 0]];
+    for (i, v) in rows.iter().flatten().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
 fn cb_aio_initialize_param(ctx: &mut CpuContext) -> HleResult {
     let p = ctx.rdi();
     if p == 0 {
         return sce_error(EINVAL);
     }
-    sce(write_guest(ctx, p, &[0u8; AIO_INIT_PARAM_SIZE]).map(|_| 0))
+    sce(write_guest(ctx, p, &aio_default_param()).map(|_| 0))
 }
 
 fn cb_aio_initialize_impl(ctx: &mut CpuContext) -> HleResult {

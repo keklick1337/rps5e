@@ -4,6 +4,31 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+## [0.1.8-alpha] - 2026-11-23
+
+### Changed
+
+- The emulated display is 1080p by default (it was 2160p), in the launcher, `rps5e-cli run` and the test scripts: games that size their output to the display render a quarter of the pixels and the window scales the picture, which is much lighter on the GPU. 2160p (and 720p) stay selectable in the launcher's settings, per game, and with `--display-resolution` / `RPS5E_DISPLAY_RESOLUTION`. Games that do not ask for the display's resolution are shown a 2160p display as on the console.
+- System functions answer as measured on a PS5 in a game process: a trylock of an adaptive mutex by its owner returns EINVAL (was EBUSY); `sceKernelAddAmprEvent` on a deleted or null event queue returns EBADF (was success); `sceSystemServiceReceiveEvent` with no event pending returns "no event" for any pointer and leaves the buffer untouched (it wrote an empty event first, and a null pointer was a parameter error); the `sceNetGetSockInfo` record carries the socket priority 0x10.
+- `sceVideoOutSetFlipRate` checks the handle before the rate and accepts rate 3 (a flip every fourth vblank), as on a PS5.
+- More system functions follow the console: `sceKernelMapDirectMemory2` refuses flags of 0x1000000 and above and an alignment that is not 0 or a power of two from 16 KiB to 1 GiB; clock id 21 (process CPU time) is answered; `sceKernelGettimezone(NULL)` succeeds; `sceNpGetAccountCountryA` reports an unknown user as "user not found"; `sceUserServiceRegisterEventCallback` / `sceUserServiceUnregisterEventCallback` exist (they were missing); `scePadRead` checks its arguments before the handle, and `scePadReadState` fills the record with a resting pad before it checks the handle.
+- AGC command builders write the packets the console library writes: `sceAgcDcbAcquireMem` / `sceAgcAcbAcquireMem` emit the native ACQUIRE_MEM (GL2 invalidation always with write-back, a DB flush covers the whole address space), `sceAgcDcbCondExec` takes any arguments, `sceAgcDcbSetIndexCount(0)` writes 1, a branch with a null target leaves that slot empty, and the indexed multi-draws (`sceAgcDcbDrawIndexMultiInstanced`, `sceAgcDcbDrawIndexIndirectMulti`) carry their begin/end markers (their GetSize grows to 60 / 64 bytes).
+- AGC patch setters match the console: `sceAgcJumpPatchSetTarget` keeps the low bits of the target dword and writes the whole high address, `sceAgcCondExecPatchSetEnd` / `...SetCommandAddress` check only the opcode and wrap; the command processor ignores the two low bits of an indirect-buffer target.
+- GPU interrupt events carry `context id << 16 | event id` in their data, and `sceAgcDriverGetEqEventType` / `sceAgcDriverGetEqContextId` read it as the console driver does.
+- `sceAgcDriverSubmitMultiDcbs` / `SubmitMultiCommandBuffers` / `SubmitMultiAcbs` with no buffers return the driver's empty-submit error; AGR submissions fail until `sceAgcDriverSetupAsyncGraphics` (new) enables the asynchronous graphics queue; `sceAgcDriverRegisterWorkloadStream` refuses an id already registered before it looks at the stream pointer.
+- Compute-queue wait markers are written without the R bit, as the console driver writes ACB user data.
+- Pad trigger effects without force (strength 0, or a vibration without amplitude or frequency) report the off state in `scePadGetTriggerEffectState`, as a controller running the off effect does.
+- Guest threads start with the console's floating-point environment: MXCSR 0x9FC0 (denormals flush to zero, every exception masked), the value the console's C library also holds as its default environment; host threads keep theirs. `RPS5E_GUEST_MXCSR=1f80` restores the host default for comparisons.
+- ATRAC9 streams past the end of a gapless segment keep consuming their input (frames are counted, nothing is written) until the segment is reset, as on a PS5; before, every later decode reported nothing consumed, which can stall a game's audio streaming.
+- `sceAgcCreateShader` checks the shader header before it writes anything and answers with the console's error codes (bad header, bad version, already created); a second create of the same shader no longer relocates its pointers twice.
+- More system functions answer as measured on a PS5: `sceKernelDirectMemoryQuery` accepts any record size from 1 byte and writes only that much; `sceNetCtlGetResult` refuses event types 2 and 3; user events are reported by `sceKernelWaitEqueue` in the order they were triggered; `sceAjmInstanceCreate` refuses invalid flags; `sceKernelAioInitializeParam` writes the console's default scheduling parameters; `sceFiberOptParamInitialize` fills the whole option block; a new thread attribute has a 16 KiB guard; `scePthreadGetprio` of an ended thread is "no such thread"; a second coredump handler registration (and an unregistration without one) is refused; `nanosleep` with a negative interval returns at once.
+- Shaders: the output modifier (`mul:2`, `mul:4`, `div:2`) of `v_cvt_f32_f64` is applied as the GPU does (without IEEE mode and with f32 denormals flushed). The shader cache is rebuilt once.
+
+### Fixed
+
+- GPU command builders follow the console's library: `sceAgcDcbAtomicMem` takes its engine argument first and `sceAgcAcbAtomicMem` its address before the cache policy (memory atomics built by games landed on a wrong address and with wrong operands), with the console's loop-interval encoding; `sceAgcCbCondWrite` encodes every argument as given (it refused some and encoded the GDS write space as a register write); `sceAgcDcbDrawIndexIndirectMulti` takes bit 0 of its count-from-memory argument instead of building nothing for other values.
+- `pthread_cond_timedwait` with an absolute deadline centuries ahead no longer times out early.
+
 ## [0.1.7-alpha] - 2026-11-13
 
 ### Fixed

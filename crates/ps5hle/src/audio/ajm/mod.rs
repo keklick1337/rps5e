@@ -560,11 +560,25 @@ fn cb_module_unregister(_ctx: &mut CpuContext) -> HleResult {
     0
 }
 
+/// SCE_AJM_ERROR_INVALID_FLAGS.
+pub const AJM_ERROR_INVALID_FLAGS: HleResult = 0x8093_000Cu32 as i32 as i64;
+
+/// The instance flags the module refuses (its check, after the null
+/// output): a sample encoding above 2 (bits 7-9), bit 13 without bit 10,
+/// or a reserved bit (14-31, 60-63).
+fn instance_flags_valid(flags: u64) -> bool {
+    flags & 0x380 < 0x180 && flags & 0x2400 != 0x2000 && flags & 0xF000_0000_FFFF_C000 == 0
+}
+
 /// sceAjmInstanceCreate(context, codec, flags, u32 *instance)
 fn cb_instance_create(ctx: &mut CpuContext) -> HleResult {
     let (context, codec, flags, out) = (ctx.rdi() as u32, ctx.rsi() as u32, ctx.rdx(), ctx.rcx());
     if out == 0 {
         return AJM_ERROR_INVALID_PARAMETER;
+    }
+    if !instance_flags_valid(flags) {
+        log::warn!("[AUDIO] sceAjmInstanceCreate codec={codec} flags={flags:#x}: invalid flags");
+        return AJM_ERROR_INVALID_FLAGS;
     }
     let supported = log_codec_support(codec);
     let slot = NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed) & INSTANCE_SLOT_MASK;

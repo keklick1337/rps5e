@@ -55,7 +55,7 @@ fn bind() -> u64 {
 
 #[test]
 fn errorcheck_mutex_semantics() {
-    let s = Scratch::new(0x5CE0_0000_0000);
+    let s = Scratch::new(0x6B50_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let m = s.base;
@@ -156,7 +156,7 @@ fn mutex_blocks_other_threads_until_unlock() {
 
 #[test]
 fn cond_signal_wakes_one_waiter_in_order() {
-    let s = Scratch::new(0x5CE4_0000_0000);
+    let s = Scratch::new(0x6B51_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let (m, c) = (s.base, s.base + 8);
@@ -199,7 +199,7 @@ fn cond_signal_wakes_one_waiter_in_order() {
 
 #[test]
 fn cond_broadcast_and_signalto() {
-    let s = Scratch::new(0x5CE5_0000_0000);
+    let s = Scratch::new(0x6B52_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let (m, c) = (s.base, s.base + 8);
@@ -257,7 +257,7 @@ fn cond_broadcast_and_signalto() {
 
 #[test]
 fn cond_wait_checks_owner_and_keeps_recursion() {
-    let s = Scratch::new(0x5CE6_0000_0000);
+    let s = Scratch::new(0x6B53_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let (attr, m, c) = (s.base, s.base + 8, s.base + 16);
@@ -284,6 +284,33 @@ fn cond_wait_checks_owner_and_keeps_recursion() {
     ctx.write_u64(ts + 8, 1_000_000_000);
     assert_eq!(call(&mut ctx, cb_posix_cond_timedwait, &[c, m, ts]), EINVAL);
     assert_eq!(call(&mut ctx, cb_mutex_unlock, &[m]), OK);
+}
+
+/// An absolute deadline centuries away (past 2^64 ns from now) waits
+/// until the signal instead of wrapping into a short timeout.
+#[test]
+fn far_cond_deadline_does_not_time_out_early() {
+    let s = Scratch::new(0x6B56_0000_0000);
+    let mut ctx = s.ctx();
+    bind();
+    let (m, c, ts) = (s.base, s.base + 8, s.base + 0x100);
+    assert_eq!(call(&mut ctx, cb_mutex_init, &[m, 0, 0]), OK);
+    assert_eq!(call(&mut ctx, cb_cond_init, &[c, 0, 0]), OK);
+    assert_eq!(call(&mut ctx, cb_mutex_lock, &[m]), OK);
+    let now = crate::time::clock_now(0).unwrap().as_nanos();
+    let target = now + (1u128 << 64) + 10_000_000;
+    ctx.write_u64(ts, (target / 1_000_000_000) as u64);
+    ctx.write_u64(ts + 8, (target % 1_000_000_000) as u64);
+    let vm = s.vm;
+    let signaller = std::thread::spawn(move || {
+        let mut ctx = CpuContext::new(vm);
+        bind();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(call(&mut ctx, cb_cond_signal, &[c]), OK);
+    });
+    assert_eq!(call(&mut ctx, cb_posix_cond_timedwait, &[c, m, ts]), OK);
+    assert_eq!(call(&mut ctx, cb_mutex_unlock, &[m]), OK);
+    signaller.join().unwrap();
 }
 
 #[test]
@@ -335,7 +362,7 @@ fn posix_rwlockattr_init_and_destroy() {
 
 #[test]
 fn rwlock_writer_preference_and_errors() {
-    let s = Scratch::new(0x5CE8_0000_0000);
+    let s = Scratch::new(0x6B54_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let l = s.base;
@@ -998,7 +1025,7 @@ fn rwlock_destroy_answers_as_the_console() {
 /// is EINVAL.
 #[test]
 fn posix_timed_locks_try_first_and_take_null_deadlines() {
-    let s = Scratch::new(0x6A1F_0000_0000);
+    let s = Scratch::new(0x6B55_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let (m, l, ts) = (s.base, s.base + 8, s.base + 0x100);
@@ -1512,11 +1539,14 @@ fn bench_mutex_handoff() {
 /// affinity mask is taken.
 #[test]
 fn attr_calls_return_the_console_errors() {
-    let s = Scratch::new(0x6A20_0000_0000);
+    let s = Scratch::new(0x6A2A_0000_0000);
     let mut ctx = s.ctx();
     bind();
     let (attr, param, out, unset) = (s.base, s.base + 0x100, s.base + 0x200, s.base + 0x300);
     assert_eq!(call(&mut ctx, cb_attr_init, &[attr]), OK);
+    // A fresh attribute's guard is one 16 KiB page.
+    assert_eq!(call(&mut ctx, cb_attr_getguardsize, &[attr, out]), OK);
+    assert_eq!(ctx.read_u64(out), Some(0x4000));
     for size in [0u64, 1, 16383] {
         assert_eq!(call(&mut ctx, cb_attr_setstacksize, &[attr, size]), EINVAL);
     }
@@ -1644,7 +1674,9 @@ fn schedparam_and_affinity_checks() {
         assert_eq!(call(&mut ctx, cb_getschedparam, &[me, policy, param]), OK);
         assert_eq!((ctx.read_u32(policy), ctx.read_u32(param)), (Some(pol as u32), Some(prio)));
     }
-    assert_eq!(call(&mut ctx, cb_getprio, &[0, param]), EINVAL);
+    ctx.write_u32(param, 0xFFFF_FFB3);
+    assert_eq!(call(&mut ctx, cb_getprio, &[0, param]), ESRCH);
+    assert_eq!(ctx.read_u32(param), Some(0xFFFF_FFB3), "output untouched");
     assert_eq!(call(&mut ctx, cb_setprio, &[0, 700]), EINVAL);
     assert_eq!(call(&mut ctx, cb_getaffinity, &[0, param]), EINVAL);
     assert_eq!(call(&mut ctx, cb_setaffinity, &[0, 1]), EINVAL);
@@ -1842,7 +1874,7 @@ fn mutex_loop_counts_and_ownership() {
 /// a live one answers (reference GuestPthread cases measured on a PS5).
 #[test]
 fn ended_thread_is_esrch_before_join() {
-    let s = Scratch::new(0x6A26_0000_0000);
+    let s = Scratch::new(0x6A28_0000_0000);
     let mut ctx = s.ctx();
     let errno = crate::kernel::bind_test_errno(&ctx);
     let (worker, _) = fake_thread("ended", DEFAULT_AFFINITY);
@@ -1862,6 +1894,10 @@ fn ended_thread_is_esrch_before_join() {
     assert_eq!(call(&mut ctx, crate::signals::tests_pthread_kill, &[worker, 0]), 3);
     assert_eq!(call(&mut ctx, px_getprio, &[worker]), -1);
     assert_eq!(ctx.read_u32(errno), Some(3));
+    // scePthreadGetprio answers the same: ESRCH, the output untouched.
+    ctx.write_u32(s.base + 0x80, 0xFFFF_FFB3);
+    assert_eq!(call(&mut ctx, cb_getprio, &[worker, s.base + 0x80]), ESRCH);
+    assert_eq!(ctx.read_u32(s.base + 0x80), Some(0xFFFF_FFB3));
     assert_eq!(call(&mut ctx, px_getprio, &[0]), -1);
     forget_fake_thread(worker);
     forget_fake_thread(me);
@@ -1875,7 +1911,7 @@ mod posix_ext;
 /// is EINVAL and an ended one ESRCH; pthread_attr_get_np reports the flag.
 #[test]
 fn create_suspended_waits_for_resume() {
-    let s = Scratch::new(0x6A27_0000_0000);
+    let s = Scratch::new(0x6A29_0000_0000);
     let mut ctx = s.ctx();
     let (attr, destroyed, got) = (s.base, s.base + 8, s.base + 16);
     assert_eq!(call(&mut ctx, px_attr_setcreatesuspend, &[0]), 22);
@@ -1941,4 +1977,29 @@ fn cond_setname_np_lifecycle() {
     assert_eq!(call(&mut ctx, px_cond_setname_np, &[lazy, name]), 0);
     assert_ne!(ctx.read_u64(lazy), Some(0), "a static condition variable is created");
     assert_eq!(call(&mut ctx, px_cond_destroy, &[lazy]), 0);
+}
+
+/// A trylock by the owner, per mutex type (a title process on a PS5:
+/// error-check 0x80020010, recursive 0, normal 0x80020010, adaptive
+/// 0x80020016), in both lock implementations and through the POSIX name.
+#[test]
+fn owner_trylock_by_mutex_type() {
+    let s = Scratch::new(0x6B48_0000_0000);
+    let mut ctx = s.ctx();
+    bind();
+    let rows = [(MUTEX_ERRORCHECK, EBUSY, 16), (MUTEX_RECURSIVE, OK, 0), (3, EBUSY, 16), (MUTEX_ADAPTIVE, EINVAL, 22)];
+    for fast in [true, false] {
+        for (i, (kind, sce, posix)) in rows.into_iter().enumerate() {
+            let m = s.base + (fast as u64) * 0x400 + i as u64 * 0x40;
+            make_mutex(&mut ctx, m, kind, (fast, 0));
+            assert_eq!(call(&mut ctx, cb_mutex_lock, &[m]), OK);
+            assert_eq!(call(&mut ctx, cb_mutex_trylock, &[m]), sce, "type {kind} fast {fast}");
+            assert_eq!(call(&mut ctx, px_mutex_trylock, &[m]), posix, "type {kind} fast {fast} (POSIX)");
+            let held = if kind == MUTEX_RECURSIVE { 3 } else { 1 };
+            for _ in 0..held {
+                assert_eq!(call(&mut ctx, cb_mutex_unlock, &[m]), OK);
+            }
+            assert_eq!(call(&mut ctx, cb_mutex_unlock, &[m]), EPERM);
+        }
+    }
 }

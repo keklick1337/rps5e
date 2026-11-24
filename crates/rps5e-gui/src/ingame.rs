@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(live_changes(&a, &b).len(), 4);
         assert_eq!(restart_pending(&b, &st), ["console language", "refresh rate", "HDR", GPU_SWITCHES[0].env]);
         // So is the display resolution.
-        b.display_resolution = "1080p".into();
+        b.display_resolution = "2160p".into();
         assert_eq!(live_changes(&a, &b).len(), 4);
         assert_eq!(
             restart_pending(&b, &st),
@@ -1262,14 +1262,14 @@ mod tests {
             "RPS5E_SYSTEM_LANGUAGE" => Some("8".into()),
             "RPS5E_GUEST_REFRESH_RATE" => Some("120".into()),
             "RPS5E_HDR" => Some("1".into()),
-            "RPS5E_DISPLAY_RESOLUTION" => Some("1080P".into()),
+            "RPS5E_DISPLAY_RESOLUTION" => Some("2160P".into()),
             "RPS5E_SAFE" => Some("1".into()),
             _ => None,
         });
         assert!(st.hdr);
         assert!(restart_pending(&b, &st).is_empty());
         assert!(!started().hdr, "HDR is off without RPS5E_HDR");
-        assert_eq!(started().display_resolution, "2160p", "2160p without RPS5E_DISPLAY_RESOLUTION");
+        assert_eq!(started().display_resolution, "1080p", "1080p without RPS5E_DISPLAY_RESOLUTION");
     }
 
     #[test]
@@ -1433,7 +1433,7 @@ mod tests {
         app.state.hint = false;
         app.state.section = Section::Graphics;
         let mut next = app.state.settings.clone();
-        next.display_resolution = "1080p".into();
+        next.display_resolution = "2160p".into();
         app.state.set_settings(next);
         shot(&mut app, Vec::new(), "ingame-graphics.png");
         // The corner indicators over a game frame: the shader cache list

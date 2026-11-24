@@ -172,8 +172,8 @@ fn output_status_stays_sdr_with_hdr_off() {
     assert!(h > 0);
     assert_eq!(call("sceVideoOutGetOutputStatus", &mut ctx, &[h as u64, BASE + 0x100]), 0);
     // The tests run without param.json and without RPS5E_DISPLAY_RESOLUTION:
-    // a 2160p display, whatever buffers the port has.
-    assert_eq!(ctx.read_bytes(BASE + 0x100, 0x30).unwrap(), output_status_bytes(2, 60, false));
+    // the default 1080p display, whatever buffers the port has.
+    assert_eq!(ctx.read_bytes(BASE + 0x100, 0x30).unwrap(), output_status_bytes(1, 60, false));
     assert_eq!(call("sceVideoOutClose", &mut ctx, &[h as u64]), 0);
 }
 
@@ -200,7 +200,14 @@ fn open_register_flip_and_events() {
     assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[hu, 5, 0, 0, 0]), ERROR_UNKNOWN_OUTPUT_MODE);
     assert_eq!(call("sceVideoOutIsOutputSupported", &mut ctx, &[999, 1, 0, 0, 0]), ERROR_INVALID_HANDLE);
     assert_eq!(call("sceVideoOutGetOutputStatus", &mut ctx, &[hu, BASE + 0x300]), 0);
-    assert_eq!(call("sceVideoOutSetFlipRate", &mut ctx, &[hu, 3]), ERROR_INVALID_VALUE);
+    // The handle first, then the rate (0..=3).
+    assert_eq!(call("sceVideoOutSetFlipRate", &mut ctx, &[hu, 3]), 0);
+    for bad in [30u64, 60, u32::MAX as u64, i32::MAX as u64] {
+        assert_eq!(call("sceVideoOutSetFlipRate", &mut ctx, &[hu, bad]), ERROR_INVALID_VALUE, "rate {bad}");
+    }
+    for (handle, rate) in [(u32::MAX as u64, 0), (99, 0), (u32::MAX as u64, 30)] {
+        assert_eq!(call("sceVideoOutSetFlipRate", &mut ctx, &[handle, rate]), ERROR_INVALID_HANDLE, "handle {handle:#x} rate {rate}");
+    }
     assert_eq!(call("sceVideoOutSetFlipRate", &mut ctx, &[hu, 0]), 0);
 
     // Event queue registrations; output mode fires immediately.
@@ -543,9 +550,9 @@ fn resolution_status_layout() {
     assert_eq!(call("sceVideoOutGetResolutionStatus", &mut ctx, &[h, st]), 0);
     let raw = ctx.read_bytes(st, 0x40).unwrap();
     let u32_at = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
-    // Full and pane size are the emulated display's (2160p by default, no
+    // Full and pane size are the emulated display's (1080p by default, no
     // param.json in the tests), not the port's buffer size.
-    assert_eq!((u32_at(0x0), u32_at(0x4), u32_at(0x8), u32_at(0xC)), (3840, 2160, 3840, 2160));
+    assert_eq!((u32_at(0x0), u32_at(0x4), u32_at(0x8), u32_at(0xC)), (1920, 1080, 1920, 1080));
     // Screen size, flags and reserved words are zero; the status is 48 bytes.
     assert!(raw[0x18..0x30].iter().all(|&b| b == 0));
     assert!(raw[0x30..0x40].iter().all(|&b| b == 0xFF));

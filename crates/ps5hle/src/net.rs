@@ -1949,6 +1949,9 @@ fn sock_info_record(id: i32, name: &str, sock: &HostSocket) -> [u8; NET_SOCK_INF
     b[36..40].copy_from_slice(&id.to_le_bytes());
     let stream = get_int_opt(sock.fd, libc::SOL_SOCKET, libc::SO_TYPE) == Ok(libc::SOCK_STREAM);
     b[40] = if stream { 1 } else { 2 };
+    // Priority 0x10 and policy 0 (both socket types, measured in a title
+    // process on a PS5).
+    b[0x2A] = 0x10;
     let mut queued: i32 = 0;
     if unsafe { libc::ioctl(sock.fd, libc::FIONREAD, &mut queued) } == 0 {
         b[44..48].copy_from_slice(&queued.to_le_bytes());
@@ -4301,6 +4304,8 @@ mod tests {
         set(&mut ctx, &[s, BASE + 0x400, 1, 0]);
         assert_eq!(cb_get_sock_info(&mut ctx), 1);
         assert_eq!(ctx.read_cstring(BASE + 0x400, 32).unwrap(), "udp");
+        // Type, policy and priority bytes as a PS5 reports a UDP socket.
+        assert_eq!(ctx.read_bytes(BASE + 0x400 + 0x28, 4).unwrap(), vec![2, 0, 0x10, 0]);
         // The flags (SELF, and NONBLOCK when set) and the buffer sizes.
         assert_eq!(ctx.read_u32(BASE + 0x400 + 0x48).map(|f| f & 1), Some(1));
         assert!(ctx.read_u32(BASE + 0x400 + 0x64).unwrap() > 0);

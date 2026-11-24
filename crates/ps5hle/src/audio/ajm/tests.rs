@@ -48,6 +48,17 @@ fn context_instance_and_batch_jobs() {
     assert_eq!(call(&mut ctx, cb_module_register, &[c, 22, 0]), AJM_ERROR_CODEC_NOT_SUPPORTED);
     assert_eq!(call(&mut ctx, cb_module_register, &[c, CODEC_DEC_OPUS as u64, 0]), 0);
 
+    // Refused flags leave the output alone; a null output comes first.
+    ctx.write_u32(BASE + 8, 0xCCCC_CCCC);
+    for bad in [0x4000u64, 1 << 60, 0x180, 0x380, 0x2000, 1 << 31] {
+        assert_eq!(call(&mut ctx, cb_instance_create, &[c, CODEC_DEC_MP3 as u64, bad | 2, BASE + 8]), AJM_ERROR_INVALID_FLAGS, "{bad:#x}");
+    }
+    assert_eq!(ctx.read_u32(BASE + 8), Some(0xCCCC_CCCC));
+    assert_eq!(call(&mut ctx, cb_instance_create, &[c, CODEC_DEC_MP3 as u64, 0x2000, 0]), AJM_ERROR_INVALID_PARAMETER);
+    for good in [0x2400u64, 0x100, 0x80, 1 << 32] {
+        assert!(instance_flags_valid(good | 2), "{good:#x}");
+    }
+
     // S16 stereo MP3 instance.
     assert_eq!(call(&mut ctx, cb_instance_create, &[c, CODEC_DEC_MP3 as u64, 2, BASE + 8]), 0);
     let inst = ctx.read_u32(BASE + 8).unwrap();

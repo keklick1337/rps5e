@@ -52,7 +52,8 @@ const DEFAULT_STACK_SIZE: u64 = 0x10_0000;
 const STACK_HEADROOM: u64 = 0x10_0000;
 /// Largest guest stack: a stack slot less the headroom below it.
 const MAX_STACK_SIZE: u64 = STACK_SLOT - STACK_HEADROOM;
-const DEFAULT_GUARD_SIZE: u64 = 0x1000;
+/// A fresh attribute's guard size: one 16 KiB page (console measurement).
+const DEFAULT_GUARD_SIZE: u64 = 0x4000;
 const DEFAULT_PRIORITY: i32 = 700;
 const DEFAULT_POLICY: i32 = 1;
 const DEFAULT_INHERIT: i32 = 4;
@@ -864,10 +865,12 @@ fn cb_getname(ctx: &mut CpuContext) -> HleResult {
     if ctx.write_bytes(buf, &bytes) { OK } else { EFAULT }
 }
 
+/// scePthreadGetprio: a null thread and one that has ended (joined or not)
+/// are ESRCH with the output untouched, as pthread_getprio.
 fn cb_getprio(ctx: &mut CpuContext) -> HleResult {
     let (handle, out) = (ctx.rdi(), ctx.rsi());
-    if handle == 0 {
-        return EINVAL;
+    if handle == 0 || !thread_is_live(handle) {
+        return ESRCH;
     }
     let Some(info) = thread(handle) else { return ESRCH };
     if out == 0 || !ctx.write_u32(out, info.attr.lock().unwrap().priority as u32) {

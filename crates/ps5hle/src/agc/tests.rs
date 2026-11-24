@@ -237,8 +237,8 @@ fn builder_cases(e: &Env) -> Vec<Case> {
         case("sceAgcAcbCopyData", vec![cb, 1, 0, label, 1, 0], vec![label2, 0, 1], g("sceAgcAcbCopyDataGetSize", vec![])),
         case("sceAgcDcbDmaData", vec![cb, 0, 0, 0, label, 0], vec![0, label2, 16, 1, 0, 0], g("sceAgcDcbDmaDataGetSize", vec![])),
         case("sceAgcAcbDmaData", vec![cb, 0, 0, label, 0, 0], vec![label2, 16, 1, 0], g("sceAgcAcbDmaDataGetSize", vec![])),
-        case("sceAgcDcbAtomicMem", vec![cb, 15, 0, 0, label, 1], vec![0, 0], g("sceAgcDcbAtomicMemGetSize", vec![])),
-        case("sceAgcAcbAtomicMem", vec![cb, 0x2F, 0, 0, label, 1], vec![0, 0], g("sceAgcAcbAtomicMemGetSize", vec![])),
+        case("sceAgcDcbAtomicMem", vec![cb, 0, 15, 0, 0, label], vec![1, 0, 0], g("sceAgcDcbAtomicMemGetSize", vec![])),
+        case("sceAgcAcbAtomicMem", vec![cb, 0x2F, 0, label, 0, 1], vec![0, 0], g("sceAgcAcbAtomicMemGetSize", vec![])),
         case("sceAgcDcbMemSemaphore", vec![cb, label, 6, 0, 0], vec![], None),
         case("sceAgcAcbMemSemaphore", vec![cb, label, 7, 0, 1], vec![], None),
         case("sceAgcDcbPrimeUtcl2", vec![cb, 1, 0, 0x10000, 4], vec![], g("sceAgcDcbPrimeUtcl2GetSize", vec![])),
@@ -575,6 +575,17 @@ fn pm4_label_writes_and_eop_interrupt() {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(crate::sync::equeue::pending_count(eq) >= 1, "graphics interrupt not delivered");
+    // The event data is `context id << 16 | event id` (event id 0 here).
+    // Interrupts of tests running beside this one reach every queue that
+    // registered event 0: look through everything delivered.
+    let mut seen = Vec::new();
+    while let Ok(events) = crate::sync::equeue::wait(eq, 8, Some(0)) {
+        if events.is_empty() || seen.len() > 4096 {
+            break;
+        }
+        seen.extend(events.iter().map(|ev| ev.data));
+    }
+    assert!(seen.contains(&(0x55 << 16)), "interrupt data {seen:x?}");
     crate::sync::equeue::delete(eq);
 }
 
@@ -619,8 +630,8 @@ fn pm4_indirect_buffer_cond_exec_and_atomics() {
     e.call("sceAgcDcbJump", &[e.cb(), 0, 0, child, 5], &[]); // call
     // COND_EXEC with zero predicate skips the next 5 dwords (an atomic add would follow).
     e.call("sceAgcDcbCondExec", &[e.cb(), pred, 9], &[]);
-    e.call("sceAgcDcbAtomicMem", &[e.cb(), 15, 0, 0, ctr, 100], &[0, 0]); // skipped (9 dwords)
-    e.call("sceAgcDcbAtomicMem", &[e.cb(), 15, 0, 0, ctr, 1], &[0, 0]); // executed: 10 + 1
+    e.call("sceAgcDcbAtomicMem", &[e.cb(), 0, 15, 0, 0, ctr], &[100, 0, 0]); // skipped (9 dwords)
+    e.call("sceAgcDcbAtomicMem", &[e.cb(), 0, 15, 0, 0, ctr], &[1, 0, 0]); // executed: 10 + 1
     let q = GpuQueue::new(1);
     submit_cb(&e, &q);
     run_queue(&q);
@@ -2038,7 +2049,7 @@ fn driver_submit_command_buffer_routes_by_queue() {
     let e = Env::new();
     let (qctx, packet) = (e.a(DATA), e.a(DATA + 0x20));
     assert_eq!(e.call("sceAgcDriverSubmitCommandBuffer", &[0, packet], &[]), ERR_INVALID_ARGUMENT);
-    assert_eq!(e.call("sceAgcDriverSubmitMultiCommandBuffers", &[0, 0, 0, 0], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverSubmitMultiCommandBuffers", &[0, 0, 0, 0], &[]), EMPTY_SUBMIT);
     assert_eq!(e.call("sceAgcDriverSubmitMultiCommandBuffers", &[0, 0, 0, 1], &[]), ERR_INVALID_ARGUMENT);
     // Empty buffers are accepted and ignored.
     mem::w32(qctx + 4, 0x21);
@@ -2046,24 +2057,71 @@ fn driver_submit_command_buffer_routes_by_queue() {
     mem::w32(packet + 8, 0);
     assert_eq!(e.call("sceAgcDriverSubmitCommandBuffer", &[qctx, packet], &[]), OK);
     assert_eq!(e.call("sceAgcDriverSubmitAcb", &[0x21, 0], &[]), OK);
-    assert_eq!(e.call("sceAgcDriverSubmitMultiDcbs", &[0, 0, 0], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverSubmitMultiDcbs", &[0, 0, 0], &[]), EMPTY_SUBMIT);
+    assert_eq!(e.call("sceAgcDriverSubmitMultiAcbs", &[0x21, 0, 0, 0], &[]), EMPTY_SUBMIT);
 }
 
-/// Event type / context id follow the event's filter.
+/// A multi-submission of no command buffers (decrypted libSceAgcDriver).
+const EMPTY_SUBMIT: i64 = 0x8A6D_0109u32 as i32 as i64;
+
+/// Event type = the low 32 bits of the event data, context id = the data
+/// shifted right by 16, whatever the filter (decrypted libSceAgcDriver:
+/// both read sceKernelGetEventData).
 #[test]
 fn driver_eq_event_fields() {
     let e = Env::new();
     let ev = e.a(DATA);
     mem::w64(ev, 0x40);
     mem::write(ev + 8, &(-14i16).to_le_bytes());
-    mem::w64(ev + 0x10, 0x0123_4567_89AB);
-    assert_eq!(e.call("sceAgcDriverGetEqEventType", &[ev], &[]), 0x40);
-    assert_eq!(e.call("sceAgcDriverGetEqContextId", &[ev], &[]), 0x4567_89AB);
+    mem::w64(ev + 0x10, 0x765_4321 << 16 | 0x21);
+    assert_eq!(e.call("sceAgcDriverGetEqEventType", &[ev], &[]), 0x4321_0021);
+    assert_eq!(e.call("sceAgcDriverGetEqContextId", &[ev], &[]), 0x765_4321);
     mem::write(ev + 8, &(-11i16).to_le_bytes());
-    assert_eq!(e.call("sceAgcDriverGetEqEventType", &[ev], &[]), 0x4567_89AB);
-    assert_eq!(e.call("sceAgcDriverGetEqContextId", &[ev], &[]), 0x40);
+    mem::w64(ev + 0x10, 0xFFFF_FFFF_8000_0005);
+    assert_eq!(e.call("sceAgcDriverGetEqEventType", &[ev], &[]), 0x8000_0005u32 as i32 as i64);
+    assert_eq!(e.call("sceAgcDriverGetEqContextId", &[ev], &[]), 0xFFFF_8000);
     assert_eq!(e.call("sceAgcDriverGetEqEventType", &[0], &[]), 0);
     assert_eq!(e.call("sceAgcDriverAddEqEvent", &[0xDEAD_0000, 0, 0], &[]), ERR_BAD_FILE);
+}
+
+/// The packets of the console module's builders, word for word (decrypted
+/// libSceAgc: DcbAtomicMem 0x3b50, AcbAtomicMem 0xd0, CbCondWrite 0x2450,
+/// DcbDrawIndexIndirectMulti 0x5800).
+#[test]
+fn atomic_mem_cond_write_and_indirect_multi_follow_the_module() {
+    let e = Env::new();
+    let built = |name: &str, args: &[u64], stack: &[u64], n: usize| {
+        e.reset_cb();
+        let at = e.call(name, args, stack) as u64;
+        assert_ne!(at, 0, "{name} built no packet");
+        mem::read_dwords(at, n).unwrap()
+    };
+    let addr = 0x1234_5678_9ABC_DEF0u64;
+    // Dcb: (cb, engine, op, cmd, cache, addr; data, compare, loop).
+    assert_eq!(
+        built("sceAgcDcbAtomicMem", &[e.cb(), 1, 0x2F, 2, 3, addr], &[0x11, 0x22, 0x1000], 9),
+        [0xC007_1E00, 0x4600_022F, 0x9ABC_DEF0, 0x1234_5678, 0x11, 0, 0x22, 0, 0x40]
+    );
+    // Acb: (cb, op, cmd, addr, cache, data; compare, loop), no engine.
+    assert_eq!(
+        built("sceAgcAcbAtomicMem", &[e.cb(), 0x2F, 2, addr, 3, 0x11], &[0x22, 0x1000], 9),
+        [0xC007_1E00, 0x0600_022F, 0x9ABC_DEF0, 0x1234_5678, 0x11, 0, 0x22, 0, 0x40]
+    );
+    // The loop interval word saturates at 0xFFF.
+    assert_eq!(built("sceAgcAcbAtomicMem", &[e.cb(), 0, 0, addr, 0, 0], &[0, u32::MAX as u64], 9)[8], 0xFFF);
+    // CondWrite: every argument as given (no checks).
+    assert_eq!(
+        built("sceAgcCbCondWrite", &[e.cb(), 9, 6, 0x1001, 7, 0x2003], &[5, 0xFF], 9),
+        [0xC007_4500, 0x211, 0x2003, 0, 5, 0xFF, 0x1001, 0, 7]
+    );
+    assert_eq!(built("sceAgcCbCondWrite", &[e.cb(), 3, 0, 0, 7, 0x1_2000_0004], &[5, 0xFF], 9)[..4], [0xC007_4500, 0x13, 0x2000_0004, 1]);
+    // IndirectMulti: countFromMemory is its bit 0 (word 4 of the draw).
+    let two = built("sceAgcDcbDrawIndexIndirectMulti", &[e.cb(), 0, 2, 1, 0, 20], &[0], 16);
+    let one = built("sceAgcDcbDrawIndexIndirectMulti", &[e.cb(), 0, 1, 1, 0, 20], &[0], 16);
+    let zero = built("sceAgcDcbDrawIndexIndirectMulti", &[e.cb(), 0, 0, 1, 0, 20], &[0], 16);
+    assert_eq!(two, zero, "countFromMemory 2 is bit 0 clear");
+    assert_ne!(one, zero);
+    assert_eq!(one.iter().zip(&zero).filter(|(a, b)| a != b).map(|(a, b)| a ^ b).collect::<Vec<_>>(), [1 << 30]);
 }
 
 #[test]
@@ -3318,4 +3376,132 @@ fn dispatches_without_synchronisation_between_them_are_unsynced() {
     run_queue(&q);
     let got: Vec<bool> = rec.dispatches.lock().unwrap().iter().map(|d| d.packet.unsynced).collect();
     assert_eq!(got, [false, true, true, false, false, true]);
+}
+
+/// The packet builders and patch setters write what the decrypted
+/// libSceAgc of a retail title writes (exports read from its disassembly).
+#[test]
+fn builders_follow_the_console_library() {
+    let e = Env::new();
+    let built = |r: i64, n: usize| mem::read_dwords(r as u64, n).unwrap();
+    // DcbAcquireMem: a DB flush is global (range from 0x100 over the whole
+    // address space, DB_DEST_BASE_ENA, GL1/GL2 ranges dropped, GLI_INV all).
+    let r = e.call("sceAgcDcbAcquireMem", &[e.cb(), 1, 0x0400_0040, 0x910A, 0x1234_5600, 0x100], &[400]);
+    assert_eq!(built(r, 8), [0xC006_5800, 0x8400_4040, 0xFFFF_FFFE, 0xFF, 1, 0, 0x19, 0x8101]);
+    // Ranged: 256-byte units covering (base & 0xFF) + size, poll / 16
+    // capped at 0xFFFF, GL2_INV brings GL2_WB, CB/DB bits masked.
+    let r = e.call("sceAgcDcbAcquireMem", &[e.cb(), 0, 0xFBFF_FFFF, 0x4123, 0x12_3456_7880, 0x200], &[0x10_0000]);
+    assert_eq!(built(r, 8), [0xC006_5800, 0x0200_7FC0, 3, 0, 0x1234_5678, 0, 0xFFFF, 0xC123]);
+    let r = e.call("sceAgcDcbAcquireMem", &[e.cb(), 0, 0, 0, 0x1234_5678_9A00, 0x100], &[0]);
+    assert_eq!(built(r, 8)[2..6], [1, 0, 0x3456_789A, 0x12]);
+    let r = e.call("sceAgcDcbAcquireMem", &[e.cb(), 0, 0, 0xFC_0001, 0, 0], &[0]);
+    assert_eq!(built(r, 8)[7], 0x4_0001);
+    // AcbAcquireMem: control word 0, no DB flush handling.
+    let r = e.call("sceAgcAcbAcquireMem", &[e.cb(), 0x4000, 0x1000, 0x1000, 40], &[]);
+    assert_eq!(built(r, 8), [0xC006_5800, 0, 0x10, 0, 0x10, 0, 2, 0xC000]);
+
+    // CondExec takes any arguments.
+    let r = e.call("sceAgcDcbCondExec", &[e.cb(), 0, 0x4005], &[]);
+    assert_ne!(r, 0);
+    assert_eq!(built(r, 5), [0xC003_2200, 0, 0, 0, 5]);
+    let r = e.call("sceAgcDcbCondExec", &[e.cb(), 0x12_3456_1002, 7], &[]);
+    assert_eq!(built(r, 5), [0xC003_2200, 0x3456_1000, 0x12, 0, 7]);
+
+    // An index count of 0 is written as 1.
+    let r = e.call("sceAgcDcbSetIndexCount", &[e.cb(), 0], &[]);
+    assert_eq!(built(r, 2), [0xC000_1300, 1]);
+
+    // A branch's null target leaves its slot zero.
+    let r = e.call("sceAgcCbBranch", &[e.cb(), 1, 3, 0, 0, 0], &[1, 0x12_3456_7898, 0x10, 2, 0, 0x20]);
+    assert_eq!(built(r, 14), [0xC00C_3F00, 0x301, 0, 0, 0, 0, 0, 0, 0x3456_7898, 0x12, 0x1000_0010, 0, 0, 0]);
+
+    // Jump target: low two bits of dword 1 kept, whole high dword written.
+    let j = e.a(DATA + 0x100);
+    mem::write_dwords(j, &[0xC002_3F00, 3, 0xFFFF_0000, 0x1230_0000]).then_some(()).unwrap();
+    assert_eq!(e.call("sceAgcJumpPatchSetTarget", &[j, 0x1234_5678_9ABC, 0x10], &[]), OK);
+    assert_eq!(mem::read_dwords(j, 4).unwrap(), [0xC002_3F00, 0x5678_9ABF, 0x1234, 0x1230_0010]);
+
+    // CondExec patches: only the opcode is checked; the skip count wraps.
+    let c = e.a(DATA + 0x200);
+    mem::write_dwords(c, &[0xC003_2200, !0, !0, 0, 0xFFFF_C000]).then_some(()).unwrap();
+    assert_eq!(e.call("sceAgcCondExecPatchSetEnd", &[c, c + 3 * 4], &[]), OK);
+    assert_eq!(mem::r32(c + 16), Some(0xFFFF_C000 | 0x3FFE));
+    assert_eq!(e.call("sceAgcCondExecPatchSetEnd", &[c, c + (5 + 0x4001) * 4], &[]), OK);
+    assert_eq!(mem::r32(c + 16), Some(0xFFFF_C001));
+    assert_eq!(e.call("sceAgcCondExecPatchSetCommandAddress", &[c, 0], &[]), OK);
+    assert_eq!(mem::read_dwords(c + 4, 2).unwrap(), [3, 0]);
+    assert_eq!(e.call("sceAgcCondExecPatchSetCommandAddress", &[c, 0x12_3456_1002], &[]), OK);
+    assert_eq!(mem::read_dwords(c + 4, 2).unwrap(), [0x3456_1003, 0x12]);
+    mem::w32(c, 0xC003_1000);
+    assert_eq!(e.call("sceAgcCondExecPatchSetEnd", &[c, c + 36], &[]), ERR_INVALID_PACKET);
+    assert_eq!(e.call("sceAgcCondExecPatchSetCommandAddress", &[c, c + 36], &[]), ERR_INVALID_PACKET);
+    assert_eq!(mem::read_dwords(c, 5).unwrap(), [0xC003_1000, 0x3456_1003, 0x12, 0, 0xFFFF_C001]);
+
+    // Indexed multi-draws sit between a begin tag naming the draw and the
+    // end tag; the multi-instanced draw takes null addresses.
+    let tag = |t: u32| [0xC001_7904, 0x342, t];
+    let r = e.call("sceAgcDcbDrawIndexMultiInstanced", &[e.cb(), 6, 0, 0, 2, 0], &[]);
+    let w = built(r, 15);
+    assert_eq!(w[..3], tag(0xC600_0006));
+    assert_eq!(w[3..11], [0xC007_3A00, 6, 0, 0, 2, 0, 0, 2]);
+    assert_eq!(w[12..], tag(0xC600_0000));
+    assert_eq!(e.call("sceAgcDcbDrawIndexMultiInstancedGetSize", &[], &[]), 60);
+    let r = e.call("sceAgcDcbDrawIndexIndirectMulti", &[e.cb(), 0, 0, 1, 0, 20], &[0]);
+    let w = built(r, 16);
+    assert_eq!(w[..3], tag(0xC600_0005));
+    assert_eq!(w[3], 0xC008_3800);
+    assert_eq!(w[13..], tag(0xC600_0000));
+    assert_eq!(e.call("sceAgcDcbDrawIndexIndirectMultiGetSize", &[], &[]), 64);
+    for packet in [&tag(0xC600_0005), &tag(0xC600_0006), &[0xC001_7900, 0x342, 0xC600_0000]] {
+        assert!(p4::is_internal_data_packet(packet[0], &packet[1..]), "{packet:x?}");
+    }
+
+    // ACB user data has no R; the wait patch setters still find the wait.
+    let label = e.a(LABELS + 0x60);
+    let r = e.call("sceAgcAcbWaitRegMem", &[e.cb(), 0, 3, 0, label, 1], &[0xFFFF_FFFF, 400]);
+    let w = built(r, 14);
+    assert_eq!((w[0], w[11]), (0xC002_7900, 0xC001_7900));
+    assert_eq!(e.call("sceAgcWaitRegMemPatchReference", &[r as u64, 0x55], &[]), OK);
+    assert_eq!(mem::r32(r as u64 + 16 + 16), Some(0x55));
+    let r = e.call("sceAgcDcbWaitRegMem", &[e.cb(), 0, 3, 0, 0, label], &[1, 0xFFFF_FFFF, 400]);
+    assert_eq!(built(r, 1)[0], 0xC002_7904);
+}
+
+/// A jump whose target dword keeps low bits (the patch setter keeps them)
+/// runs the dword-aligned buffer.
+#[test]
+fn indirect_buffer_target_ignores_the_low_bits() {
+    let e = Env::new();
+    let q = bare_queue();
+    let label = e.a(LABELS + 0x70);
+    let child = e.a(CMD_END - 0x800);
+    mem::write_dwords(child, &write_data(label, 0x77)).then_some(()).unwrap();
+    let mut ib = indirect_buffer(child, 5, false);
+    ib[1] |= 3;
+    run_words(&q, e.a(CMD), &ib);
+    assert_eq!(mem::r32(label), Some(0x77));
+}
+
+/// AGR submissions fail until sceAgcDriverSetupAsyncGraphics enables the
+/// queue; registering a workload stream id twice is refused before its
+/// pointer is looked at (decrypted libSceAgcDriver).
+#[test]
+fn agr_submissions_and_workload_stream_order() {
+    const AGR_UNAVAILABLE: i64 = 0x8A6D_0003u32 as i32 as i64;
+    let e = Env::new();
+    let p = e.a(DATA + 0x300);
+    mem::w64(p, 0);
+    mem::w32(p + 8, 0);
+    assert_eq!(e.call("sceAgcDriverAgrSubmitDcb", &[p], &[]), AGR_UNAVAILABLE);
+    assert_eq!(e.call("sceAgcDriverAgrSubmitMultiDcbs", &[0, 0, 0], &[]), AGR_UNAVAILABLE);
+    assert_eq!(e.call("sceAgcDriverSetupAsyncGraphics", &[1], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverAgrSubmitDcb", &[p], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverAgrSubmitMultiDcbs", &[0, 0, 0], &[]), EMPTY_SUBMIT);
+    assert_eq!(e.call("sceAgcDriverSetupAsyncGraphics", &[0], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverAgrSubmitDcb", &[p], &[]), AGR_UNAVAILABLE);
+
+    let stream = e.a(DATA + 0x340);
+    assert_eq!(e.call("sceAgcDriverRegisterWorkloadStream", &[29, stream], &[]), OK);
+    assert_eq!(e.call("sceAgcDriverRegisterWorkloadStream", &[29, 0], &[]), ERR_DRIVER_INVALID_VALUE);
+    assert_eq!(e.call("sceAgcDriverRegisterWorkloadStream", &[30, 0], &[]), ERR_DRIVER_INVALID_ARGUMENT);
 }

@@ -151,11 +151,44 @@ fn patch_program_registers(header: u64, code: u64) -> HleResult {
     }
 }
 
+/// SCE_AGC_ERROR_INVALID_SHADER_HEADER: the file header word is not
+/// `0x34333231`.
+const ERR_SHADER_FILE_HEADER: HleResult = 0x8A6C_0003u32 as i32 as i64;
+/// SCE_AGC_ERROR_INVALID_SHADER_VERSION: the version word is not `0x18`.
+const ERR_SHADER_VERSION: HleResult = 0x8A6C_0004u32 as i32 as i64;
+/// The code address at +0x10 is already set: the object was created.
+const ERR_SHADER_ALREADY_CREATED: HleResult = 0x8A6C_001Fu32 as i32 as i64;
+
+/// The checks `sceAgcCreateShader` makes before it writes anything, in the
+/// module's order: file header, version, then the code address slot, which
+/// is zero until the object is created (a second create on the same object
+/// would relocate its pointers twice).
+fn check_shader_header(header: u64) -> HleResult {
+    let (Some(fh), Some(ver), Some(code)) = (mem::r32(header), mem::r32(header + 4), mem::r64(header + OFF_CODE)) else {
+        return ERR_MEMORY_FAULT;
+    };
+    if fh != FILE_HEADER {
+        log::warn!("[agc] CreateShader: bad file header 0x{fh:08x}");
+        ERR_SHADER_FILE_HEADER
+    } else if ver != VERSION {
+        log::warn!("[agc] CreateShader: bad version 0x{ver:x}");
+        ERR_SHADER_VERSION
+    } else if code != 0 {
+        ERR_SHADER_ALREADY_CREATED
+    } else {
+        OK
+    }
+}
+
 /// `sceAgcCreateShader(Shader** out, header, code)`.
 fn create_shader(ctx: &mut CpuContext) -> HleResult {
     let (out, header, code) = (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2));
     if out == 0 || header == 0 || code == 0 {
         return ERR_INVALID_ARGUMENT;
+    }
+    let r = check_shader_header(header);
+    if r != OK {
+        return r;
     }
     let fields = [OFF_CX_REGS, OFF_SH_REGS, OFF_USER_DATA, OFF_SPECIALS, OFF_INPUT_SEMANTICS, OFF_OUTPUT_SEMANTICS];
     if !fields.iter().all(|&f| relocate(header + f)) || !mem::w64(header + OFF_CODE, code) {
@@ -164,11 +197,6 @@ fn create_shader(ctx: &mut CpuContext) -> HleResult {
     let Some(ud) = mem::r64(header + OFF_USER_DATA) else { return ERR_MEMORY_FAULT };
     if ud != 0 && !(0..5).all(|i| relocate(ud + i * 8)) {
         return ERR_MEMORY_FAULT;
-    }
-    let (Some(fh), Some(ver)) = (mem::r32(header), mem::r32(header + 4)) else { return ERR_MEMORY_FAULT };
-    if fh != FILE_HEADER || ver != VERSION {
-        log::warn!("[agc] CreateShader: bad header 0x{fh:08x} version 0x{ver:x}");
-        return ERR_INVALID_ARGUMENT;
     }
     if code & 0xFFFF_0000_0000_00FF != 0 {
         log::warn!("[agc] CreateShader: code 0x{code:x} is not a 256-byte aligned 48-bit address");
@@ -872,3 +900,57 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("vieBRwlh1Lw", "sceAgcUpdateInterpolantMapping_10000", LIB_AGC, update_interpolant_mapping_10000),
     ("MqAdbRMdNz4", "sceAgcLinkShaders", LIB_AGC, link_shaders),
 ];
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+    use crate::context::CpuRegister;
+
+    fn call_create(out: u64, header: u64, code: u64) -> HleResult {
+        let vm = ps5vm::VirtualMemory::new();
+        let mut ctx = CpuContext::new(&vm);
+        ctx.set(CpuRegister::Rdi, out);
+        ctx.set(CpuRegister::Rsi, header);
+        ctx.set(CpuRegister::Rdx, code);
+        create_shader(&mut ctx)
+    }
+
+    /// The header checks come first, with the module's codes, and a
+    /// failed create leaves the object as it was; a second create of the
+    /// same object is refused instead of relocating its pointers again.
+    #[test]
+    fn create_shader_checks_the_header_before_writing() {
+        let buf: &'static mut [u8] = Box::leak(vec![0u8; 0x3000].into_boxed_slice());
+        let base = (buf.as_ptr() as u64 + 0xFFF) & !0xFFF;
+        ps5vm::ranges::track(base, 0x2000, ps5vm::MemProtect::RW);
+        let (out, at) = (base, base + 0x100);
+        let header = |magic: u32, version: u32| {
+            assert!(mem::write(at, &[0u8; 0x60]));
+            mem::w32(at, magic);
+            mem::w32(at + 4, version);
+            // Shader register table 0x60 bytes after its field, no registers.
+            mem::w64(at + OFF_SH_REGS, 0x60);
+            mem::w8(at + OFF_TYPE, 4);
+        };
+        let snapshot = || mem::read_dwords(at, 0x18).unwrap();
+        let code = 0x0012_3400u64;
+
+        header(0x1234_5678, VERSION);
+        let before = snapshot();
+        assert_eq!(call_create(out, at, code), ERR_SHADER_FILE_HEADER);
+        assert_eq!(snapshot(), before);
+
+        header(FILE_HEADER, 0x17);
+        let before = snapshot();
+        assert_eq!(call_create(out, at, code), ERR_SHADER_VERSION);
+        assert_eq!(snapshot(), before);
+
+        header(FILE_HEADER, VERSION);
+        assert_eq!(call_create(out, at, code), OK);
+        assert_eq!(mem::r64(at + OFF_CODE), Some(code));
+        assert_eq!(mem::r64(at + OFF_SH_REGS), Some(at + OFF_SH_REGS + 0x60));
+        let created = snapshot();
+        assert_eq!(call_create(out, at, code), ERR_SHADER_ALREADY_CREATED);
+        assert_eq!(snapshot(), created);
+    }
+}

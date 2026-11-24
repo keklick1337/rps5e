@@ -138,26 +138,6 @@ impl AjmAt9Decoder {
         }
     }
 
-    /// Decodes and discards the rest of the superframe once the gapless
-    /// sample limit is reached, so the stream stays superframe aligned.
-    fn drain_superframe(&mut self, input: &[u8], offset: &mut usize, result: &mut DecodeResult) {
-        while self.num_frames != 0 {
-            let remaining = input.len().saturating_sub(*offset);
-            if remaining < self.min_input() {
-                result.result = RESULT_PARTIAL_INPUT;
-                return;
-            }
-            let Some(used) = self.decode_frame(&input[*offset..], remaining, result) else { return };
-            *offset += used as usize;
-            result.input_consumed = *offset;
-            result.frames += 1;
-            self.advance_superframe(used, input.len(), offset, result);
-            if result.result != 0 {
-                return;
-            }
-        }
-    }
-
     fn parse_riff_header(&mut self, input: &[u8], gapless: &mut GaplessState, result: &mut DecodeResult) -> Option<usize> {
         if input.len() < 12 || &input[0..4] != b"RIFF" || &input[8..12] != b"WAVE" {
             result.result = RESULT_INVALID_DATA;
@@ -257,9 +237,16 @@ impl AjmDecoder for AjmAt9Decoder {
         // room ran out, after any number of frames; both when the input
         // ended just as the output filled. The end of a gapless segment
         // reports neither.
+        //
+        // Past the end of a gapless segment the frames are still decoded,
+        // counted and consumed, but write nothing (console measurement of
+        // libSceAjm on a title's stream): a run that reaches the total and
+        // every later run consume their whole input, until a reset starts a
+        // new segment.
         let frame_samples = self.frame_samples();
         loop {
-            if gapless.is_end() {
+            let ended = gapless.is_end();
+            if ended && offset >= input.len() {
                 break;
             }
             let (_, out_samples) = gapless.preview(frame_samples);
@@ -281,12 +268,15 @@ impl AjmDecoder for AjmAt9Decoder {
 
             let Some(used) = self.decode_frame(&input[offset..], remaining, &mut result) else { break };
 
-            let (skip, write) = gapless.plan(frame_samples);
+            let (skip, write) = if ended { (0, 0) } else { gapless.plan(frame_samples) };
             let bytes = self.frame_bytes_out(write);
             let dst = &mut output[result.output_written..result.output_written + bytes];
             self.decoder.as_ref().unwrap().write_frame_pcm(dst, skip as usize, write as usize, self.encoding);
             result.output_written += bytes;
-            gapless.commit(frame_samples, write);
+            // Frames past the end are not counted as skipped.
+            if !ended {
+                gapless.commit(frame_samples, write);
+            }
 
             offset += used as usize;
             result.input_consumed = offset;
@@ -294,9 +284,6 @@ impl AjmDecoder for AjmAt9Decoder {
             self.total_decoded_samples += write as u64;
 
             self.advance_superframe(used, input.len(), &mut offset, &mut result);
-            if gapless.is_end() {
-                self.drain_superframe(input, &mut offset, &mut result);
-            }
             if result.result != 0 || !multiple_frames {
                 break;
             }
@@ -464,18 +451,30 @@ mod tests {
         assert_eq!(&out[..924 * 2], &full[200..]);
         assert_eq!(g.current, GaplessDecode { total_samples: 76, skip_samples: 0, skipped_samples: 100 });
 
-        // The limit ends the stream after 76 samples; the rest of the
-        // superframe is drained so the input stays aligned.
+        // The limit ends the stream after 76 samples; the frames after it
+        // are still decoded and consumed, writing nothing.
         let r = decode(&mut d, &data, &mut out, true, &mut g);
         assert_eq!(r.output_written, 76 * 2);
         assert_eq!(r.input_consumed, 512);
         assert_eq!(r.frames, 4);
+        assert_eq!(r.result, 0, "the end of the segment reports neither side");
         assert!(g.is_end());
-        // Drained frames are not counted as skipped.
+        // Frames past the end are not counted as skipped.
         assert_eq!(g.current.skipped_samples, 100 + 256 - 76);
-        // At the end nothing more is decoded or consumed.
+        // Later runs consume their whole input and write nothing; the
+        // decoded total stays.
+        let total = r.total_decoded_samples;
         let r = decode(&mut d, &data, &mut out, true, &mut g);
-        assert_eq!((r.input_consumed, r.output_written, r.frames), (0, 0, 0));
+        assert_eq!((r.input_consumed, r.output_written, r.frames, r.result), (512, 0, 4, 0));
+        assert_eq!(r.total_decoded_samples, total);
+        // The same total without a reset changes nothing; a reset starts a
+        // new segment.
+        g.set(GaplessDecode { total_samples: 1000, skip_samples: 100, skipped_samples: 0 }, false);
+        let r = decode(&mut d, &data, &mut out, true, &mut g);
+        assert_eq!((r.input_consumed, r.output_written), (512, 0));
+        g.set(GaplessDecode { total_samples: 1000, skip_samples: 0, skipped_samples: 0 }, true);
+        let r = decode(&mut d, &data, &mut out, true, &mut g);
+        assert_eq!((r.input_consumed, r.output_written), (512, 1000 * 2));
     }
 
     fn riff(data: &[u8], config: [u8; 4], fact: Option<(u32, u32)>) -> Vec<u8> {

@@ -34,8 +34,12 @@ pub const SCALE_MODES: [(&str, &str); 3] =
 pub const DISPLAY_RESOLUTIONS: [(&str, &str); 3] =
     [("720p", "720p (1280x720)"), ("1080p", "1080p (1920x1080)"), ("2160p", "2160p (3840x2160)")];
 
+/// The format of [`EmulatorSettings`] this build writes: 1 since the
+/// default display became 1080p.
+pub const SETTINGS_VERSION: u32 = 1;
+
 /// The default of [`EmulatorSettings::display_resolution`].
-pub const DEFAULT_DISPLAY_RESOLUTION: &str = "2160p";
+pub const DEFAULT_DISPLAY_RESOLUTION: &str = "1080p";
 
 /// Scaling filter (`RPS5E_SCALE_FILTER`).
 pub const SCALE_FILTERS: [(&str, &str); 2] = [("linear", "Linear (smooth)"), ("nearest", "Nearest (sharp pixels)")];
@@ -97,6 +101,10 @@ pub struct EmulatorSettings {
     /// 720p | 1080p | 2160p: the emulated display games are told about
     /// (`--display-resolution`, `RPS5E_DISPLAY_RESOLUTION`).
     pub display_resolution: String,
+    /// Format of the saved settings ([`SETTINGS_VERSION`]; 0 when the
+    /// file predates it, see [`EmulatorSettings::migrate`]).
+    #[serde(default)]
+    pub settings_version: u32,
     /// Performance overlay shown from the start (`--perf-overlay`; F10 toggles).
     pub perf_overlay: bool,
     /// Small FPS counter in the corner (`RPS5E_FPS_COUNTER`).
@@ -157,6 +165,7 @@ impl Default for EmulatorSettings {
             fullscreen: false,
             hdr: false,
             display_resolution: DEFAULT_DISPLAY_RESOLUTION.into(),
+            settings_version: SETTINGS_VERSION,
             perf_overlay: false,
             fps_counter: false,
             scale_mode: "fit".into(),
@@ -199,6 +208,16 @@ fn parse_bool(s: &str) -> Option<bool> {
 }
 
 impl EmulatorSettings {
+    /// Bring settings saved by an older build to [`SETTINGS_VERSION`]: those
+    /// files stored every setting, so a 2160p display there is the old
+    /// default, not a choice; it becomes the new default, 1080p.
+    pub fn migrate(&mut self) {
+        if self.settings_version < 1 && self.display_resolution == "2160p" {
+            self.display_resolution = DEFAULT_DISPLAY_RESOLUTION.into();
+        }
+        self.settings_version = SETTINGS_VERSION;
+    }
+
     /// Every setting as text (the import/export form).
     pub fn to_map(&self) -> BTreeMap<String, String> {
         let mut m = BTreeMap::new();
@@ -488,7 +507,11 @@ impl GameConfigs {
     }
 
     pub fn parse(text: &str) -> Result<Self, String> {
-        toml::from_str(text).map_err(|e| e.to_string())
+        let mut c: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        for g in c.games.values_mut() {
+            g.settings.migrate();
+        }
+        Ok(c)
     }
 
     pub fn load(config_dir: &Path) -> Result<Self, String> {
@@ -569,7 +592,7 @@ mod tests {
         s.fast_paths = false;
         s.pause_in_menu = true;
         s.hdr = true;
-        s.display_resolution = "1080p".into();
+        s.display_resolution = "2160p".into();
         let mut t = EmulatorSettings::default();
         for (k, v) in s.to_map() {
             t.set(&k, &v).unwrap();
@@ -585,7 +608,7 @@ mod tests {
         assert!(t.set("hdr", "off").is_ok() && !t.hdr);
         assert!(!EmulatorSettings::default().hdr, "HDR is off by default");
         assert!(t.set("perf_overlay", "on").is_ok() && t.perf_overlay);
-        assert_eq!(EmulatorSettings::default().display_resolution, "2160p");
+        assert_eq!(EmulatorSettings::default().display_resolution, "1080p");
         assert!(t.set("display_resolution", "1440p").is_err());
         assert!(t.set("display_resolution", "").is_err());
         assert!(t.set("display_resolution", " 720P ").is_ok() && t.display_resolution == "720p");
@@ -656,24 +679,41 @@ mod tests {
         assert!(!env.iter().any(|(k, _)| k == "RPS5E_GAME_PATCH"));
     }
 
+    /// Per-game settings saved before 1080p became the default carry the
+    /// old default, 2160p, and read as 1080p; a 2160p chosen since stays.
+    #[test]
+    fn old_saved_2160p_becomes_the_1080p_default() {
+        let mut c = GameConfigs::default();
+        let mut s = EmulatorSettings::default();
+        s.display_resolution = "2160p".into();
+        c.games.insert("/g/A".into(), GameConfig { title_id: "PPSA01234".into(), name: "A".into(), settings: s });
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(GameConfigs::parse(&text).unwrap().games["/g/A"].settings.display_resolution, "2160p");
+        let old = text.replace("settings_version = 1\n", "");
+        assert_ne!(old, text);
+        let migrated = GameConfigs::parse(&old).unwrap();
+        assert_eq!(migrated.games["/g/A"].settings.display_resolution, "1080p");
+        assert_eq!(migrated.games["/g/A"].settings.settings_version, SETTINGS_VERSION);
+    }
+
     #[test]
     fn game_configs_file_and_export_import() {
         let mut c = GameConfigs::default();
         let mut s = EmulatorSettings::default();
         s.fullscreen = true;
-        s.display_resolution = "1080p".into();
+        s.display_resolution = "720p".into();
         c.games.insert("/g/A".into(), GameConfig { title_id: "PPSA01234".into(), name: "A".into(), settings: s.clone() });
         let text = toml::to_string_pretty(&c).unwrap();
         assert_eq!(GameConfigs::parse(&text).unwrap(), c);
         let global = EmulatorSettings::default();
         assert!(c.effective("/g/A", &global).fullscreen);
         assert!(!c.effective("/g/B", &global).fullscreen);
-        assert_eq!(c.effective("/g/A", &global).display_resolution, "1080p");
-        assert_eq!(c.effective("/g/B", &global).display_resolution, "2160p");
+        assert_eq!(c.effective("/g/A", &global).display_resolution, "720p");
+        assert_eq!(c.effective("/g/B", &global).display_resolution, "1080p");
         // A games.toml written before the setting existed reads the default.
-        let old = text.replace("display_resolution = \"1080p\"\n", "");
+        let old = text.replace("display_resolution = \"720p\"\n", "");
         assert_ne!(old, text);
-        assert_eq!(GameConfigs::parse(&old).unwrap().games["/g/A"].settings.display_resolution, "2160p");
+        assert_eq!(GameConfigs::parse(&old).unwrap().games["/g/A"].settings.display_resolution, "1080p");
 
         let json = c.export_json("/g/A").unwrap();
         let imp = parse_import(&json).unwrap();

@@ -173,14 +173,24 @@ fn unregister_in(cid: i32, t: &'static CallbackTable) -> HleResult {
     0
 }
 
-/// sceNetCtlGetResult(int eventType, int* errorCode): events complete
-/// without error.
+/// sceNetCtlGetResult(int eventType, int* errorCode): only event type 1
+/// has a result (0); types 2 and 3 are INVALID_TYPE with the output
+/// untouched (title-process measurement).
 fn cb_get_result(ctx: &mut CpuContext) -> HleResult {
+    get_result(ctx, 1..=1)
+}
+
+/// sceNetCtlGetResultV6: types 1..3 complete without error (unmeasured).
+fn cb_get_result_v6(ctx: &mut CpuContext) -> HleResult {
+    get_result(ctx, 1..=3)
+}
+
+fn get_result(ctx: &mut CpuContext, types: std::ops::RangeInclusive<i32>) -> HleResult {
     let (event, out) = (ctx.rdi() as i32, ctx.rsi());
     if out == 0 {
         return ERR_INVALID_ADDR;
     }
-    if !(1..=3).contains(&event) {
+    if !types.contains(&event) {
         return ERR_INVALID_TYPE;
     }
     written(ctx.write_u32(out, 0))
@@ -234,7 +244,7 @@ const EXPORTS: &[(&str, &str, HleCallback)] = &[
     ("teuK4QnJTGg", "sceNetCtlGetIfStat", cb_get_if_stat),
     ("Rqm2OnZMCz0", "sceNetCtlUnregisterCallback", cb_unregister_callback),
     ("0cBgduPRR+M", "sceNetCtlGetResult", cb_get_result),
-    ("H5yARg37U5g", "sceNetCtlGetResultV6", cb_get_result),
+    ("H5yARg37U5g", "sceNetCtlGetResultV6", cb_get_result_v6),
     ("Jy1EO5GdlcM", "sceNetCtlGetInfoV6", cb_get_info_v6),
     ("obuxdTiwkF8", "sceNetCtlGetInfo", cb_get_info),
     ("Z4wwCFiBELQ", "sceNetCtlTerm", cb_term),
@@ -247,7 +257,7 @@ const EXPORTS: &[(&str, &str, HleCallback)] = &[
     ("xstcTqAhTys", "sceNetCtlGetInfoIpcInt", cb_get_info),
     ("ipqlpcIqRsQ", "sceNetCtlRegisterCallbackV6IpcInt", cb_register_callback_v6),
     ("Hjxpy28aID8", "sceNetCtlUnregisterCallbackV6IpcInt", cb_unregister_callback_v6),
-    ("vdsTa93atXY", "sceNetCtlGetResultV6IpcInt", cb_get_result),
+    ("vdsTa93atXY", "sceNetCtlGetResultV6IpcInt", cb_get_result_v6),
     ("O8Fk4w5MWss", "sceNetCtlGetStateV6IpcInt", cb_get_state),
     ("arAQRFlwqaA", "sceNetCtlGetInfoV6IpcInt", cb_get_info_v6),
 ];
@@ -572,8 +582,13 @@ mod tests {
             ctx.write_u32(BASE + 0x310, 7);
             ctx.set(Rdi, event);
             ctx.set(Rsi, BASE + 0x310);
-            assert_eq!(cb_get_result(&mut ctx), 0);
+            assert_eq!(cb_get_result_v6(&mut ctx), 0);
             assert_eq!(ctx.read_u32(BASE + 0x310), Some(0));
+            // The IPv4 call has a result for event 1 only.
+            ctx.write_u32(BASE + 0x310, 0xCCCC_CCCC);
+            let (rc, value) = if event == 1 { (0, 0) } else { (ERR_INVALID_TYPE, 0xCCCC_CCCC) };
+            assert_eq!(cb_get_result(&mut ctx), rc, "event {event}");
+            assert_eq!(ctx.read_u32(BASE + 0x310), Some(value), "event {event}");
         }
         ctx.set(Rdi, 4);
         assert_eq!(cb_get_result(&mut ctx), ERR_INVALID_TYPE);

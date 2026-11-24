@@ -53,6 +53,34 @@ fn level_user_event_delivery() {
     assert!(delete(eq));
 }
 
+/// User events are reported in the order they became active (console
+/// steps, three level user events added as 1, 2, 3): activation appends
+/// to the active list, a trigger of an active event keeps its place, a
+/// reported event moves behind the others.
+#[test]
+fn user_events_report_in_trigger_order() {
+    let eq = create_named("user-trigger-order");
+    for id in 1..=3 {
+        assert_eq!(add_user(eq, id, false), OK);
+    }
+    let ids = |evs: Vec<KernelEvent>| evs.iter().map(|e| e.ident).collect::<Vec<_>>();
+    assert_eq!(wait_n(eq, 8, Some(0)), Err(ETIMEDOUT));
+    for id in [2, 1, 3] {
+        assert_eq!(trigger(eq, id, FILTER_USER, 0), OK);
+    }
+    assert_eq!(ids(wait_n(eq, 8, Some(0)).unwrap()), [2, 1, 3]);
+    assert_eq!(ids(wait_n(eq, 8, Some(0)).unwrap()), [2, 1, 3]);
+    assert_eq!(trigger(eq, 1, FILTER_USER, 0), OK);
+    assert_eq!(trigger(eq, 1, FILTER_USER, 0), OK);
+    assert_eq!(ids(wait_n(eq, 8, Some(0)).unwrap()), [2, 1, 3]);
+    assert_eq!(trigger(eq, 3, FILTER_USER, 0), OK);
+    assert_eq!(trigger(eq, 2, FILTER_USER, 0), OK);
+    assert_eq!(ids(wait_n(eq, 1, Some(0)).unwrap()), [2]);
+    assert_eq!(ids(wait_n(eq, 1, Some(0)).unwrap()), [1]);
+    assert_eq!(ids(wait_n(eq, 8, Some(0)).unwrap()), [3, 2, 1]);
+    assert!(delete(eq));
+}
+
 #[test]
 fn periodic_timer_events() {
     assert_eq!(add_timer(0, 10, 1_000_000, true, 0), EBADF);
@@ -472,8 +500,16 @@ fn guest_callbacks() {
     assert_eq!(cb_wait_equeue(&mut ctx), ERR_MEMORY_FAULT, "null event array");
     assert_eq!(cb_delete_equeue(&mut ctx), OK);
     assert_eq!(cb_delete_equeue(&mut ctx), EBADF);
-    // AMPR adds/deletes succeed even without a queue.
+    // An AMPR add needs a live queue (EBADF for a deleted or null one);
+    // deletes and system adds succeed without one.
+    assert_eq!(cb_add_ampr_event(&mut ctx), ERR_BAD_QUEUE, "deleted queue");
     ctx.set(crate::CpuRegister::Rdi, 0);
+    assert_eq!(cb_add_ampr_event(&mut ctx), ERR_BAD_QUEUE, "null queue");
+    assert_eq!(cb_add_ampr_system_event(&mut ctx), OK);
+    assert_eq!(cb_delete_ampr_event(&mut ctx), OK);
+    let live = create_named("ampr");
+    ctx.set(crate::CpuRegister::Rdi, live);
+    ctx.set(crate::CpuRegister::Rsi, 3);
     assert_eq!(cb_add_ampr_event(&mut ctx), OK);
     assert_eq!(cb_delete_ampr_event(&mut ctx), OK);
 }

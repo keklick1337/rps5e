@@ -1191,7 +1191,28 @@ fn cb_pad_device_class_parse_data(ctx: &mut CpuContext) -> HleResult {
     if ctx.write_bytes(out, &parse_device_class_data(&pad_data)) { OK } else { PAD_ERR_INVALID_ARG }
 }
 
+/// The record scePadReadState writes before it looks at the service or the
+/// handle: zeros, centred sticks, the identity orientation and 1 G along
+/// +y (PS5 13.42 libScePad; it stays there when the read fails).
+fn default_read_state_record() -> [u8; PAD_DATA_SIZE] {
+    let mut d = [0u8; PAD_DATA_SIZE];
+    d[0x04..0x08].fill(0x80);
+    d[0x18..0x1C].copy_from_slice(&1.0f32.to_le_bytes());
+    d[0x20..0x24].copy_from_slice(&1.0f32.to_le_bytes());
+    d
+}
+
+/// scePadReadState(handle, data*): a null record is INVALID_ARG; the
+/// default record is written next, then the service and the handle are
+/// checked (PS5 13.42 libScePad).
 fn cb_pad_read_state(ctx: &mut CpuContext) -> HleResult {
+    let out = ctx.rsi();
+    if out == 0 {
+        return PAD_ERR_INVALID_ARG;
+    }
+    if !ctx.write_bytes(out, &default_read_state_record()) {
+        return PAD_ERR_INVALID_ARG;
+    }
     let slot = match pad_slot(handle_arg(ctx)) {
         Ok(slot) => slot,
         Err(e) => return e,
@@ -1205,17 +1226,22 @@ fn cb_pad_read_state(ctx: &mut CpuContext) -> HleResult {
 }
 
 /// Zeroes all `count` entries, writes the unread samples (oldest first, at
-/// least the current one) and returns their count.
+/// least the current one) and returns their count. The service is checked
+/// first, then the record and the count (1..=64), then the handle (PS5
+/// 13.42 libScePad).
 fn cb_pad_read(ctx: &mut CpuContext) -> HleResult {
     let addr = ctx.rsi();
     let count = ctx.rdx() as i32;
+    if !ports().initialized {
+        return PAD_ERR_NOT_INITIALIZED;
+    }
+    if addr == 0 || !(1..=64).contains(&count) {
+        return PAD_ERR_INVALID_ARG;
+    }
     let slot = match pad_slot(handle_arg(ctx)) {
         Ok(slot) => slot,
         Err(e) => return e,
     };
-    if addr == 0 || !(1..=64).contains(&count) {
-        return PAD_ERR_INVALID_ARG;
-    }
     let samples = {
         let mut pads = pads();
         expire_audio_haptics(slot, &mut pads[slot]);
@@ -2353,7 +2379,7 @@ mod tests {
     fn trigger_effect_state_argument_checks() {
         const BASE: u64 = 0x5C82_0000_0000;
         let vm = ps5vm::VirtualMemory::new();
-        vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
+        vm.map(BASE, 0x4000, ps5vm::MemProtect::RW).unwrap();
         let mut ctx = CpuContext::new(&vm);
         {
             // The only test using the global ports: the primary pad is open.
@@ -2361,6 +2387,46 @@ mod tests {
             ports.init();
             let _ = ports.open(crate::user_service::PRIMARY_USER_ID, STANDARD_PORT_TYPE, 0);
         }
+        // scePadRead: the service, then the record and the count, then the
+        // handle. scePadReadState: a null record first, then the default
+        // record is written and stays when the service or handle fails.
+        let read = |ctx: &mut CpuContext, handle: u64, data: u64, num: i64| {
+            ctx.set(crate::CpuRegister::Rdi, handle);
+            ctx.set(crate::CpuRegister::Rsi, data);
+            ctx.set(crate::CpuRegister::Rdx, num as u64);
+            cb_pad_read(ctx)
+        };
+        let read_state = |ctx: &mut CpuContext, handle: u64, data: u64| {
+            ctx.write_bytes(BASE + 0x100, &[0x5A; PAD_DATA_SIZE]);
+            ctx.set(crate::CpuRegister::Rdi, handle);
+            ctx.set(crate::CpuRegister::Rsi, data);
+            cb_pad_read_state(ctx)
+        };
+        let record = BASE + 0x100;
+        let was = std::mem::replace(&mut ports().initialized, false);
+        assert_eq!(read(&mut ctx, 99, 0, 0), PAD_ERR_NOT_INITIALIZED);
+        assert_eq!(read_state(&mut ctx, 99, 0), PAD_ERR_INVALID_ARG);
+        for handle in [99, PRIMARY_PAD_HANDLE as u64] {
+            assert_eq!(read_state(&mut ctx, handle, record), PAD_ERR_NOT_INITIALIZED);
+            assert_eq!(ctx.read_bytes(record, PAD_DATA_SIZE).unwrap(), default_read_state_record());
+        }
+        ports().initialized = was;
+        for (handle, data, num, expect) in [
+            (99u64, 0u64, 1i64, PAD_ERR_INVALID_ARG),
+            (99, record, 0, PAD_ERR_INVALID_ARG),
+            (99, record, 65, PAD_ERR_INVALID_ARG),
+            (99, record, -1, PAD_ERR_INVALID_ARG),
+            (PRIMARY_PAD_HANDLE as u64, record, 65, PAD_ERR_INVALID_ARG),
+            (99, record, 1, PAD_ERR_INVALID_HANDLE),
+        ] {
+            assert_eq!(read(&mut ctx, handle, data, num), expect, "handle {handle} num {num}");
+        }
+        let n = read(&mut ctx, PRIMARY_PAD_HANDLE as u64, BASE + 0x200, 64);
+        assert!((1..=64).contains(&n), "{n}");
+        assert_eq!(read_state(&mut ctx, 99, record), PAD_ERR_INVALID_HANDLE);
+        assert_eq!(ctx.read_bytes(record, PAD_DATA_SIZE).unwrap(), default_read_state_record());
+        assert_eq!(read_state(&mut ctx, PRIMARY_PAD_HANDLE as u64, record), OK);
+        assert_eq!(serialize_pad_data(&PadSample { connected: false, connected_count: 0, ..PadSample::NEUTRAL }), default_read_state_record());
         // Vibration mode: a mode of 0 or less fails before the handle, the
         // handle before the other modes.
         for (handle, mode, expect) in [

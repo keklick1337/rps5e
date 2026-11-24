@@ -510,6 +510,55 @@ fn direct_names_types_and_validation() {
     }
 }
 
+/// sceKernelMapDirectMemory2 refuses flags of 0x1000000 and above and an
+/// alignment that is not 0 or a power of two from 16 KiB to 1 GiB with
+/// EINVAL, before mapping and without touching the address (PS5 13.42
+/// libkernel); the other mappings stay.
+#[test]
+fn map_direct2_checks_flags_and_alignment() {
+    let t = T::new();
+    let phys = t.alloc_ok(PAGE, PAGE);
+    let io = t.base + 0x20;
+    let rsp = t.base + 0x400;
+    let map2 = |hint: u64, flags: u64, align: u64| {
+        let mut ctx = t.ctx();
+        ctx.write_u64(io, hint);
+        ctx.write_u64(rsp + 8, align);
+        for (r, v) in [CpuRegister::Rdi, CpuRegister::Rsi, CpuRegister::Rdx, CpuRegister::Rcx, CpuRegister::R8, CpuRegister::R9]
+            .iter()
+            .zip([io, PAGE, u32::MAX as u64, PROT_CPU_RW as u64, flags, phys])
+        {
+            ctx.set(*r, v);
+        }
+        ctx.set(CpuRegister::Rsp, rsp);
+        let r = cb_map_direct_memory2(&mut ctx);
+        (r, ctx.read_u64(io).unwrap())
+    };
+    let (r, first) = map2(0, 0, 0);
+    assert_eq!(r, OK);
+    t.write(first, 0x5151_5151);
+    let sentinel = 0x1234_5000;
+    for flags in [0x0100_0000u64, 0x0200_0000, 0xFFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF] {
+        assert_eq!(map2(sentinel, flags, 0), (EINVAL, sentinel), "flags {flags:#x}");
+    }
+    for align in [0x1000u64, 0x2000, 0x5000, 0x18000, 0x8000_0000, 1 << 63] {
+        assert_eq!(map2(sentinel, 0, align), (EINVAL, sentinel), "align {align:#x}");
+    }
+    assert_eq!(t.read(first), 0x5151_5151, "the first mapping stays");
+    let mut mapped = vec![first];
+    // The flags compare as 32 bits: high bits above them are not looked at.
+    for (flags, align) in [(0, 0x4000u64), (0, 0x20_0000), (0, 0x4000_0000), (0x1_0000_0000, 0)] {
+        let (r, a) = map2(0, flags, align);
+        assert_eq!(r, OK, "flags {flags:#x} align {align:#x}");
+        assert_eq!(a % align.max(PAGE), 0);
+        mapped.push(a);
+    }
+    assert_eq!(t.release(phys, PAGE), OK);
+    for a in mapped {
+        t.expect_unmapped(a);
+    }
+}
+
 #[test]
 fn direct_map_validation_leaves_outputs() {
     let t = T::new();
@@ -622,8 +671,25 @@ fn direct_memory_query_merges_same_type_blocks() {
     let (r, ctx) = t.call(cb_direct_memory_query, &[a, 0, info, 24]);
     assert_eq!(r, OK);
     assert_eq!((ctx.read_u64(info), ctx.read_u64(info + 8), ctx.read_u32(info + 16)), (Some(a), Some(a + 2 * PAGE), Some(MTYPE_C as u32)));
-    assert_eq!(t.call(cb_direct_memory_query, &[a, 0, info, 16]).0, EINVAL);
+    // Any size from 1 works and writes only the first `min(size, 24)` bytes.
+    for (size, written) in [(8u64, 8usize), (16, 16), (1, 1), (256, 24)] {
+        let canary = [0xCCu8; 40];
+        assert!(ctx.write_bytes(info, &canary));
+        assert_eq!(t.call(cb_direct_memory_query, &[a, 0, info, size]).0, OK, "size {size}");
+        let got = ctx.read_bytes(info, 40).unwrap();
+        let mut want = canary.to_vec();
+        let mut record = a.to_le_bytes().to_vec();
+        record.extend_from_slice(&(a + 2 * PAGE).to_le_bytes());
+        record.extend_from_slice(&(MTYPE_C as u32).to_le_bytes());
+        record.extend_from_slice(&[0; 4]);
+        want[..written].copy_from_slice(&record[..written]);
+        assert_eq!(got, want, "size {size}");
+    }
+    assert_eq!(t.call(cb_direct_memory_query, &[a, 0, info, 0]).0, EINVAL);
+    let untouched = ctx.read_bytes(info, 24).unwrap();
     assert_eq!(t.call(cb_direct_memory_query, &[a, 2, info, 24]).0, EINVAL);
+    assert_eq!(t.call(cb_direct_memory_query, &[a, 4, info, 24]).0, EINVAL);
+    assert_eq!(ctx.read_bytes(info, 24).unwrap(), untouched, "refused flags write nothing");
     assert_eq!(t.release(a, 2 * PAGE), OK);
     assert_eq!(t.call(cb_direct_memory_query, &[a, 0, info, 24]).0, EACCES);
     // Find-next beyond every allocation reports the terminal entry.
@@ -1584,6 +1650,28 @@ fn mlock_and_munlock_follow_the_guest_mapping_state() {
     // images) counts as committed.
     assert_eq!(kernel_mlock(t.base + 1, 0x100), OK);
     assert_eq!(kernel_munlock(t.base + 1, 0x100), OK);
+}
+
+/// An unmapped range forgets its names: a new mapping at the address has
+/// no name (or its own one), whether the old name came from the map call
+/// or from sceKernelSetVirtualRangeName (PS5 11.60).
+#[test]
+fn munmap_drops_range_names() {
+    let t = T::new();
+    let a = t.flex_ok(PAGE, PROT_CPU_RW, "f_probe_A");
+    assert_eq!(t.query(a, 0).name, "f_probe_A");
+    assert_eq!(t.munmap(a, PAGE), OK);
+    assert_eq!(t.flex(a, PAGE, PROT_CPU_RW, MAP_FIXED, Some("")), (OK, a));
+    assert_eq!(t.query(a, 0).name, "");
+    let n = t.name(2, "renamed");
+    assert_eq!(t.call(cb_set_virtual_range_name, &[a, PAGE, n]).0, OK);
+    assert_eq!(t.munmap(a, PAGE), OK);
+    assert_eq!(t.flex(a, PAGE, PROT_CPU_RW, MAP_FIXED, Some("")), (OK, a));
+    assert_eq!(t.query(a, 0).name, "");
+    assert_eq!(t.munmap(a, PAGE), OK);
+    assert_eq!(t.flex(a, PAGE, PROT_CPU_RW, MAP_FIXED, Some("f_probe_new")), (OK, a));
+    assert_eq!(t.query(a, 0).name, "f_probe_new");
+    assert_eq!(t.munmap(a, PAGE), OK);
 }
 
 /// sceKernelVirtualQuery writes the SysV layout of the console's

@@ -53,6 +53,9 @@ pub const CLOCK_EXT_NETWORK: i32 = 16;
 pub const CLOCK_EXT_DEBUG_NETWORK: i32 = 17;
 pub const CLOCK_EXT_AD_NETWORK: i32 = 18;
 pub const CLOCK_EXT_RAW_NETWORK: i32 = 19;
+/// The process CPU time in whole microseconds (PS5: it follows clock 2
+/// under load and idle, in microsecond steps, resolution 1 µs).
+pub const CLOCK_PROCESS_CPUTIME_US: i32 = 21;
 
 /// `tz_dsttime` value reported while daylight saving time is in effect.
 const DST_MET: i32 = 4;
@@ -318,6 +321,7 @@ pub(crate) fn clock_now(clock_id: i32) -> Option<Duration> {
         CLOCK_PROCTIME => Some(Duration::from_micros(process_time_usec())),
         CLOCK_THREAD_CPUTIME_ID => host_now(libc::CLOCK_THREAD_CPUTIME_ID),
         CLOCK_VIRTUAL | CLOCK_PROF => host_now(libc::CLOCK_PROCESS_CPUTIME_ID),
+        CLOCK_PROCESS_CPUTIME_US => host_now(libc::CLOCK_PROCESS_CPUTIME_ID).map(|d| Duration::from_micros(d.as_micros() as u64)),
         CLOCK_SECOND => host_now(libc::CLOCK_REALTIME).map(|d| Duration::from_secs(d.as_secs())),
         _ => host_now(host_clock(clock_id)?),
     }
@@ -398,6 +402,7 @@ fn clock_getres(ctx: &CpuContext, clock_id: i32, ts: u64) -> HleResult {
             let f = tsc_frequency();
             Duration::from_nanos(if f != 0 { ((1_000_000_000 + (f >> 1)) / f).max(1) } else { 1 })
         }
+        CLOCK_PROCESS_CPUTIME_US => Duration::from_micros(1),
         id if is_cpu_clock(id) => {
             // A process clock answers with the CPU-time resolution for any
             // process id (FreeBSD's getres does not look the process up).
@@ -492,11 +497,12 @@ fn cb_sce_gettimeofday(ctx: &mut CpuContext) -> HleResult {
     OK
 }
 
-/// sceKernelGettimezone(timezone*): { int minuteswest; int dsttime; }
+/// sceKernelGettimezone(timezone*): { int minuteswest; int dsttime; }. A
+/// null pointer asks for nothing and succeeds (PS5 11.60).
 fn cb_gettimezone(ctx: &mut CpuContext) -> HleResult {
     let tz = ctx.rdi();
     if tz == 0 {
-        return EFAULT;
+        return OK;
     }
     let (west, dst) = timezone();
     if !(ctx.write_u32(tz, west as u32) && ctx.write_u32(tz + 4, dst as u32)) {
@@ -689,13 +695,39 @@ mod tests {
         for id in [4, 5, 7, 8, 11, 12, 16, 17, 18, 19] {
             assert_eq!(host_clock(id), Some(libc::CLOCK_MONOTONIC));
         }
-        for id in [3, 6, 20, -1] {
+        for id in [3, 6, 20, 22, 31, -1] {
             assert_eq!(host_clock(id), None);
             assert!(clock_now(id).is_none());
         }
         assert_eq!(clock_now(CLOCK_SECOND).unwrap().subsec_nanos(), 0);
         assert!(clock_now(CLOCK_PROCTIME).is_some());
         assert!(clock_now(CLOCK_THREAD_CPUTIME_ID).is_some());
+    }
+
+    /// Clock 21 is the process CPU time (clock 2) in whole microseconds,
+    /// with a 1 µs resolution, through both exports.
+    #[test]
+    fn clock_21_is_process_cpu_time_in_microseconds() {
+        const BASE: u64 = 0x5CCB_0000_0000;
+        let vm = VirtualMemory::new();
+        vm.map(BASE, 0x1000, MemProtect::RW).unwrap();
+        let mut ctx = CpuContext::new(&vm);
+        let spin = Instant::now();
+        while spin.elapsed() < Duration::from_millis(5) {
+            std::hint::spin_loop();
+        }
+        let prof0 = clock_now(CLOCK_PROF).unwrap();
+        let t = clock_now(CLOCK_PROCESS_CPUTIME_US).unwrap();
+        let prof1 = clock_now(CLOCK_PROF).unwrap();
+        assert_eq!(t.subsec_nanos() % 1000, 0);
+        assert!(t + Duration::from_micros(1) > prof0 && t <= prof1, "{prof0:?} <= {t:?} <= {prof1:?}");
+        ctx.set(CpuRegister::Rdi, CLOCK_PROCESS_CPUTIME_US as u64);
+        ctx.set(CpuRegister::Rsi, BASE);
+        assert_eq!(cb_sce_clock_gettime(&mut ctx), OK);
+        assert_eq!(ctx.read_u64(BASE + 8).unwrap() % 1000, 0);
+        assert_eq!(cb_clock_gettime(&mut ctx), 0);
+        assert_eq!(cb_sce_clock_getres(&mut ctx), OK);
+        assert_eq!((ctx.read_u64(BASE), ctx.read_u64(BASE + 8)), (Some(0), Some(1000)));
     }
 
     #[test]
@@ -779,7 +811,7 @@ mod tests {
         assert!(ctx.read_u64(BASE + 8).unwrap() >= 1);
         ctx.set(CpuRegister::Rdi, 0);
         assert_eq!(cb_sce_gettimeofday(&mut ctx), EFAULT);
-        assert_eq!(cb_gettimezone(&mut ctx), EFAULT);
+        assert_eq!(cb_gettimezone(&mut ctx), OK, "a null zone asks for nothing");
         ctx.set(CpuRegister::Rdi, BASE);
         assert_eq!(cb_gettimezone(&mut ctx), OK);
         let dst = ctx.read_u32(BASE + 4).unwrap() as i32;

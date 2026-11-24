@@ -76,6 +76,13 @@ const FLIP_EOP_LATCH_LIMIT: u32 = 4;
 type FlipEopLatch = Arc<Mutex<Option<u32>>>;
 
 /// A release interrupt reached a registered event of the latch's queue.
+/// The data of a graphics interrupt event: `context id << 16 | event id`
+/// (sceAgcDriverGetEqContextId reads it back shifted right by 16 and
+/// sceAgcDriverGetEqEventType returns its low 32 bits).
+pub(crate) fn graphics_event_data(context_id: u32, event_id: u64) -> u64 {
+    (context_id as u64) << 16 | event_id
+}
+
 fn latch_release_interrupt(latch: &FlipEopLatch) {
     if flip_eop_latch_enabled() {
         *latch.lock().unwrap_or_else(|e| e.into_inner()) = Some(0);
@@ -1302,7 +1309,7 @@ impl Interpreter {
         INTERRUPTS.fetch_add(1, Ordering::Relaxed);
         let (event_id, latch) = (self.event_id, self.flip_eop_latch.clone());
         let deliver = move || {
-            if equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, context_id as u64, event_id) > 0 {
+            if equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, graphics_event_data(context_id, event_id), event_id) > 0 {
                 latch_release_interrupt(&latch);
             }
         };
@@ -1320,7 +1327,7 @@ impl Interpreter {
         let deliver = move || {
             if flip_eop_event_due(&latch) {
                 INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-                equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, 0, event_id);
+                equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, graphics_event_data(0, event_id), event_id);
             }
         };
         match &self.executor {
@@ -1337,7 +1344,7 @@ impl Interpreter {
         let deliver = move || {
             if conditional_interrupt_due(dst, data, wide) {
                 INTERRUPTS.fetch_add(1, Ordering::Relaxed);
-                if equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, context_id as u64, event_id) > 0 {
+                if equeue::trigger_registered_events_by_filter(equeue::FILTER_GRAPHICS, graphics_event_data(context_id, event_id), event_id) > 0 {
                     latch_release_interrupt(&latch);
                 }
             }
@@ -1877,7 +1884,9 @@ impl Interpreter {
             return Err(format!("INDIRECT_BUFFER length {} unsupported at 0x{:x}", p.len(), p.addr));
         }
         let control = pl[2];
-        let addr = pl[0] as u64 | (pl[1] as u64) << 32;
+        // The two low bits of the target dword are not address bits (the
+        // jump patch setter keeps them).
+        let addr = (pl[0] & !3) as u64 | (pl[1] as u64) << 32;
         let dwords = control & 0xFFFFF;
         let chain = (control >> 20) & 1 != 0;
         if dwords != 0 {
@@ -2648,7 +2657,7 @@ fn scan_stream(stack: &mut Vec<Cursor>, regs: &mut RegisterFile, dispatch_args_b
                     }
                     return Stop::Branch;
                 }
-                let addr = pl[0] as u64 | (pl[1] as u64) << 32;
+                let addr = (pl[0] & !3) as u64 | (pl[1] as u64) << 32;
                 let dwords = pl[2] & 0xFFFFF;
                 let chain = (pl[2] >> 20) & 1 != 0;
                 if dwords == 0 {

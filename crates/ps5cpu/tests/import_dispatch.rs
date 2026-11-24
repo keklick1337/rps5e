@@ -45,6 +45,8 @@ const ENTRY_SLOT: u64 = CODE + 0x200;
 const TAIL_TARGET: u64 = CODE + 0x220;
 /// `lea rax, [rdi + rdi]; ret`
 const NESTED_FN: u64 = CODE + 0x230;
+/// Returns the MXCSR the guest runs with.
+const MXCSR_FN: u64 = CODE + 0x400;
 
 static CALLS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
@@ -171,6 +173,14 @@ fn setup() {
         write(CALLER3, &caller3);
         write(TAIL_TARGET, &[0x48, 0x8D, 0x47, 0x64, 0xC3]);
         write(NESTED_FN, &[0x48, 0x8D, 0x04, 0x3F, 0xC3]);
+        #[rustfmt::skip]
+        write(MXCSR_FN, &[
+            0x48, 0x83, 0xEC, 0x08, // sub rsp, 8
+            0x0F, 0xAE, 0x1C, 0x24, // stmxcsr [rsp]
+            0x8B, 0x04, 0x24,       // mov eax, [rsp]
+            0x48, 0x83, 0xC4, 0x08, // add rsp, 8
+            0xC3,                   // ret
+        ]);
         write(TRAP_STUB, &[0xCC]);
         write(TRAP_TAIL_STUB, &[0xCC]);
         unsafe { std::ptr::write(ENTRY_SLOT as *mut u64, exec::import_entry_address()) };
@@ -178,7 +188,7 @@ fn setup() {
             write(stub, &exec::import_stub_code(stub, ENTRY_SLOT));
         }
         exec::add_guest_code_range(CODE, 0x1000, "import-dispatch-test");
-        for i in 0..8 {
+        for i in 0..9 {
             exec::map_guest_stack(STACKS + (i + 1) * 0x1000_0000, STACK_SIZE).unwrap();
         }
     });
@@ -193,6 +203,29 @@ fn run_guest(slot: u64, func: u64, args: [u64; 6]) -> u64 {
         GuestExit::Returned(v) => v,
         e => panic!("unexpected exit {e:?}"),
     }
+}
+
+/// A thread's first guest call runs with the console's MXCSR (FTZ and
+/// DAZ, exceptions masked); a value set later on the thread is kept.
+#[test]
+fn guest_threads_start_with_the_console_mxcsr() {
+    setup();
+    let top = STACKS + 9 * 0x1000_0000;
+    let h = std::thread::spawn(move || {
+        let host = 0x1F80u32;
+        // SAFETY: loads the host default MXCSR from a local.
+        unsafe { std::arch::asm!("ldmxcsr [{p}]", p = in(reg) &host, options(nostack, readonly)) };
+        let read = || match exec::enter_guest(&exec::call_regs(MXCSR_FN, top, [0; 6])) {
+            GuestExit::Returned(v) => v as u32,
+            e => panic!("unexpected exit {e:?}"),
+        };
+        let first = read();
+        unsafe { std::arch::asm!("ldmxcsr [{p}]", p = in(reg) &host, options(nostack, readonly)) };
+        (first, read())
+    });
+    let (first, later) = h.join().unwrap();
+    assert_eq!(first & 0xFFC0, exec::GUEST_INITIAL_MXCSR & 0xFFC0, "first guest call: {first:#x}");
+    assert_eq!(later & 0xFFC0, 0x1F80, "a value the thread set later is kept: {later:#x}");
 }
 
 /// `count` calls through `stub`; returns ns per call.

@@ -125,15 +125,31 @@ fn cb_backtrace_for_game(ctx: &mut CpuContext) -> HleResult {
 /// (handler, context) registered for crash reports; never invoked.
 static COREDUMP_HANDLER: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
-/// sceCoredumpRegisterCoredumpHandler(handler, stackSize, context)
+/// SCE_COREDUMP_ERROR_NOT_REGISTERED: no handler to unregister.
+const COREDUMP_ERROR_NOT_REGISTERED: HleResult = 0x8118_0001u32 as i32 as i64;
+/// SCE_COREDUMP_ERROR_ALREADY_REGISTERED: a handler is already set (kept).
+const COREDUMP_ERROR_ALREADY_REGISTERED: HleResult = 0x8118_0002u32 as i32 as i64;
+
+/// sceCoredumpRegisterCoredumpHandler(handler, stackSize, context): one
+/// handler per process; a second registration is refused and the first
+/// one stays (console measurement).
 fn cb_coredump_register_handler(ctx: &mut CpuContext) -> HleResult {
-    *COREDUMP_HANDLER.lock().unwrap_or_else(|p| p.into_inner()) = (ctx.rdi(), ctx.rdx());
+    let mut h = COREDUMP_HANDLER.lock().unwrap_or_else(|p| p.into_inner());
+    if h.0 != 0 {
+        return COREDUMP_ERROR_ALREADY_REGISTERED;
+    }
+    *h = (ctx.rdi(), ctx.rdx());
     0
 }
 
-/// sceCoredumpUnregisterCoredumpHandler(): forget the handler.
+/// sceCoredumpUnregisterCoredumpHandler(): forget the handler; without
+/// one it is NOT_REGISTERED.
 fn cb_coredump_unregister_handler(_ctx: &mut CpuContext) -> HleResult {
-    *COREDUMP_HANDLER.lock().unwrap_or_else(|p| p.into_inner()) = (0, 0);
+    let mut h = COREDUMP_HANDLER.lock().unwrap_or_else(|p| p.into_inner());
+    if h.0 == 0 {
+        return COREDUMP_ERROR_NOT_REGISTERED;
+    }
+    *h = (0, 0);
     0
 }
 
@@ -283,6 +299,23 @@ mod tests {
         for &(nid, name, _, _) in EXPORTS {
             assert_eq!(ps5nid::compute_nid(name), nid, "NID mismatch for {name}");
         }
+    }
+
+    /// One coredump handler per process: a second registration is refused
+    /// (the first stays), an unregistration without a handler too.
+    #[test]
+    fn coredump_handler_registers_once() {
+        let vm = ps5vm::VirtualMemory::new();
+        let mut ctx = CpuContext::new(&vm);
+        ctx.set(Rdi, 0x1234_0000);
+        ctx.set(Rsi, 0x10000);
+        ctx.set(Rdx, 0);
+        assert_eq!(cb_coredump_register_handler(&mut ctx), 0);
+        ctx.set(Rdi, 0x5678_0000);
+        assert_eq!(cb_coredump_register_handler(&mut ctx), COREDUMP_ERROR_ALREADY_REGISTERED);
+        assert_eq!(COREDUMP_HANDLER.lock().unwrap().0, 0x1234_0000, "the first handler stays");
+        assert_eq!(cb_coredump_unregister_handler(&mut ctx), 0);
+        assert_eq!(cb_coredump_unregister_handler(&mut ctx), COREDUMP_ERROR_NOT_REGISTERED);
     }
 
     /// The device service keeps no state: initialize and terminate succeed.

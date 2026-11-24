@@ -224,22 +224,21 @@ fn cb_hide_splash_screen(_ctx: &mut CpuContext) -> HleResult {
     OK
 }
 
-/// Pops the oldest pending event; the payload is always cleared. The only
-/// event generated is the entitlement update queued by AppContent init (no
-/// suspend/resume, no URL launch).
+/// Pops the oldest pending event; its payload is cleared. With nothing
+/// pending the result is NO_EVENT for any pointer, null included, and the
+/// buffer is left as it was (measured in a title process on a PS5). The
+/// only event generated is the entitlement update queued by AppContent
+/// init (no suspend/resume, no URL launch).
 fn cb_receive_event(ctx: &mut CpuContext) -> HleResult {
     let out = ctx.rdi();
+    let mut q = events();
+    let Some(&kind) = q.front() else { return ERR_NO_EVENT };
     if out == 0 {
         return ERR_PARAMETER;
     }
     let mut ev = vec![0u8; 4 + EVENT_DATA_SIZE];
-    ev[..4].copy_from_slice(&(-1i32).to_le_bytes());
+    ev[..4].copy_from_slice(&kind.to_le_bytes());
     if !ctx.write_bytes(out, &ev) {
-        return ERR_PARAMETER;
-    }
-    let mut q = events();
-    let Some(&kind) = q.front() else { return ERR_NO_EVENT };
-    if !ctx.write_bytes(out, &kind.to_le_bytes()) {
         return ERR_PARAMETER;
     }
     q.pop_front();
@@ -715,7 +714,12 @@ mod tests {
         let payload = ctx.read_bytes(event + 4, EVENT_DATA_SIZE).unwrap();
         assert!(payload.iter().all(|&b| b == 0), "payload is cleared");
         assert_eq!(event_num(&mut ctx), 0, "delivered exactly once");
+        // Nothing pending: NO_EVENT for a buffer or null, the buffer untouched.
+        ctx.write_bytes(event, &[0xCC; 4 + EVENT_DATA_SIZE]);
         ctx.set(Rdi, event);
+        assert_eq!(cb_receive_event(&mut ctx), ERR_NO_EVENT);
+        assert!(ctx.read_bytes(event, 4 + EVENT_DATA_SIZE).unwrap().iter().all(|&b| b == 0xCC), "buffer untouched");
+        ctx.set(Rdi, 0);
         assert_eq!(cb_receive_event(&mut ctx), ERR_NO_EVENT);
     }
 

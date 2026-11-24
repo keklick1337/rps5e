@@ -74,7 +74,7 @@ thread_local! {
 
 /// Give this thread the console's initial x87 control word before its
 /// first guest call (once per host thread; later calls keep what the guest
-/// set). MXCSR already starts at 0x1F80, as on the console.
+/// set). MXCSR is set for every platform by `exec::enter_guest`.
 pub(crate) fn init_thread_fpu() {
     if FPU_READY.with(|f| f.replace(true)) {
         return;

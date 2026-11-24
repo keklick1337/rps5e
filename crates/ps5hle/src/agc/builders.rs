@@ -200,41 +200,65 @@ fn dcb_stall_parser_get_size(_: &mut CpuContext) -> HleResult {
 // Acquire / release / write / wait
 // ---------------------------------------------------------------------------
 
-/// Misaligned or out-of-range sizes/bases are only reported.
-fn acquire_mem_packet(cb: u64, control0: u32, gcr: u32, base: u64, size: u64, poll: u32) -> u64 {
-    let no_size = size == u64::MAX;
-    if (!no_size && (size & 0xFF != 0 || size >> 40 != 0)) || base & 0xFF != 0 || base >> 40 != 0 {
-        log::debug!("[agc] AcquireMem base 0x{base:x} size 0x{size:x} not 256-byte aligned or too large");
+/// The native 8-dword ACQUIRE_MEM libSceAgc writes (decrypted module):
+/// `[header, control, size lo, size hi & 0xFF, base >> 8, base >> 40,
+/// min(poll >> 4, 0xFFFF), gcr & 0x7FFFF]`. The size covers
+/// `(base & 0xFF) + size` bytes in 256-byte units (48-bit wrap, rounded
+/// up), capped at the end of the 48-bit address space. GL2_INV (bit 14)
+/// always brings GL2_WB (bit 15). On the DCB a DB flush (control bit 26,
+/// DB_ACTION_ENA) is global: DB_DEST_BASE_ENA (bit 14) is set, the range
+/// becomes the whole address space from 0x100, GL1_RANGE (bits 2..3) and
+/// GL2_RANGE (bit 12) lose their range bit and a ranged GLI_INV (2 or 3)
+/// invalidates all (1). The module also applies a hardware workaround that
+/// a driver-provided global selects (zero unless the driver sets it); it is
+/// not modelled.
+fn acquire_mem_words(control: u32, gcr: u32, base: u64, size: u64, poll: u32) -> [u32; 8] {
+    const ADDRESS_MASK: u64 = 0xFFFF_FFFF_FFFF;
+    let mut gcr = if gcr & 0xC000 == 0x4000 { gcr | 0x8000 } else { gcr };
+    let (mut control, mut base, mut size) = (control, base, size);
+    let mut units = None;
+    if control & (1 << 26) != 0 {
+        control |= 1 << 14;
+        base = 0x100;
+        units = Some(0xFF_FFFF_FFFEu64);
+        let g = if gcr & 2 != 0 { (gcr & !0xB) | 1 } else { gcr & !8 };
+        gcr = if g & 0x1000 != 0 { g & !0x1008 } else { g };
+        size = 0;
     }
-    emit(
-        cb,
-        &[
-            pm4(8, op::NOP, nop::ACQUIRE_MEM),
-            control0,
-            if no_size { 0 } else { (size >> 8) as u32 },
-            0,
-            (base >> 8) as u32,
-            0,
-            poll / 40,
-            gcr,
-        ],
-    )
+    let units = units.unwrap_or_else(|| {
+        let bytes = (((base & 0xFF).wrapping_add(size)) & ADDRESS_MASK) + 0xFF;
+        bytes.min(0xFFFF_FFFF_FF00u64.wrapping_sub(base)) >> 8
+    });
+    [
+        pm4(8, op::ACQUIRE_MEM, 0),
+        control,
+        units as u32,
+        (units >> 32) as u32 & 0xFF,
+        (base >> 8) as u32,
+        (base >> 40) as u32,
+        (poll >> 4).min(0xFFFF),
+        gcr & 0x7FFFF,
+    ]
 }
 
+/// `sceAgcAcbAcquireMem(cb, gcr, base, size, poll)`: control word 0.
 fn acb_acquire_mem(ctx: &mut CpuContext) -> HleResult {
     let (cb, gcr, base, size, poll) = (arg(ctx, 0), arg(ctx, 1) as u32, arg(ctx, 2), arg(ctx, 3), arg(ctx, 4) as u32);
-    ptr(acquire_mem_packet(cb, 0x8000_0000, gcr, base, size, poll))
+    ptr(emit(cb, &acquire_mem_words(0, gcr, base, size, poll)))
 }
 
+/// `sceAgcDcbAcquireMem(cb, engine, cbDbOp, gcr, base, size, poll)`: the
+/// engine in control bit 31, the CB/DB operation bits masked by 0x6007FC0.
 fn dcb_acquire_mem(ctx: &mut CpuContext) -> HleResult {
     let cb = arg(ctx, 0);
     let engine = (arg(ctx, 1) & 0xFF) as u32;
     let (cbdb, gcr, base, size) = (arg(ctx, 2) as u32, arg(ctx, 3) as u32, arg(ctx, 4), arg(ctx, 5));
     let Some(poll) = stack_arg(ctx, 1) else { return 0 };
-    if engine > 1 {
-        log::debug!("[agc] DcbAcquireMem engine {engine} unsupported");
-    }
-    ptr(acquire_mem_packet(cb, ((engine & 1) << 31) | cbdb, gcr, base, size, poll as u32))
+    let words = acquire_mem_words(cbdb, gcr, base, size, poll as u32);
+    let control = (engine << 31) | (words[1] & 0x0600_7FC0);
+    let mut w = words;
+    w[1] = control;
+    ptr(emit(cb, &w))
 }
 
 fn acquire_mem_get_size(_: &mut CpuContext) -> HleResult {
@@ -243,7 +267,11 @@ fn acquire_mem_get_size(_: &mut CpuContext) -> HleResult {
 
 /// Wait-on-address: the internal-data begin tag (address in the payload),
 /// the native WAIT_REG_MEM(_64), and the end tag. Returns the begin tag.
-fn wait_reg_mem_packet(cb: u64, size: u32, cmp: u32, operation: u32, cache: u32, addr: u64, reference: u64, mask: u64, poll: u32) -> u64 {
+/// The begin and end tags are driver user data, written with R (header
+/// custom bits 1) in a DCB and without it in an ACB (`acb`), as
+/// sceAgcDriverUserDataWritePacket does for its compute argument.
+#[allow(clippy::too_many_arguments)]
+fn wait_reg_mem_packet(cb: u64, acb: bool, size: u32, cmp: u32, operation: u32, cache: u32, addr: u64, reference: u64, mask: u64, poll: u32) -> u64 {
     use super::pm4::{INTERNAL_DATA_REGISTER, WAIT_USER_DATA_BEGIN32_TAG, WAIT_USER_DATA_BEGIN64_TAG, WAIT_USER_DATA_END_TAG};
     if size > 1 {
         return 0;
@@ -252,8 +280,9 @@ fn wait_reg_mem_packet(cb: u64, size: u32, cmp: u32, operation: u32, cache: u32,
         log::debug!("[agc] WaitRegMem cache policy {cache} unsupported");
     }
     let tag = if size == 0 { WAIT_USER_DATA_BEGIN32_TAG } else { WAIT_USER_DATA_BEGIN64_TAG };
-    let begin = [pm4(4, op::SET_UCONFIG_REG, 1), INTERNAL_DATA_REGISTER, tag | (hi(addr) & 0xFFFF), lo(addr)];
-    let end = [pm4(3, op::SET_UCONFIG_REG, 1), INTERNAL_DATA_REGISTER, WAIT_USER_DATA_END_TAG];
+    let r = if acb { 0 } else { 1 };
+    let begin = [pm4(4, op::SET_UCONFIG_REG, r), INTERNAL_DATA_REGISTER, tag | (hi(addr) & 0xFFFF), lo(addr)];
+    let end = [pm4(3, op::SET_UCONFIG_REG, r), INTERNAL_DATA_REGISTER, WAIT_USER_DATA_END_TAG];
     let poll = encode_wait_poll(poll);
     let mut w = [0u32; 16];
     w[..4].copy_from_slice(&begin);
@@ -296,7 +325,7 @@ fn dcb_wait_reg_mem(ctx: &mut CpuContext) -> HleResult {
     let (Some(reference), Some(mask), Some(poll)) = (stack_arg(ctx, 1), stack_arg(ctx, 2), stack_arg(ctx, 3)) else {
         return 0;
     };
-    ptr(wait_reg_mem_packet(cb, size, cmp, operation, cache, addr, reference, mask, poll as u32))
+    ptr(wait_reg_mem_packet(cb, false, size, cmp, operation, cache, addr, reference, mask, poll as u32))
 }
 
 fn acb_wait_reg_mem(ctx: &mut CpuContext) -> HleResult {
@@ -306,7 +335,7 @@ fn acb_wait_reg_mem(ctx: &mut CpuContext) -> HleResult {
     let cache = (arg(ctx, 3) & 0xFF) as u32;
     let (addr, reference) = (arg(ctx, 4), arg(ctx, 5));
     let (Some(mask), Some(poll)) = (stack_arg(ctx, 1), stack_arg(ctx, 2)) else { return 0 };
-    ptr(wait_reg_mem_packet(cb, size, cmp, 0, cache, addr, reference, mask, poll as u32))
+    ptr(wait_reg_mem_packet(cb, true, size, cmp, 0, cache, addr, reference, mask, poll as u32))
 }
 
 fn wait_on_address_get_size(ctx: &mut CpuContext) -> HleResult {
@@ -420,35 +449,18 @@ fn queue_end_of_shader_action_get_size(_: &mut CpuContext) -> HleResult {
     size_bytes(8)
 }
 
-/// `sceAgcCbCondWrite(cb, cmp, space, writeAddr, writeValue, readAddr, ref, mask)`.
+/// `sceAgcCbCondWrite(cb, cmp, space, writeAddr, writeValue, pollAddr;
+/// stack: ref, mask)`: the module (export at 0x2450) encodes every argument
+/// as given, without checks: control `0x10 | cmp[2:0] | space[1:0]<<8`,
+/// both addresses written whole.
 fn cb_cond_write(ctx: &mut CpuContext) -> HleResult {
     let cb = arg(ctx, 0);
-    let cmp = arg(ctx, 1) as u32;
-    let space = arg(ctx, 2) as u32;
+    let (cmp, space) = (arg(ctx, 1) as u32 & 7, arg(ctx, 2) as u32 & 3);
     let (waddr, wval, raddr) = (arg(ctx, 3), arg(ctx, 4) as u32, arg(ctx, 5));
     let (Some(reference), Some(mask)) = (stack_arg(ctx, 1), stack_arg(ctx, 2)) else { return 0 };
-    if cmp > 6
-        || !matches!(space, 1 | 2)
-        || raddr == 0
-        || (space == 1 && (waddr == 0 || waddr % 4 != 0))
-        || raddr % 4 != 0
-    {
-        return 0;
-    }
-    let control = 0x10 | cmp | if space == 1 { 0x100 } else { 0 };
     ptr(emit(
         cb,
-        &[
-            pm4(9, op::COND_WRITE, 0),
-            control,
-            (raddr as u32) & !3,
-            hi(raddr) & 0xFFFF,
-            reference as u32,
-            mask as u32,
-            (waddr as u32) & !3,
-            hi(waddr) & 0xFFFF,
-            wval,
-        ],
+        &[pm4(9, op::COND_WRITE, 0), 0x10 | cmp | space << 8, lo(raddr), hi(raddr), reference as u32, mask as u32, lo(waddr), hi(waddr), wval],
     ))
 }
 
@@ -622,6 +634,9 @@ fn cb_branch(ctx: &mut CpuContext) -> HleResult {
         }
     }
     let (cache1, buf1, dw1, cache2, buf2, dw2) = (s[0] as u32 & 3, s[1], s[2] as u32, s[3] as u32 & 3, s[4], s[5] as u32);
+    // A null target leaves its three dwords zero (decrypted libSceAgc).
+    let target = |buf: u64, dw: u32, cache: u32| if buf == 0 { [0; 3] } else { [(buf as u32) & !3, hi(buf), (dw & 0xFFFFF) | (cache << 28)] };
+    let (t, e) = (target(buf1, dw1, cache1), target(buf2, dw2, cache2));
     ptr(emit(
         cb,
         &[
@@ -633,12 +648,12 @@ fn cb_branch(ctx: &mut CpuContext) -> HleResult {
             hi(mask),
             lo(reference),
             hi(reference),
-            (buf1 as u32) & !3,
-            hi(buf1),
-            (dw1 & 0xFFFFF) | (cache1 << 28),
-            (buf2 as u32) & !3,
-            hi(buf2),
-            (dw2 & 0xFFFFF) | (cache2 << 28),
+            t[0],
+            t[1],
+            t[2],
+            e[0],
+            e[1],
+            e[2],
         ],
     ))
 }
@@ -648,12 +663,11 @@ fn cb_branch_get_size(_: &mut CpuContext) -> HleResult {
 }
 
 /// `sceAgcDcbCondExec(cb, predicateAddr, dwords)`: skips the next `dwords`
-/// when the predicate dword is zero.
+/// when the predicate dword is zero. The arguments are not checked: the
+/// address loses its low two bits and the count keeps its low 14 bits
+/// (decrypted libSceAgc).
 fn cond_exec(ctx: &mut CpuContext) -> HleResult {
     let (cb, addr, n) = (arg(ctx, 0), arg(ctx, 1), arg(ctx, 2) as u32);
-    if addr == 0 || addr & 3 != 0 || n > 0x3FFF {
-        return 0;
-    }
     ptr(emit(cb, &[pm4(5, op::COND_EXEC, 0), (addr as u32) & !3, hi(addr), 0, n & 0x3FFF]))
 }
 
@@ -821,39 +835,42 @@ fn dma_data_get_size(_: &mut CpuContext) -> HleResult {
     size_bytes(7)
 }
 
-/// Inferred: `sceAgcDcbAtomicMem(cb, op, command, cache, addr, data,
-/// compare, loopInterval)` -> the 9-dword ATOMIC_MEM packet
-/// `[ctl = op[6:0] | cmd<<8 | cache<<25 | engine<<30, addr, data, compare,
-/// loop]`.
-fn atomic_mem_packet(ctx: &CpuContext, engine: u32) -> u64 {
-    let cb = arg(ctx, 0);
-    let aop = arg(ctx, 1) as u32 & 0x7F;
-    let cmd = arg(ctx, 2) as u32 & 0xF;
-    let cache = arg(ctx, 3) as u32 & 3;
-    let (addr, data) = (arg(ctx, 4), arg(ctx, 5));
-    let (Some(compare), Some(lp)) = (stack_arg(ctx, 1), stack_arg(ctx, 2)) else { return 0 };
+/// The 9-dword ATOMIC_MEM packet of `sceAgcDcbAtomicMem` /
+/// `sceAgcAcbAtomicMem` (decrypted libSceAgc): `[ctl = op[6:0] | cmd[3:0]<<8
+/// | cache[1:0]<<25 | engine<<30, addr, data, compare, loop]`, the loop
+/// interval word `min(loop >> 6, 0xFFF)`.
+#[allow(clippy::too_many_arguments)]
+fn atomic_mem_packet(cb: u64, engine: u32, aop: u64, cmd: u64, cache: u64, addr: u64, data: u64, compare: u64, lp: u64) -> u64 {
+    let control = (aop as u32 & 0x7F) | (cmd as u32 & 0xF) << 8 | (cache as u32 & 3) << 25 | engine << 30;
     emit(
         cb,
         &[
             pm4(9, op::ATOMIC_MEM, 0),
-            aop | (cmd << 8) | (cache << 25) | (engine << 30),
+            control,
             lo(addr),
             hi(addr),
             lo(data),
             hi(data),
             lo(compare),
             hi(compare),
-            lp as u32 & 0x1FFF,
+            (lp as u32 >> 6).min(0xFFF),
         ],
     )
 }
 
+/// `sceAgcDcbAtomicMem(cb, engine, op, cmd, cache, addr; stack: u64 data,
+/// u64 compare, u32 loopInterval)` (module export at 0x3b50).
 fn dcb_atomic_mem(ctx: &mut CpuContext) -> HleResult {
-    ptr(atomic_mem_packet(ctx, 0))
+    let (Some(data), Some(compare), Some(lp)) = (stack_arg(ctx, 1), stack_arg(ctx, 2), stack_arg(ctx, 3)) else { return 0 };
+    let engine = arg(ctx, 1) as u32 & 3;
+    ptr(atomic_mem_packet(arg(ctx, 0), engine, arg(ctx, 2), arg(ctx, 3), arg(ctx, 4), arg(ctx, 5), data, compare, lp))
 }
 
+/// `sceAgcAcbAtomicMem(cb, op, cmd, addr, cache, data; stack: u64 compare,
+/// u32 loopInterval)` (module export at 0xd0): no engine field.
 fn acb_atomic_mem(ctx: &mut CpuContext) -> HleResult {
-    ptr(atomic_mem_packet(ctx, 0))
+    let (Some(compare), Some(lp)) = (stack_arg(ctx, 1), stack_arg(ctx, 2)) else { return 0 };
+    ptr(atomic_mem_packet(arg(ctx, 0), 0, arg(ctx, 1), arg(ctx, 2), arg(ctx, 4), arg(ctx, 3), arg(ctx, 5), compare, lp))
 }
 
 fn atomic_mem_get_size(_: &mut CpuContext) -> HleResult {
@@ -1024,8 +1041,10 @@ fn dcb_set_index_size_get_size(_: &mut CpuContext) -> HleResult {
     size_bytes(3)
 }
 
+/// `sceAgcDcbSetIndexCount(cb, count)`: a count of 0 is written as 1
+/// (decrypted libSceAgc).
 fn dcb_set_index_count(ctx: &mut CpuContext) -> HleResult {
-    ptr(emit(arg(ctx, 0), &[pm4(2, op::INDEX_BUFFER_SIZE, 0), arg(ctx, 1) as u32]))
+    ptr(emit(arg(ctx, 0), &[pm4(2, op::INDEX_BUFFER_SIZE, 0), (arg(ctx, 1) as u32).max(1)]))
 }
 
 fn two_dword_get_size(_: &mut CpuContext) -> HleResult {
@@ -1097,23 +1116,37 @@ fn dcb_draw_index_indirect(ctx: &mut CpuContext) -> HleResult {
     ptr(emit(cb, &[pm4(5, op::DRAW_INDEX_INDIRECT, 0), offset, lo(loc), hi(loc), draw_index_initiator(modifier)]))
 }
 
+/// A draw packet bracketed by driver user data, as libSceAgc writes its
+/// multi-draws: the begin tag naming the draw, the draw, the end tag. The
+/// returned packet is the begin tag.
+fn tagged_draw(cb: u64, begin_tag: u32, draw: &[u32]) -> u64 {
+    use super::pm4::{DRAW_END_TAG, INTERNAL_DATA_REGISTER};
+    let tag = |t: u32| [pm4(3, op::SET_UCONFIG_REG, 1), INTERNAL_DATA_REGISTER, t];
+    let mut w = Vec::with_capacity(draw.len() + 6);
+    w.extend_from_slice(&tag(begin_tag));
+    w.extend_from_slice(draw);
+    w.extend_from_slice(&tag(DRAW_END_TAG));
+    emit(cb, &w)
+}
+
 /// `sceAgcDcbDrawIndexIndirectMulti(cb, dataOffset, countFromMemory, count,
-/// countAddr, stride, modifier)`.
+/// countAddr, stride, modifier)`: DRAW_INDEX_INDIRECT_MULTI between the
+/// 0xC6000005 begin tag and the end tag (decrypted libSceAgc).
 fn dcb_draw_index_indirect_multi(ctx: &mut CpuContext) -> HleResult {
     let cb = arg(ctx, 0);
     let (offset, from_mem, count, count_addr, stride) =
         (arg(ctx, 1) as u32, arg(ctx, 2) as u32, arg(ctx, 3) as u32, arg(ctx, 4), arg(ctx, 5) as u32);
     let Some(modifier) = stack_arg(ctx, 1) else { return 0 };
-    if from_mem > 1 {
-        return 0;
-    }
+    // The module takes bit 0 of countFromMemory (export at 0x5800).
+    let from_mem = from_mem & 1;
     let loc = indirect_patch_locations(modifier, true);
     let m = modifier as u32;
     // The multi-draw moves the first-index enable to word 4, bit 28.
     let control = indirect_draw_index_location(m) | ((m & 0x10) << 23) | ((m & 2) << 27) | (from_mem << 30) | ((m & 8) << 28);
     let ca = count_addr & !3;
-    ptr(emit(
+    ptr(tagged_draw(
         cb,
+        super::pm4::DRAW_INDEX_INDIRECT_MULTI_BEGIN_TAG,
         &[
             pm4(10, op::DRAW_INDEX_INDIRECT_MULTI, 0),
             offset,
@@ -1130,14 +1163,13 @@ fn dcb_draw_index_indirect_multi(ctx: &mut CpuContext) -> HleResult {
 }
 
 fn dcb_draw_index_indirect_multi_get_size(_: &mut CpuContext) -> HleResult {
-    size_bytes(10)
+    size_bytes(16)
 }
 
 /// `sceAgcDcbDrawIndirectMulti(cb, dataOffset, countFromMemory, count,
 /// countAddr, stride, modifier)`: DRAW_INDIRECT_MULTI bracketed by the
 /// private begin/end tags (3 + 10 + 3 dwords, inferred).
 fn dcb_draw_indirect_multi(ctx: &mut CpuContext) -> HleResult {
-    use super::pm4::{DRAW_INDIRECT_MULTI_BEGIN_TAG, DRAW_INDIRECT_MULTI_END_TAG, INTERNAL_DATA_REGISTER};
     let cb = arg(ctx, 0);
     let (offset, from_mem, count, count_addr, stride) =
         (arg(ctx, 1) as u32, arg(ctx, 2) as u32, arg(ctx, 3) as u32, arg(ctx, 4), arg(ctx, 5) as u32);
@@ -1145,10 +1177,10 @@ fn dcb_draw_indirect_multi(ctx: &mut CpuContext) -> HleResult {
     let m = modifier as u32;
     let loc = indirect_patch_locations(modifier, false);
     let control = indirect_draw_index_location(m) | ((m & 0x10) << 23) | ((from_mem & 1) << 30) | ((m & 8) << 28);
-    let tag = |t: u32| [pm4(3, op::SET_UCONFIG_REG, 1), INTERNAL_DATA_REGISTER, t];
-    let mut w = Vec::with_capacity(16);
-    w.extend_from_slice(&tag(DRAW_INDIRECT_MULTI_BEGIN_TAG));
-    w.extend_from_slice(&[
+    ptr(tagged_draw(
+        cb,
+        super::pm4::DRAW_INDIRECT_MULTI_BEGIN_TAG,
+        &[
         pm4(10, op::DRAW_INDIRECT_MULTI, 0),
         offset,
         lo(loc),
@@ -1159,9 +1191,8 @@ fn dcb_draw_indirect_multi(ctx: &mut CpuContext) -> HleResult {
         hi(count_addr),
         stride,
         indirect_draw_initiator(modifier),
-    ]);
-    w.extend_from_slice(&tag(DRAW_INDIRECT_MULTI_END_TAG));
-    ptr(emit(cb, &w))
+        ],
+    ))
 }
 
 fn dcb_draw_indirect_multi_get_size(_: &mut CpuContext) -> HleResult {
@@ -1169,15 +1200,15 @@ fn dcb_draw_indirect_multi_get_size(_: &mut CpuContext) -> HleResult {
 }
 
 /// `sceAgcDcbDrawIndexMultiInstanced(cb, count, indexAddr, objectIds,
-/// instances, modifier)`: DISPATCH_DRAW_PREAMBLE form.
+/// instances, modifier)`: DISPATCH_DRAW_PREAMBLE form between the
+/// 0xC6000006 begin tag and the end tag; the addresses are not checked
+/// (decrypted libSceAgc).
 fn dcb_draw_index_multi_instanced(ctx: &mut CpuContext) -> HleResult {
     let (cb, count, addr, ids, inst, modifier) =
         (arg(ctx, 0), arg(ctx, 1) as u32, arg(ctx, 2), arg(ctx, 3), arg(ctx, 4) as u32, arg(ctx, 5));
-    if addr == 0 || ids == 0 || addr & 1 != 0 {
-        return 0;
-    }
-    ptr(emit(
+    ptr(tagged_draw(
         cb,
+        super::pm4::DRAW_INDEX_MULTI_INST_BEGIN_TAG,
         &[
             pm4(9, op::DISPATCH_DRAW_PREAMBLE, 0),
             count,
@@ -1193,7 +1224,7 @@ fn dcb_draw_index_multi_instanced(ctx: &mut CpuContext) -> HleResult {
 }
 
 fn dcb_draw_index_multi_instanced_get_size(_: &mut CpuContext) -> HleResult {
-    size_bytes(9)
+    size_bytes(15)
 }
 
 /// `sceAgcDcbSetBaseIndirectArgs(cb, shaderType, addr)`: SET_BASE index 1;

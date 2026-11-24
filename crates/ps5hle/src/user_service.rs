@@ -302,6 +302,48 @@ fn cb_get_np_account_id(ctx: &mut CpuContext) -> HleResult {
 
 /// sceUserServiceTerminate: the local user stays logged in; the service
 /// may be initialized again.
+/// The (callback, user data) pairs of sceUserServiceRegisterEventCallback.
+/// The service never produces an event a callback would be told about
+/// (logins reach the title through sceUserServiceGetEvent), so they are
+/// only kept for the return codes.
+static EVENT_CALLBACKS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn initialized() -> bool {
+    INITIALIZED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// sceUserServiceRegisterEventCallback(callback, userData): needs an
+/// initialized service; a null callback succeeds without a registration and
+/// a pair already registered is kept once (PS5 13.60 libSceUserService).
+fn cb_register_event_callback(ctx: &mut CpuContext) -> HleResult {
+    let (callback, userdata) = (ctx.rdi(), ctx.rsi());
+    if !initialized() {
+        return ERR_NOT_INITIALIZED;
+    }
+    if callback != 0 {
+        let mut list = EVENT_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+        if !list.contains(&(callback, userdata)) {
+            list.push((callback, userdata));
+        }
+    }
+    OK
+}
+
+/// sceUserServiceUnregisterEventCallback(callback, userData): needs an
+/// initialized service; a null callback is INVALID_ARGUMENT, a pair that is
+/// not registered succeeds (PS5 13.60 libSceUserService).
+fn cb_unregister_event_callback(ctx: &mut CpuContext) -> HleResult {
+    let (callback, userdata) = (ctx.rdi(), ctx.rsi());
+    if !initialized() {
+        return ERR_NOT_INITIALIZED;
+    }
+    if callback == 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+    EVENT_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != (callback, userdata));
+    OK
+}
+
 fn cb_terminate(_ctx: &mut CpuContext) -> HleResult {
     if INITIALIZED.swap(false, std::sync::atomic::Ordering::AcqRel) { OK } else { ERR_NOT_INITIALIZED }
 }
@@ -328,6 +370,8 @@ pub fn register(reg: &mut HleRegistry) {
     reg.register_fn("5EiQCnL2G1Y", "sceUserServiceGetRegisteredUserIdList", LIB, cb_get_registered_user_id_list);
     reg.register_fn("lUoqwTQu4Go", "sceUserServiceGetUserColor", LIB, cb_get_user_color);
     reg.register_fn("6dfDreosXGY", "sceUserServiceGetNpAccountId", LIB, cb_get_np_account_id);
+    reg.register_fn("wuI7c7UNk0A", "sceUserServiceRegisterEventCallback", LIB, cb_register_event_callback);
+    reg.register_fn("spW--yoLQ9o", "sceUserServiceUnregisterEventCallback", LIB, cb_unregister_event_callback);
 }
 
 #[cfg(test)]
@@ -346,6 +390,14 @@ mod tests {
         use crate::context::CpuRegister::Rdi;
         let was = INITIALIZED.swap(false, std::sync::atomic::Ordering::AcqRel);
         assert_eq!(cb_terminate(&mut ctx), ERR_NOT_INITIALIZED);
+        // The event callback calls need an initialized service.
+        let callbacks = |ctx: &mut CpuContext, cb: u64, ud: u64| {
+            ctx.set(Rdi, cb);
+            ctx.set(crate::context::CpuRegister::Rsi, ud);
+            (cb_register_event_callback(ctx), cb_unregister_event_callback(ctx))
+        };
+        assert_eq!(callbacks(&mut ctx, 0x1000, 1), (ERR_NOT_INITIALIZED, ERR_NOT_INITIALIZED));
+        assert_eq!(callbacks(&mut ctx, 0, 0), (ERR_NOT_INITIALIZED, ERR_NOT_INITIALIZED));
         for bad in [0u64, 0xFF, 0x300, u32::MAX as u64] {
             ctx.set(Rdi, bad);
             assert_eq!(cb_initialize2(&mut ctx), ERR_INVALID_ARGUMENT, "{bad:#x}");
@@ -358,6 +410,18 @@ mod tests {
         assert_eq!(cb_initialize2(&mut ctx), ERR_ALREADY_INITIALIZED);
         ctx.set(Rdi, 0);
         assert_eq!(cb_initialize(&mut ctx), ERR_ALREADY_INITIALIZED);
+        // Registered: a null callback is accepted by register only, a pair
+        // is kept once, an absent pair unregisters successfully.
+        assert_eq!(callbacks(&mut ctx, 0, 7), (OK, ERR_INVALID_ARGUMENT));
+        let pair = (0x5A70_0000_1000u64, 7u64);
+        ctx.set(Rdi, pair.0);
+        ctx.set(crate::context::CpuRegister::Rsi, pair.1);
+        assert_eq!(cb_register_event_callback(&mut ctx), OK);
+        assert_eq!(cb_register_event_callback(&mut ctx), OK);
+        assert_eq!(EVENT_CALLBACKS.lock().unwrap().iter().filter(|&&p| p == pair).count(), 1);
+        assert_eq!(cb_unregister_event_callback(&mut ctx), OK);
+        assert!(!EVENT_CALLBACKS.lock().unwrap().contains(&pair));
+        assert_eq!(cb_unregister_event_callback(&mut ctx), OK, "an absent pair");
         assert_eq!(cb_terminate(&mut ctx), OK);
         ctx.write_u32(BASE, 0x100);
         ctx.set(Rdi, BASE);
@@ -380,6 +444,8 @@ mod tests {
             ("5EiQCnL2G1Y", "sceUserServiceGetRegisteredUserIdList"),
             ("lUoqwTQu4Go", "sceUserServiceGetUserColor"),
             ("6dfDreosXGY", "sceUserServiceGetNpAccountId"),
+            ("wuI7c7UNk0A", "sceUserServiceRegisterEventCallback"),
+            ("spW--yoLQ9o", "sceUserServiceUnregisterEventCallback"),
         ] {
             assert_eq!(ps5nid::compute_nid(name), nid);
         }

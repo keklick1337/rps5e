@@ -319,8 +319,14 @@ fn cb_opt_param_initialize(ctx: &mut CpuContext) -> HleResult {
     if opt & 7 != 0 {
         return ERR_ALIGNMENT;
     }
-    if ctx.write_u32(opt, OPT_MAGIC) { 0 } else { ERR_INVALID }
+    // The console fills the whole 128-byte block: the magic, then zeros.
+    let mut block = [0u8; OPT_PARAM_SIZE];
+    block[..4].copy_from_slice(&OPT_MAGIC.to_le_bytes());
+    if ctx.write_bytes(opt, &block) { 0 } else { ERR_INVALID }
 }
+
+/// Size of `SceFiberOptParam`.
+const OPT_PARAM_SIZE: usize = 128;
 
 fn cb_finalize(ctx: &mut CpuContext) -> HleResult {
     let fiber = ctx.rdi();
@@ -668,5 +674,33 @@ mod tests {
         assert_eq!(cb_switch(&mut ctx), ERR_PERMISSION);
         assert_eq!(cb_finalize(&mut ctx), 0);
         assert_eq!(cb_finalize(&mut ctx), ERR_STATE);
+    }
+
+    /// The option block is 128 bytes: the magic, then zeros; a misaligned
+    /// block is refused before anything is written.
+    #[test]
+    fn opt_param_initialize_fills_the_block() {
+        let vm = ps5vm::VirtualMemory::new();
+        const BASE: u64 = 0x5C70_0000_0000;
+        vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
+        let mut ctx = CpuContext::new(&vm);
+        for off in [0u64, 8, 16, 32] {
+            ctx.write_bytes(BASE, &[0xAA; 0x100]);
+            ctx.set(CpuRegister::Rdi, BASE + off);
+            assert_eq!(cb_opt_param_initialize(&mut ctx), 0);
+            let got = ctx.read_bytes(BASE, 0x100).unwrap();
+            let mut want = vec![0xAAu8; 0x100];
+            want[off as usize..off as usize + OPT_PARAM_SIZE].fill(0);
+            want[off as usize..off as usize + 4].copy_from_slice(&OPT_MAGIC.to_le_bytes());
+            assert_eq!(got, want, "offset {off}");
+        }
+        ctx.write_bytes(BASE, &[0xAA; 0x100]);
+        for off in [1u64, 2, 4] {
+            ctx.set(CpuRegister::Rdi, BASE + off);
+            assert_eq!(cb_opt_param_initialize(&mut ctx), ERR_ALIGNMENT);
+        }
+        assert_eq!(ctx.read_bytes(BASE, 0x100).unwrap(), vec![0xAAu8; 0x100]);
+        ctx.set(CpuRegister::Rdi, 0);
+        assert_eq!(cb_opt_param_initialize(&mut ctx), ERR_NULL);
     }
 }

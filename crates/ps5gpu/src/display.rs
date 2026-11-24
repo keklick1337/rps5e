@@ -19,7 +19,7 @@
 //!   when the display offers an HDR10 surface format (default off; read at
 //!   start, see [`crate::hdr`]).
 //! - `RPS5E_DISPLAY_RESOLUTION=720p|1080p|2160p`: the resolution of the
-//!   emulated display the game is told about (default `2160p`; read once
+//!   emulated display the game is told about (default `1080p`; read once
 //!   at start, see [`display_resolution`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -206,9 +206,9 @@ pub enum DisplayResolution {
     /// 1280x720.
     P720,
     /// 1920x1080.
+    #[default]
     P1080,
     /// 3840x2160.
-    #[default]
     P2160,
 }
 
@@ -243,13 +243,14 @@ impl DisplayResolution {
 }
 
 /// The emulated display's resolution (`RPS5E_DISPLAY_RESOLUTION`, default
-/// 2160p). Read once: the guest learns it when it starts. An invalid value
+/// 1080p: games that pick their output size from the display render a
+/// quarter of the pixels of 2160p, and the window scales the image). Read once: the guest learns it when it starts. An invalid value
 /// is reported and the default used.
 pub fn display_resolution() -> DisplayResolution {
     static RES: std::sync::OnceLock<DisplayResolution> = std::sync::OnceLock::new();
     *RES.get_or_init(|| match std::env::var("RPS5E_DISPLAY_RESOLUTION") {
         Ok(v) if !v.trim().is_empty() => DisplayResolution::parse(&v).unwrap_or_else(|| {
-            log::warn!("RPS5E_DISPLAY_RESOLUTION={v:?} is not 720p, 1080p or 2160p: using 2160p");
+            log::warn!("RPS5E_DISPLAY_RESOLUTION={v:?} is not 720p, 1080p or 2160p: using 1080p");
             DisplayResolution::default()
         }),
         _ => DisplayResolution::default(),
@@ -360,7 +361,7 @@ mod tests {
         assert_eq!(DisplayResolution::parse(" 4K "), Some(DisplayResolution::P2160));
         assert_eq!(DisplayResolution::parse("1080P"), Some(DisplayResolution::P1080));
         assert_eq!(DisplayResolution::parse("1440p"), None);
-        assert_eq!(DisplayResolution::default(), DisplayResolution::P2160);
+        assert_eq!(DisplayResolution::default(), DisplayResolution::P1080);
         assert_eq!(DisplayResolution::P720.size(), (1280, 720));
         assert_eq!(DisplayResolution::P1080.size(), (1920, 1080));
         assert_eq!(DisplayResolution::P2160.size(), (3840, 2160));
