@@ -18,7 +18,7 @@ Packages (names differ per distribution):
 - Vulkan loader and driver (`libvulkan.so.1`);
 - OpenSSL development files (`libssl-dev` / `openssl-devel`);
 - ALSA development files (`libasound2-dev` / `alsa-lib-devel`);
-- optional: FFmpeg development files (`libavformat`, `libavcodec`, `libavutil`, `libswscale`, `libswresample`) for in-game movies; without them movies are skipped;
+- optional: FFmpeg development files (`libavformat`, `libavcodec`, `libavutil`, `libswscale`, `libswresample`) for in-game movies; without them a game's movies fail to open, and games that do not expect that (Astro Bot) stop at their first movie;
 - optional at run time: SDL3 (`libSDL3.so`) for controllers; keyboard and mouse work without it.
 
 ```sh
@@ -86,3 +86,10 @@ scripts/package.sh windows    # dist/rps5e-<version>-windows-x86_64.zip (cross b
 ```
 
 Both use the `dist` profile (release without debug info). `CARGO=<wrapper>` selects another cargo, for example one that sets up the Windows cross toolchain. The Linux tarball has a `share/` folder with the desktop entry and icons for `~/.local/share` or `/usr/share`.
+
+Release archives link a small static FFmpeg into the Linux binaries, so movies play on any distribution whatever FFmpeg it has (the release workflow does this):
+
+```sh
+scripts/build-ffmpeg.sh local/ffmpeg                       # FFmpeg's own decoders only, needs nasm
+RPS5E_FFMPEG_PREFIX=$PWD/local/ffmpeg scripts/package.sh linux
+```

@@ -4,6 +4,12 @@ All notable changes to RustPS5Emu (RPS5E) are listed here. Versions follow [Sema
 
 ## [Unreleased]
 
+## [0.1.9-alpha] - 2026-11-25
+
+### Fixed
+
+- The Linux release plays game movies: it links a small static FFmpeg (FFmpeg's own H.264, HEVC, VP8/VP9, AAC, Opus, Vorbis and MP3 decoders, no other libraries), so it needs no FFmpeg on the system and works whatever FFmpeg version the distribution has. The 0.1.8 archive was built without FFmpeg, and Astro Bot crashed at its first movie (#7).
+
 ## [0.1.8-alpha] - 2026-11-23
 
 ### Changed

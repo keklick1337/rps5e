@@ -16,7 +16,9 @@
 # Environment: CARGO (default cargo; e.g. a wrapper that sets up the Windows
 # cross toolchain), OUT (default <repo>/dist), BUILD=0 packs existing binaries,
 # SDL3_ZIP (an already downloaded SDL3-<version>-win32-x64.zip; otherwise it is
-# downloaded once into $OUT/cache).
+# downloaded once into $OUT/cache), RPS5E_FFMPEG_PREFIX (a static FFmpeg from
+# scripts/build-ffmpeg.sh: the Linux binaries link it in and play movies on
+# any distribution; without it they use the host's FFmpeg development files).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CARGO="${CARGO:-cargo}"
@@ -36,13 +38,25 @@ common_files() {
 
 package_linux() {
     local name="rps5e-$VERSION-linux-x86_64" bin="$ROOT/target/dist"
+    local ff="${RPS5E_FFMPEG_PREFIX:-}"
     if [[ "${BUILD:-1}" != 0 ]]; then
-        "$CARGO" build --profile dist --manifest-path "$ROOT/Cargo.toml" --bin rps5e --bin rps5e-cli
+        if [[ -n "$ff" ]]; then
+            PKG_CONFIG_PATH="$ff/lib/pkgconfig" LIBAVFORMAT_STATIC=1 LIBAVCODEC_STATIC=1 LIBAVUTIL_STATIC=1 \
+                LIBSWSCALE_STATIC=1 LIBSWRESAMPLE_STATIC=1 \
+                "$CARGO" build --profile dist --manifest-path "$ROOT/Cargo.toml" --bin rps5e --bin rps5e-cli
+        else
+            "$CARGO" build --profile dist --manifest-path "$ROOT/Cargo.toml" --bin rps5e --bin rps5e-cli
+        fi
+    fi
+    if [[ -n "$ff" ]] && grep -q "FFmpeg) is not compiled in" "$bin/rps5e-cli"; then
+        echo "package: $bin/rps5e-cli was built without FFmpeg" >&2
+        exit 1
     fi
     local stage="$OUT/$name"
     rm -rf "$stage" && mkdir -p "$stage"
     install -m755 "$bin/rps5e" "$bin/rps5e-cli" "$stage/"
     common_files "$stage"
+    [[ -z "$ff" ]] || install -m644 "$ff/share/ffmpeg/LICENSE.txt" "$stage/FFmpeg-LICENSE.txt"
     # The layout of a prefix: copy share/ into ~/.local/share or /usr/share.
     install -Dm644 "$ROOT/packaging/rps5e.desktop" "$stage/share/applications/rps5e.desktop"
     for f in "$ROOT"/assets/icons/rps5e-*.png; do
