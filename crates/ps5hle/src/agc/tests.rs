@@ -1715,6 +1715,25 @@ fn land_all(rec: &LateGpu, mut after: impl FnMut()) -> usize {
     n
 }
 
+/// Runs `q` again after landings until it holds no work (the GPU command
+/// thread re-polls its blocked queues the same way). A write held behind a
+/// late write also waits for every late write issued before that one, and
+/// the pending set is process-wide: a test running beside this one can
+/// have its own late write still on its way, so a single retry is not
+/// enough. Landings of `rec` made meanwhile call `after`.
+fn run_until_idle(q: &GpuQueue, rec: &LateGpu, mut after: impl FnMut()) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        q.retry_blocked();
+        run_queue(q);
+        land_all(rec, &mut after);
+        if q.pending() == 0 || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// `RPS5E_LABELS_AT_EOP=cpu` (the default): an end-of-pipe label reaches
 /// guest memory only once the GPU finished the work before it, while the
 /// command processor's own wait on it is satisfied as soon as the label
@@ -1743,8 +1762,7 @@ fn cp_labels_reach_the_cpu_after_the_gpu_and_the_cp_at_once() {
     assert_eq!(land_all(&rec, || assert_eq!(mem::r32(out), Some(0))), 1);
     assert_eq!(mem::r32(label), Some(1));
     // A landing retries the blocked queues (of the global queue set).
-    q.retry_blocked();
-    run_queue(&q);
+    run_until_idle(&q, &rec, || {});
     assert_eq!(q.pending(), 0);
     assert_eq!(mem::r32(out), Some(7));
 }
@@ -1782,8 +1800,7 @@ fn late_labels_never_land_over_memory_the_guest_reused() {
     let mut reused = false;
     reuse(&mut reused);
     land_all(&rec, || reuse(&mut reused));
-    q.retry_blocked();
-    run_queue(&q);
+    run_until_idle(&q, &rec, || reuse(&mut reused));
     reuse(&mut reused);
     land_all(&rec, || reuse(&mut reused));
     assert!(reused, "the command processor's report reached the guest");
