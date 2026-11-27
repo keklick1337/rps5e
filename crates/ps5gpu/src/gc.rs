@@ -195,6 +195,15 @@ pub fn heaps(dev: &GpuDevice) -> Option<(Vec<Heap>, bool)> {
     Some((heaps, dev.props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU))
 }
 
+/// `RPS5E_VRAM_BUDGET_MB=<MiB>`: the collection marks are derived from at
+/// most this budget instead of everything the device offers the process (a
+/// large card otherwise lets the caches grow until the whole card is nearly
+/// full, other applications included).
+fn budget_limit() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("RPS5E_VRAM_BUDGET_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m > 0).map(|m| m << 20))
+}
+
 /// Device memory reports of one device.
 pub struct DeviceMemory {
     pub images: Thresholds,
@@ -205,7 +214,7 @@ pub struct DeviceMemory {
 
 impl DeviceMemory {
     pub fn new(dev: &GpuDevice) -> DeviceMemory {
-        let budget = heaps(dev).map(|(h, discrete)| total_budget(&h, discrete));
+        let budget = heaps(dev).map(|(h, discrete)| total_budget(&h, discrete)).map(|b| budget_limit().map_or(b, |limit| b.min(limit)));
         DeviceMemory { images: Thresholds::images(budget), buffers: Thresholds::buffers(budget), reported: budget.is_some() }
     }
 

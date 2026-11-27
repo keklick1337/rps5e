@@ -1918,6 +1918,15 @@ fn amm_remap_multimap_protect_and_prt() {
     assert!((pool..pool + PAGE * 2).contains(&t.query(prt, 0).offset));
     assert_eq!(amm::execute(&allocate(PROT_CPU_RD)), OK, "backed pages take the new protection");
     assert_eq!(t.query(prt, 0).prot, PROT_CPU_RD);
+    // UnmapToPrt: the pages go back to the pool, the range stays PRT and
+    // can be backed again.
+    assert_eq!(amm::execute(&cmd(AmmKind::UnmapToPrt, prt, 0, PAGE, 0, 0, 0)), OK);
+    t.expect_unmapped(prt);
+    assert_eq!(t.read(prt + PAGE), 7, "the page next to it keeps its backing");
+    assert_eq!(amm::execute(&cmd(AmmKind::UnmapToPrt, prt, 0, PAGE * 2, 0, 0, 0)), OK, "unbacked pages are fine");
+    t.expect_unmapped(prt + PAGE);
+    assert_eq!(amm::execute(&allocate(PROT_CPU_RW)), OK, "both pages came back to the pool");
+    assert!((pool..pool + PAGE * 2).contains(&t.query(prt + PAGE, 0).offset));
     assert_eq!(amm::execute(&cmd(AmmKind::Unmap, prt, 0, PAGE * 2, 0, 0, 0)), OK);
     assert_eq!(amm::execute(&allocate(PROT_CPU_RW)), EINVAL, "unmap ends the PRT range");
 
@@ -1925,4 +1934,242 @@ fn amm_remap_multimap_protect_and_prt() {
     assert_eq!(t.release(phys, PAGE * 2), OK);
     amm::withdraw_automatic(pool, PAGE * 2);
     assert_eq!(t.release(pool, PAGE * 2), OK);
+}
+
+/// Deterministic pseudo-random numbers for the replay tests.
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+/// The range map and the direct views stay cheap under a title that
+/// commits and releases pieces of a partially resident window all the
+/// time: 20 000 direct ranges, then 50 000 commit / release commands of
+/// 16 KiB to 1 MiB at pseudo-random places of a 64 GiB window, replayed
+/// through the calls the mapping paths make (`MemState::map_direct` over a
+/// gap, `protect_memory` / `mtype_protect` over backed pages,
+/// `unmap_range`). The result is compared with a page-by-page model, and
+/// the replay has a time bound that work proportional to the number of
+/// ranges per command misses by far.
+#[test]
+fn range_map_and_views_keep_up_with_prt_commit_streams() {
+    const WINDOW: u64 = EXTENDED_MEMORY_BASE;
+    const SPAN: u64 = 64 << 30;
+    const PAGES: usize = (SPAN / PAGE) as usize;
+    const POOL: u64 = 4 << 30;
+    const RANGES: usize = 20_000;
+    const COMMANDS: usize = 50_000;
+
+    #[derive(Clone, Copy)]
+    struct Command {
+        commit: bool,
+        page: usize,
+        pages: usize,
+        prot: i32,
+        mtype: i32,
+        seed: u64,
+    }
+    let phys_of = |c: &Command, gap_page: usize, gap_pages: usize| -> u64 {
+        let pool_pages = (POOL / PAGE) as usize;
+        let h = (c.seed ^ (gap_page as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) as usize;
+        (h % (pool_pages - gap_pages)) as u64
+    };
+
+    struct Maps {
+        ranges: VirtualRanges,
+        physical: PhysicalMemory,
+        pool: u64,
+    }
+    impl Maps {
+        fn direct_runs(&self, va: u64, len: u64) -> Vec<(u64, u64, bool)> {
+            let mut runs = Vec::new();
+            let mut at = va;
+            for p in self.ranges.pieces(va, len) {
+                assert_eq!(p.rtype, RangeType::Direct);
+                if p.start > at {
+                    runs.push((at, p.start - at, false));
+                }
+                runs.push((p.start, p.size, true));
+                at = p.start + p.size;
+            }
+            if at < va + len {
+                runs.push((at, va + len - at, false));
+            }
+            runs
+        }
+
+        fn commit(&mut self, va: u64, len: u64, prot: i32, mtype: i32, phys_page: impl Fn(usize, usize) -> u64) {
+            for (start, l, backed) in self.direct_runs(va, len) {
+                if backed {
+                    for r in self.ranges.pieces(start, l) {
+                        self.physical.protect_mapping(r.start, r.size, prot);
+                        self.ranges.protect(r.start, r.size, prot);
+                    }
+                    for p in self.ranges.pieces(start, l) {
+                        self.ranges.edit(p.start, p.size, |r| r.memory_type = mtype);
+                    }
+                    continue;
+                }
+                let phys = self.pool + phys_page(((start - WINDOW) / PAGE) as usize, (l / PAGE) as usize) * PAGE;
+                assert!(self.ranges.query_span(start, l).is_none());
+                self.ranges.remove(start, l);
+                assert!(self.ranges.add(start, l, 0, 0, 0, RangeType::Reserved, "anon", false));
+                assert!(self.physical.map(start, phys, l, prot, "", mtype));
+                assert!(self.ranges.replace_span(start, l, RangeType::Reserved, phys, prot, mtype, RangeType::Direct, "", false));
+            }
+        }
+
+        fn release(&mut self, va: u64, len: u64) {
+            for p in self.ranges.pieces(va, len) {
+                let r = self.ranges.query(p.start, 0).unwrap();
+                assert!(p.size <= r.size - (p.start - r.start));
+                assert!(self.physical.unmap(p.start, p.size));
+                assert!(self.ranges.remove(p.start, p.size));
+            }
+        }
+    }
+
+    // Page model: backing page + 1 (0: not mapped), protection, memory
+    // type, and whether a range starts at the page.
+    struct Model {
+        phys: Vec<u32>,
+        prot: Vec<u8>,
+        mtype: Vec<u8>,
+        starts: Vec<bool>,
+    }
+    impl Model {
+        fn apply(&mut self, c: &Command, phys_page: impl Fn(usize, usize) -> u64) {
+            let (a, b) = (c.page, c.page + c.pages);
+            if !c.commit {
+                for p in a..b {
+                    self.phys[p] = 0;
+                    self.starts[p] = false;
+                }
+                if b < PAGES && self.phys[b] != 0 {
+                    self.starts[b] = true;
+                }
+                return;
+            }
+            if self.phys[a] != 0 {
+                self.starts[a] = true;
+            }
+            if b < PAGES && self.phys[b] != 0 {
+                self.starts[b] = true;
+            }
+            let mut p = a;
+            while p < b {
+                if self.phys[p] == 0 {
+                    let mut e = p;
+                    while e < b && self.phys[e] == 0 {
+                        e += 1;
+                    }
+                    let first = phys_page(p, e - p);
+                    for (i, q) in (p..e).enumerate() {
+                        self.phys[q] = (first + i as u64 + 1) as u32;
+                    }
+                    self.starts[p] = true;
+                    for q in p..e {
+                        self.prot[q] = c.prot as u8;
+                        self.mtype[q] = c.mtype as u8;
+                    }
+                    p = e;
+                } else {
+                    self.prot[p] = c.prot as u8;
+                    self.mtype[p] = c.mtype as u8;
+                    p += 1;
+                }
+            }
+        }
+
+        /// (start, size, direct memory offset, protection, memory type)
+        fn ranges(&self, pool: u64) -> Vec<(u64, u64, u64, i32, i32)> {
+            let mut out: Vec<(u64, u64, u64, i32, i32)> = Vec::new();
+            for p in 0..PAGES {
+                if self.phys[p] == 0 {
+                    continue;
+                }
+                let phys = pool + (self.phys[p] as u64 - 1) * PAGE;
+                if !self.starts[p] && p != 0 && self.phys[p - 1] != 0 {
+                    let last = out.last_mut().unwrap();
+                    assert_eq!(last.2 + last.1, phys, "a range is one piece of direct memory");
+                    assert_eq!((last.3, last.4), (self.prot[p] as i32, self.mtype[p] as i32));
+                    last.1 += PAGE;
+                } else {
+                    out.push((WINDOW + p as u64 * PAGE, PAGE, phys, self.prot[p] as i32, self.mtype[p] as i32));
+                }
+            }
+            out
+        }
+    }
+
+    let mut rng = XorShift(0x2545_F491_4F6C_DD1D);
+    let mut command = |commit: Option<bool>| {
+        let r = rng.next();
+        let pages = 1 + (r >> 8) as usize % 64;
+        let page = (r >> 20) as usize % (PAGES - pages);
+        let commit = commit.unwrap_or(r & 1 == 0);
+        let prot = if r & 2 == 0 { PROT_CPU_READ | PROT_CPU_WRITE } else { PROT_CPU_READ | PROT_GPU_READ };
+        Command { commit, page, pages, prot, mtype: 11 + (r >> 4) as i32 % 3, seed: r }
+    };
+
+    let mut maps = Maps { ranges: VirtualRanges::default(), physical: PhysicalMemory::new(TOTAL_BYTES), pool: 0 };
+    maps.pool = maps.physical.alloc(0, POOL, POOL, 0, 0, AllocationKind::Direct).expect("the pool");
+    // What a title has besides the window: code, heaps, reservations.
+    for i in 0..2000u64 {
+        let kind = [RangeType::Code, RangeType::Flexible, RangeType::Reserved][i as usize % 3];
+        assert!(maps.ranges.add(HOST_USER_MIN + i * 0x40_0000, 0x10_0000 + (i % 7) * 0x4_0000, 0, PROT_CPU_READ, 0, kind, "", i % 5 == 0));
+    }
+    let outside = maps.ranges.pieces(0, WINDOW).len();
+    let mut model = Model { phys: vec![0; PAGES], prot: vec![0; PAGES], mtype: vec![0; PAGES], starts: vec![false; PAGES] };
+
+    let mut setup = Vec::new();
+    while maps.ranges.ranges.len() < outside + RANGES {
+        let c = command(Some(true));
+        maps.commit(WINDOW + c.page as u64 * PAGE, c.pages as u64 * PAGE, c.prot, c.mtype, |p, n| phys_of(&c, p, n));
+        setup.push(c);
+    }
+    let commands: Vec<Command> = (0..COMMANDS).map(|_| command(None)).collect();
+
+    let started = std::time::Instant::now();
+    for c in &commands {
+        let (va, len) = (WINDOW + c.page as u64 * PAGE, c.pages as u64 * PAGE);
+        if c.commit {
+            maps.commit(va, len, c.prot, c.mtype, |p, n| phys_of(c, p, n));
+        } else {
+            maps.release(va, len);
+        }
+    }
+    let elapsed = started.elapsed();
+
+    for c in setup.iter().chain(&commands) {
+        model.apply(c, |p, n| phys_of(c, p, n));
+    }
+    let expected = model.ranges(maps.pool);
+    assert!(expected.len() > RANGES / 2, "{} ranges left", expected.len());
+    let ranges: Vec<_> = maps
+        .ranges
+        .pieces(WINDOW, SPAN)
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.rtype, RangeType::Direct);
+            (r.start, r.size, r.offset, r.protection, r.memory_type)
+        })
+        .collect();
+    assert_eq!(ranges.len(), expected.len());
+    assert!(ranges == expected, "the range map differs from the page model");
+    let views: Vec<_> = maps.physical.find_mappings(maps.pool, POOL).into_iter().map(|m| (m.map_vaddr, m.map_size, m.start_addr, m.prot)).collect();
+    let expected_views: Vec<_> = expected.iter().map(|&(s, l, o, p, _)| (s, l, o, p)).collect();
+    assert!(views == expected_views, "the direct views differ from the page model");
+    assert_eq!(maps.ranges.pieces(0, WINDOW).len(), outside, "ranges outside the window are untouched");
+
+    eprintln!("range map replay: {COMMANDS} commands over {} ranges in {elapsed:?}", expected.len());
+    if !cfg!(debug_assertions) {
+        assert!(elapsed < std::time::Duration::from_millis(1500), "{COMMANDS} commands took {elapsed:?}");
+    }
 }

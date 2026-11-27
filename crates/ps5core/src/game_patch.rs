@@ -23,7 +23,18 @@
 //! the matched program must have all-zero `off` bytes: they go to "code
 //! cave" pages (16 KiB, read/write/execute) allocated at that address.
 //! When no loaded program matches, the plan waits for the next module
-//! loaded at run time.
+//! loaded at run time. A `version` of `*` matches every version of the
+//! title: such a file relies on its `off` bytes alone (a signature that is
+//! searched for, so an update that moves the code still matches). Its
+//! offsets are those of the version it was made from and only fix the
+//! distances between its writes; the code may lie below or above them.
+//!
+//! Built-in patches (`crates/ps5core/patches/<TITLE_ID>.json`, compiled
+//! into the emulator) are applied to their title by default, next to the
+//! user's file; `RPS5E_BUILTIN_PATCHES=0` turns them off. They hold what a
+//! title needs to run here at all and no gameplay changes. A title may have
+//! several files, each found and applied on its own; a file may be bound to
+//! the emulated display being smaller than 2160p.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -33,6 +44,39 @@ pub const CAVE_PAGE_SIZE: u64 = 0x4000;
 
 /// Environment variable naming the patch file.
 pub const PATCH_ENV: &str = "RPS5E_GAME_PATCH";
+
+/// `0` turns the built-in patches off.
+pub const BUILTIN_ENV: &str = "RPS5E_BUILTIN_PATCHES";
+
+/// The version of a patch file that matches every version of its title.
+pub const ANY_VERSION: &str = "*";
+
+/// When a built-in file applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    Always,
+    /// The emulated display (`RPS5E_DISPLAY_RESOLUTION`, default 1080p) is
+    /// smaller than 2160p.
+    DisplayBelow2160p,
+}
+
+/// Patch files compiled into the emulator: (title id, when, mods JSON).
+const BUILTIN: &[(&str, When, &str)] = &[
+    ("PPSA38500", When::Always, include_str!("../patches/PPSA38500.json")),
+    ("PPSA38500", When::DisplayBelow2160p, include_str!("../patches/PPSA38500-display.json")),
+];
+
+/// The built-in mods JSON files of `title_id`, with when each applies.
+pub fn builtin(title_id: &str) -> impl Iterator<Item = (When, &'static str)> {
+    let title_id = title_id.to_owned();
+    BUILTIN.iter().filter(move |(id, _, _)| id.eq_ignore_ascii_case(&title_id)).map(|(_, when, text)| (*when, *text))
+}
+
+/// Whether the emulated display is smaller than 2160p (the variable the
+/// video output reads; unset or invalid: 1080p).
+fn display_below_2160p() -> bool {
+    !std::env::var("RPS5E_DISPLAY_RESOLUTION").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "2160p" | "4k"))
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Write {
@@ -137,7 +181,8 @@ pub fn load_plan(path: &Path) -> Result<Plan, String> {
 
 /// The plan must name the loaded game.
 pub fn validate_game(plan: &Plan, title_id: &str, version: &str, process: &str) -> Result<(), String> {
-    if !process.eq_ignore_ascii_case(&plan.process) || !title_id.eq_ignore_ascii_case(&plan.title_id) || version != plan.version {
+    let version_matches = plan.version == ANY_VERSION || version == plan.version;
+    if !process.eq_ignore_ascii_case(&plan.process) || !title_id.eq_ignore_ascii_case(&plan.title_id) || !version_matches {
         return Err("cheat file does not match the loaded game".into());
     }
     Ok(())
@@ -191,8 +236,12 @@ pub fn matches(plan: &mut Plan, image: &Image) -> Option<u64> {
             let Some(pos) = data[from..].windows(n).position(|w| w == anchor.off.as_slice()) else { break };
             let found = from + pos;
             let rva = addr - image.base + found as u64;
-            if anchor.source_address >= rva {
-                let source_base = anchor.source_address - rva;
+            // The file's addresses are at or above the program's own, except
+            // in a file for every version: there they only say how far the
+            // writes are from each other, and the code may have moved either
+            // way (the base then wraps, and so does the translation).
+            if anchor.source_address >= rva || plan.version == ANY_VERSION {
+                let source_base = anchor.source_address.wrapping_sub(rva);
                 if translate_and_validate(plan, image, source_base) {
                     return Some(source_base);
                 }
@@ -271,11 +320,12 @@ pub fn apply_writes(
 // ---------------------------------------------------------------------------
 
 struct State {
-    pending: Option<Plan>,
+    /// Plans (the user's file, the built-in one) no loaded program matched yet.
+    pending: Vec<Plan>,
     applied_caves: Vec<u64>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { pending: None, applied_caves: Vec::new() });
+static STATE: Mutex<State> = Mutex::new(State { pending: Vec::new(), applied_caves: Vec::new() });
 
 /// Code caves in the guest address space.
 pub struct GuestCaves<'a>(pub &'a ps5vm::VirtualMemory);
@@ -312,19 +362,43 @@ fn running_game() -> (String, String) {
 /// Load the plan at `path`, check it against the game and apply it to the
 /// first matching program (else keep it pending for modules loaded later).
 pub fn apply(path: &Path, vm: &ps5vm::VirtualMemory, programs: &[crate::LoadedModule]) -> Result<(), String> {
+    apply_plan(load_plan(path)?, vm, programs)
+}
+
+/// Apply the running title's built-in patch file, when it has one and
+/// `RPS5E_BUILTIN_PATCHES` is not `0`.
+pub fn apply_builtin(vm: &ps5vm::VirtualMemory, programs: &[crate::LoadedModule]) -> Result<(), String> {
+    if std::env::var(BUILTIN_ENV).is_ok_and(|v| v.trim() == "0") {
+        return Ok(());
+    }
+    let (title, _) = running_game();
+    let mut result = Ok(());
+    for (when, text) in builtin(&title) {
+        if when == When::DisplayBelow2160p && !display_below_2160p() {
+            continue;
+        }
+        // Each file on its own: one that does not fit this version of the
+        // title does not keep the others from applying.
+        if let Err(e) = parse_plan(text).and_then(|plan| apply_plan(plan, vm, programs)) {
+            result = Err(e);
+        }
+    }
+    result
+}
+
+fn apply_plan(plan: Plan, vm: &ps5vm::VirtualMemory, programs: &[crate::LoadedModule]) -> Result<(), String> {
     let Some(main) = programs.first().filter(|m| m.base != 0) else {
         return Err("main executable is not loaded".into());
     };
-    let plan = load_plan(path)?;
     let (title, version) = running_game();
     validate_game(&plan, &title, &version, &main.name)?;
     if plan.writes.is_empty() {
         return Ok(());
     }
-    STATE.lock().unwrap_or_else(|e| e.into_inner()).pending = Some(plan);
+    STATE.lock().unwrap_or_else(|e| e.into_inner()).pending.push(plan);
     for p in programs {
         apply_pending(vm, p)?;
-        if STATE.lock().unwrap_or_else(|e| e.into_inner()).pending.is_none() {
+        if STATE.lock().unwrap_or_else(|e| e.into_inner()).pending.is_empty() {
             return Ok(());
         }
     }
@@ -332,32 +406,41 @@ pub fn apply(path: &Path, vm: &ps5vm::VirtualMemory, programs: &[crate::LoadedMo
     Ok(())
 }
 
-/// Apply a pending plan to `program` when it matches.
+/// Apply every pending plan that matches `program`.
 pub fn apply_pending(vm: &ps5vm::VirtualMemory, program: &crate::LoadedModule) -> Result<(), String> {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(plan) = st.pending.as_mut() else { return Ok(()) };
+    if st.pending.is_empty() {
+        return Ok(());
+    }
     let image = Image::of(program);
-    let Some(source_base) = matches(plan, &image) else { return Ok(()) };
-    log::info!("Game cheat: matched {} with source base {source_base:#x}", image.name);
     let mut caves = GuestCaves(vm);
-    if let Err(e) = apply_writes(plan, &image, &mut caves, &mut |a, b| program.patch(a, b)) {
-        release_caves(&mut plan.cave_pages, &mut caves);
-        st.pending = None;
-        return Err(e);
+    let mut result = Ok(());
+    let mut waiting = Vec::new();
+    for mut plan in std::mem::take(&mut st.pending) {
+        let Some(source_base) = matches(&mut plan, &image) else {
+            waiting.push(plan);
+            continue;
+        };
+        log::info!("Game cheat: matched {} with source base {source_base:#x}", image.name);
+        if let Err(e) = apply_writes(&mut plan, &image, &mut caves, &mut |a, b| program.patch_unfinished(a, b)) {
+            release_caves(&mut plan.cave_pages, &mut caves);
+            result = Err(e);
+            continue;
+        }
+        for name in &plan.mod_names {
+            log::info!("Successfully applied cheat: {name}");
+        }
+        st.applied_caves.append(&mut plan.cave_pages);
     }
-    for name in &plan.mod_names {
-        log::info!("Successfully applied cheat: {name}");
-    }
-    let plan = st.pending.take().unwrap_or_default();
-    st.applied_caves = plan.cave_pages;
-    Ok(())
+    st.pending = waiting;
+    result
 }
 
-/// Drop the plan and free the code caves.
+/// Drop the plans and free the code caves.
 pub fn clear(vm: &ps5vm::VirtualMemory) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let mut caves = GuestCaves(vm);
-    if let Some(mut p) = st.pending.take() {
+    for mut p in std::mem::take(&mut st.pending) {
         release_caves(&mut p.cave_pages, &mut caves);
     }
     let mut applied = std::mem::take(&mut st.applied_caves);
@@ -391,6 +474,80 @@ mod tests {
         assert!(parse_plan(r#"{"id":"A","version":"1","process":"e","mods":[{"name":"x","memory":[{"offset":"1","on":"9","off":"8"}]}]}"#).is_err());
         assert!(parse_plan(r#"{"id":"A","version":"1","process":"e","mods":[{"name":"x","memory":[{"offset":"1","on":"9090","off":"88"}]}]}"#).is_err());
         assert!(parse_plan(r#"{"id":"A","version":"1","process":"e","mods":[{"name":"x","memory":[{"offset":"zz","on":"90","off":"88"}]}]}"#).is_err());
+    }
+
+    /// Every built-in file parses, names its own title and keeps the
+    /// lengths of its byte pairs; a `*` version matches any version.
+    #[test]
+    fn builtin_files_are_valid() {
+        for (id, _, text) in BUILTIN {
+            let plan = parse_plan(text).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(&plan.title_id, id);
+            assert!(!plan.writes.is_empty() && !plan.mod_names.is_empty(), "{id}");
+            assert!(plan.writes.iter().all(|w| w.off.len() == w.on.len() && w.off != w.on), "{id}");
+            assert!(validate_game(&plan, id, "09.999.000", &plan.process).is_ok(), "{id}: any version");
+            assert!(validate_game(&plan, "PPSA00000", "01.000.000", &plan.process).is_err(), "{id}: another title");
+        }
+        assert_eq!(builtin("ppsa38500").map(|(when, _)| when).collect::<Vec<_>>(), [When::Always, When::DisplayBelow2160p]);
+        assert!(builtin("PPSA00000").next().is_none());
+    }
+
+    /// The watchdog patch of PPSA38500 is found by its bytes wherever the
+    /// code lies and removes exactly the two jumps.
+    #[test]
+    fn builtin_watchdog_patch_matches_by_signature() {
+        let mut plan = parse_plan(builtin("PPSA38500").next().unwrap().1).unwrap();
+        let (first, second) = (plan.writes[0].clone(), plan.writes[1].clone());
+        // The same code at another place than the patch file names.
+        let distance = (first.source_address - second.source_address) as usize;
+        let (buf, image) = program(&[(0x100, &second.off), (0x100 + distance, &first.off)]);
+        let moved = (0x100 + distance) as u64;
+        assert_eq!(matches(&mut plan, &image), Some(first.source_address - moved));
+        let mut caves = TestCaves { fail: false, freed: Vec::new() };
+        let mut written = Vec::new();
+        apply_writes(&mut plan, &image, &mut caves, &mut |a, b| {
+            written.push((a - image.base, b.to_vec()));
+            true
+        })
+        .unwrap();
+        written.sort();
+        assert_eq!(written.len(), 2);
+        assert_eq!((written[0].0, &written[0].1[..6], &written[0].1[6..]), (0x100, &[0x90; 6][..], &second.off[6..]), "timer check");
+        let counter = &written[1].1;
+        assert_eq!(written[1].0, moved);
+        assert_eq!((&counter[..18], &counter[18..20], &counter[20..]), (&first.off[..18], &[0x90, 0x90][..], &first.off[20..]), "counter");
+        drop(buf);
+
+        // A version whose code lies above the file's offsets matches too;
+        // a file for one version does not accept that.
+        let mut plan = parse_plan(builtin("PPSA38500").next().unwrap().1).unwrap();
+        for w in &mut plan.writes {
+            w.source_address -= second.source_address - 0x10;
+        }
+        let (buf, image) = program(&[(0x100, &second.off), (0x100 + distance, &first.off)]);
+        let mut fixed = plan.clone();
+        fixed.version = "01.002.001".into();
+        assert_eq!(matches(&mut fixed, &image), None);
+        assert!(matches(&mut plan, &image).is_some());
+        assert_eq!((plan.writes[0].target_address, plan.writes[1].target_address), (image.base + moved, image.base + 0x100));
+        drop(buf);
+    }
+
+    /// The display patch of PPSA38500 leaves the 1080p defaults and removes
+    /// only the two conditional moves that select 2160p.
+    #[test]
+    fn builtin_display_patch_keeps_the_1080p_mode() {
+        let (when, text) = builtin("PPSA38500").nth(1).unwrap();
+        assert_eq!(when, When::DisplayBelow2160p);
+        let mut plan = parse_plan(text).unwrap();
+        let w = plan.writes[0].clone();
+        let n = w.off.len();
+        assert_eq!((&w.on[..n - 8], &w.on[n - 8..]), (&w.off[..n - 8], &[0x90; 8][..]));
+        assert_eq!(&w.off[n - 8..], &[0x44, 0x0F, 0x44, 0xF0, 0x44, 0x0F, 0x44, 0xD1], "cmove eax->r14d, cmove ecx->r10d");
+        let (buf, image) = program(&[(0x340, &w.off)]);
+        assert!(matches(&mut plan, &image).is_some());
+        assert_eq!(plan.writes[0].target_address, image.base + 0x340);
+        drop(buf);
     }
 
     #[test]

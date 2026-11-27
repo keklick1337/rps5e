@@ -929,21 +929,16 @@ impl<'a> Translator<'a> {
     }
 
     /// The median of v_med3_f32 (no NaN among the operands), as measured on
-    /// RDNA2: the operand equal to the numeric maximum of the three (+0 and
-    /// -0 compare equal) is dropped and the larger of the other two is the
-    /// result, so med3(-0, +0, -0) is +0. The comparisons see the operands
-    /// before the input denormal flush (`raw`): med3(-0, +denormal,
-    /// -denormal) with flushed denormals is -0.
+    /// RDNA2: max(min(a, b), min(max(a, b), c)) with -0 ordered below +0,
+    /// so med3(-0, +0, -0) and med3(-1, -0, +0) are -0. The comparisons see
+    /// the operands before the input denormal flush (`raw`): med3(-0,
+    /// +denormal, -denormal) with flushed denormals is -0.
     fn med3_f32_median(&mut self, raw: [Value; 3]) -> Value {
         let [a, b, c] = raw;
+        let min_ab = self.b().fmin(a, b);
         let max_ab = self.b().fmax(a, b);
-        let max3 = self.b().fmax(max_ab, c);
-        let max_bc = self.b().fmax(b, c);
-        let max_ac = self.b().fmax(a, c);
-        let a_is_max = self.b().fcmp(FCmp::OEq, max3, a);
-        let b_is_max = self.b().fcmp(FCmp::OEq, max3, b);
-        let not_a = self.b().select(b_is_max, max_ac, max_ab);
-        let median = self.b().select(a_is_max, max_bc, not_a);
+        let high_min = self.b().fmin(max_ab, c);
+        let median = self.b().fmax(min_ab, high_min);
         if self.f32_flush & 1 != 0 {
             self.flush_denorm(median)
         } else {

@@ -40,7 +40,7 @@ layout(push_constant) uniform P {
     uint flags_word;    // table word of the entry's flags
     uint entry;         // table entry index
     uint page_bits;
-    uint page_limit;
+    uint page_low;
     uint stats_word;    // table word of the proxy counters (no slot, too small, no structure, stale, format, instances)
 } pc;
 

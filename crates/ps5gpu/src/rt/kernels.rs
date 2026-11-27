@@ -123,13 +123,25 @@ impl Push {
     }
 }
 
-/// The page-table words every kernel reads guest memory with.
+/// The page-table words every kernel reads guest memory with: the page
+/// size and the pages of the table's low range (the window after it is
+/// written in `kernels/guest.glsl`).
 pub fn paging() -> (u32, u32) {
-    (ps5shader::resources::paging::PAGE_BITS, (crate::buffers::BDA_PAGE_COUNT - 1) as u32)
+    (ps5shader::resources::paging::PAGE_BITS, ps5shader::resources::paging::LOW_PAGES as u32)
 }
 
 #[cfg(test)]
 mod tests {
+    /// The window the kernels' source names is the page table's.
+    #[test]
+    fn kernels_know_the_page_table_window() {
+        use ps5shader::resources::paging;
+        let source = include_str!("kernels/guest.glsl");
+        assert!(source.contains(&format!("GUEST_WINDOW_BASE = {:#x}ul;", paging::WINDOW_BASE)));
+        assert!(source.contains(&format!("GUEST_WINDOW_BYTES = {:#x}ul;", paging::WINDOW_BYTES)));
+        assert_eq!(super::paging(), (14, 1 << 26));
+    }
+
     #[test]
     fn kernels_match_their_sources() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rt/kernels");

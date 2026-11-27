@@ -438,8 +438,8 @@ impl Mirror {
         let Some(k) = self.gather_k.as_ref() else { return };
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let Ok(out) = Buffer::new(&self.dev, 256, usage, MemoryUse::Download) else { return };
-        let (bits, limit) = paging();
-        let push = Push::default().u64(base).u64(out.address).u32(64).u32(bits).u32(limit);
+        let (bits, low) = paging();
+        let push = Push::default().u64(base).u64(out.address).u32(64).u32(bits).u32(low);
         let cb = ctx.sched.ordered_cmd();
         let pt = vk::DescriptorBufferInfo { buffer: page_table, offset: 0, range: vk::WHOLE_SIZE };
         k.record(cb, &[pt], &push.0, [1, 1, 1]);
@@ -779,7 +779,7 @@ impl Mirror {
         self.serial += 1;
         self.stats.updates += 1;
         let timed = ctx.sched.time_item_begin(crate::scheduler::gpu_timer::label::HW_RT);
-        let (bits, limit) = paging();
+        let (bits, low) = paging();
         let pt = vk::DescriptorBufferInfo { buffer: page_table, offset: 0, range: vk::WHOLE_SIZE };
         let table_info = vk::DescriptorBufferInfo { buffer: fault.buffer, offset: 0, range: vk::WHOLE_SIZE };
         let compute = (vk::PipelineStageFlags2::COMPUTE_SHADER, vk::AccessFlags2::SHADER_WRITE);
@@ -892,7 +892,7 @@ impl Mirror {
                 .u64(self.status.address)
                 .u64(self.full.address)
                 .u32(bits)
-                .u32(limit)
+                .u32(low)
                 .u32(bank);
             let cb = ctx.sched.ordered_cmd();
             k.record(cb, &[pt], &push.0, [*n, 1, 1]);
@@ -992,7 +992,7 @@ impl Mirror {
                 .u32(flags_word)
                 .u32(i as u32)
                 .u32(bits)
-                .u32(limit)
+                .u32(low)
                 .u32(table::BASE + table::STATS);
             let cb = ctx.sched.ordered_cmd();
             if let Some(k) = &self.instances_k {
@@ -1099,8 +1099,8 @@ impl Mirror {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
         let Ok(out) = Buffer::new(&self.dev, size.max(4), usage, MemoryUse::Download) else { return Vec::new() };
         let count = (size / 4) as u32;
-        let (bits, limit) = paging();
-        let push = Push::default().u64(addr).u64(out.address).u32(count).u32(bits).u32(limit);
+        let (bits, low) = paging();
+        let push = Push::default().u64(addr).u64(out.address).u32(count).u32(bits).u32(low);
         let cb = ctx.sched.ordered_cmd();
         let pt = vk::DescriptorBufferInfo { buffer: page_table, offset: 0, range: vk::WHOLE_SIZE };
         k.record(cb, &[pt], &push.0, [count.div_ceil(64), 1, 1]);

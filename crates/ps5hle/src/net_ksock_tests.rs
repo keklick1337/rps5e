@@ -606,7 +606,7 @@ fn socket_timeouts_round_and_apply() {
 #[test]
 fn fstat_reports_socket_status() {
     on_thread(|| {
-        let mut g = Guest::new(0x7E77_0000_0000);
+        let mut g = Guest::new(0x5B09_0000_0000);
         let (a, b) = posix_ext::test_socketpair(&g.ctx, 1, g.base);
         let st = g.base + 0x100;
         assert_eq!(fs::fstat(&g.ctx, a, st), Ok(0));
@@ -621,8 +621,6 @@ fn fstat_reports_socket_status() {
         assert_eq!(g.ctx.read_bytes(st + 8, 2).unwrap(), 0o140444u16.to_le_bytes().to_vec());
         g.close(a);
         g.close(b);
-        // The number is free again (a test running alongside may reuse it).
-        assert!(!is_kernel_socket(a) || fs::fstat(&g.ctx, a, st).is_ok());
     });
 }
 

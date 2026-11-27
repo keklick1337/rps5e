@@ -9,62 +9,108 @@
 
 use std::collections::BTreeMap;
 
+const CLASSES: usize = 64;
+
 /// Views of the backing: `(backing start, guest address) -> backing end`.
 /// The entries follow the guest spans one to one (split where they split).
-#[derive(Default)]
+///
+/// Views may share backing bytes, so the one before a backing offset says
+/// nothing about the others that reach it. The entries are kept by length
+/// class (lengths of `[2^k, 2^(k+1))`): a view of class `k` that reaches
+/// an offset starts less than `2^(k+1)` below it, which bounds the search
+/// in every class by the views near the offset.
 pub struct BackingViews {
-    views: BTreeMap<(u64, u64), u64>,
-    /// Longest view ever entered (bounds the overlap search).
-    longest: u64,
+    classes: [BTreeMap<(u64, u64), u64>; CLASSES],
+    /// Bit `k`: class `k` holds a view.
+    used: u64,
+}
+
+impl Default for BackingViews {
+    fn default() -> Self {
+        Self { classes: std::array::from_fn(|_| BTreeMap::new()), used: 0 }
+    }
 }
 
 /// Bytes two views share: `(guest address in the other view, guest address
 /// in the new view, bytes)`.
 pub type SharedBytes = (u64, u64, u64);
 
+fn class_of(size: u64) -> usize {
+    63 - size.max(1).leading_zeros() as usize
+}
+
 impl BackingViews {
+    fn enter(&mut self, backing: u64, addr: u64, size: u64) {
+        let k = class_of(size);
+        self.classes[k].insert((backing, addr), backing + size);
+        self.used |= 1 << k;
+    }
+
+    fn take(&mut self, backing: u64, addr: u64, size: u64) -> bool {
+        // The entry has the length of its span; a class it is not in is
+        // tried only when it is not where the span says.
+        let (first, used) = (class_of(size), self.used);
+        let mut classes = std::iter::once(first).chain((0..CLASSES).filter(|&k| k != first && used & (1 << k) != 0));
+        let Some(k) = classes.find(|&k| self.classes[k].remove(&(backing, addr)).is_some()) else { return false };
+        if self.classes[k].is_empty() {
+            self.used &= !(1 << k);
+        }
+        true
+    }
+
     /// The guest view at `addr` maps `size` backing bytes from `backing`.
     pub fn insert(&mut self, addr: u64, size: u64, backing: u64) {
         if size == 0 {
             return;
         }
-        self.views.insert((backing, addr), backing + size);
-        self.longest = self.longest.max(size);
+        self.take(backing, addr, size);
+        self.enter(backing, addr, size);
     }
 
     /// The guest span at `addr` (mapping `backing`, ending at guest `end`)
     /// loses `[start, stop)`: its entry is cut as the span is.
     pub fn cut(&mut self, addr: u64, end: u64, backing: u64, start: u64, stop: u64) {
-        if self.views.remove(&(backing, addr)).is_none() {
+        if !self.take(backing, addr, end - addr) {
             return;
         }
         if addr < start {
-            self.views.insert((backing, addr), backing + (start - addr));
+            self.enter(backing, addr, start - addr);
         }
         if end > stop {
-            self.views.insert((backing + (stop - addr), stop), backing + (end - addr));
+            self.enter(backing + (stop - addr), stop, end - stop);
         }
     }
 
     /// Another view sharing backing bytes with `[backing, backing + size)`,
-    /// the new view being at guest `addr` (not entered yet).
+    /// the new view being at guest `addr` (not entered yet): of those, the
+    /// first by backing start, then guest address.
     pub fn shared(&self, addr: u64, size: u64, backing: u64) -> Option<SharedBytes> {
-        let low = backing.saturating_sub(self.longest);
         let end = backing + size;
-        self.views.range((low, 0)..(end, 0)).find_map(|(&(b, there), &e)| {
-            (e > backing && there != addr).then(|| {
-                let first = b.max(backing);
-                (there + (first - b), addr + (first - backing), e.min(end) - first)
-            })
+        let mut best: Option<((u64, u64), u64)> = None;
+        let mut used = self.used;
+        while used != 0 {
+            let k = used.trailing_zeros() as usize;
+            used &= used - 1;
+            let reach = if k == 63 { u64::MAX } else { (2u64 << k) - 1 };
+            let found = self.classes[k].range((backing.saturating_sub(reach), 0)..(end, 0)).find(|(&(_, there), &e)| e > backing && there != addr);
+            if let Some((&key, &e)) = found {
+                if best.is_none_or(|(b, _)| key < b) {
+                    best = Some((key, e));
+                }
+            }
+        }
+        best.map(|((b, there), e)| {
+            let first = b.max(backing);
+            (there + (first - b), addr + (first - backing), e.min(end) - first)
         })
     }
 
     pub fn len(&self) -> usize {
-        self.views.len()
+        self.classes.iter().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.views.is_empty()
+        self.used == 0
     }
 }
 

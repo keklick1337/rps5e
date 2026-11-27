@@ -615,6 +615,13 @@ fn emit_op(
     let swizzle = info.shader_swizzle;
     match attr.op {
         ImageOp::Sample | ImageOp::Gather4 | ImageOp::GetLod => {
+            // The host samples single-sample images only (a sampling
+            // instruction on a multisampled image is invalid); what the
+            // console's sampler returns for a multisampled T# is not
+            // measured.
+            if msaa(b.dimension) {
+                return Err(format!("sampling a {:?} image", b.dimension));
+            }
             // A converted integer image samples (point) and gathers its raw
             // words, unpacked after; a converted UNORM one has no filtered
             // host view.
@@ -876,6 +883,13 @@ fn emit_op(
                 return Ok(Some(pack_gather(e, &comps, attr, d.ty, component_class != ImageNumericClass::Float)));
             }
             if attr.op == ImageOp::Gather4 {
+                // The host gathers from 2D images, their arrays and cubes
+                // only (`OpImageGather` of any other image is invalid, and
+                // a driver compiler may abort on it); which texels the
+                // console reads through a volume T# is not measured.
+                if !matches!(b.dimension, ImageDimension::Dim2D | ImageDimension::Dim2DArray) {
+                    return Err(format!("gather of a {:?} image", b.dimension));
+                }
                 // A converted image gathers its words (component 0).
                 let comp = if conv.is_some() { 0 } else { (attr.dmask as u32).trailing_zeros().min(3) };
                 let op = if dref.is_some() { S::ImageDrefGather } else { S::ImageGather };

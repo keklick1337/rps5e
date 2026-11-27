@@ -37,6 +37,12 @@ pub const IDENTITY_IMAGE_SWIZZLE: u32 = 0xFAC;
 pub const INVALID_FORMAT: u32 = 0;
 /// "No index" in every `u32` index field.
 pub const NO_INDEX: u32 = u32::MAX;
+/// [`BufferResource::packed_stride`] of a V# whose stride fields are
+/// run-time values ([`BufferResource::runtime_stride`]): the module reads
+/// the stride, SWIZZLE_ENABLE, INDEX_STRIDE, ADD_TID_ENABLE and OOB_SELECT
+/// from the descriptor words its registers hold, so one module serves
+/// every value of them.
+pub const RUNTIME_STRIDE: u32 = 1 << 31;
 
 /// One buffer resource and how the program uses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,8 +53,17 @@ pub struct BufferResource {
     /// Highest byte (immediate offset + access size) any access reaches.
     pub max_byte_extent: u32,
     /// Filled by specialization: stride | swizzle<<14 | index stride<<16 |
-    /// add-tid<<20 | OOB_SELECT<<24.
+    /// add-tid<<20 | OOB_SELECT<<24, or [`RUNTIME_STRIDE`].
     pub packed_stride: u32,
+    /// The program computes word 1 of the V# (the address high bits, the
+    /// stride and SWIZZLE_ENABLE) from data that is not a constant, as a
+    /// program does that builds a V# in registers from a pointer and a
+    /// count (`pointer high | stride << 16`): the stride field then holds
+    /// whatever the data's upper bits are, so it is a run-time value and
+    /// never part of a specialization. A V# loaded whole from a resource
+    /// table or passed in user data is the title's descriptor: its fields
+    /// are specialized.
+    pub runtime_stride: bool,
     pub descriptor_format: u32,
     pub descriptor_swizzle: u32,
     /// The image whose first four T# dwords are this V#.
@@ -71,6 +86,7 @@ impl BufferResource {
             first_use_pc,
             max_byte_extent: 0,
             packed_stride: 0,
+            runtime_stride: false,
             descriptor_format: INVALID_FORMAT,
             descriptor_swizzle: IDENTITY_DESTINATION_SELECT,
             image_alias: NO_INDEX,

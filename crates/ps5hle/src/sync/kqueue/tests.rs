@@ -31,6 +31,9 @@ const CHANGES: u64 = 0x100;
 const EVENTS: u64 = 0x400;
 const TIMEOUT: u64 = 0x80;
 const SCRATCH: u64 = 0x800;
+/// A descriptor number nothing holds. A number a test just closed is handed
+/// out again at once, to any other test of the process.
+const NEVER_OPEN: i32 = 0x7FFF_0000;
 
 fn change(ident: u64, filter: i16, flags: u16, fflags: u32, data: i64, udata: u64) -> KernelEvent {
     KernelEvent { ident, filter, flags, fflags, data: data as u64, udata }
@@ -162,7 +165,7 @@ fn create_and_close() {
     assert_ne!(kq, other);
     assert!(k.poll(kq).is_empty());
     close(kq);
-    let r = k.kevent(kq, &[], 4, Some((0, 0))).0;
+    let r = k.kevent(NEVER_OPEN, &[], 4, Some((0, 0))).0;
     k.require_failure(r, EBADF);
     close(other);
     let (r0, w0) = fs::pipe(&k.ctx, k.base + 0x40);
@@ -355,7 +358,7 @@ fn socket_pair() {
     assert_eq!(k.apply(space, change(b as u64, EVFILT_WRITE, EV_DELETE, 0, 0, 0)), 0);
     close(space);
     close(a);
-    let r = k.apply(kq, change(a as u64, EVFILT_READ, EV_DELETE, 0, 0, 0));
+    let r = k.apply(kq, change(NEVER_OPEN as u64, EVFILT_READ, EV_DELETE, 0, 0, 0));
     k.require_failure(r, EBADF);
     close(b);
     close(kq);
@@ -643,9 +646,9 @@ fn file_watch() {
     assert_eq!(k.apply(kq, change(id, EVFILT_VNODE, EV_ADD, NOTE_WRITE, 0, 0)), 0);
     assert_eq!(k.call(cb_add_file_event, &[eq, id, NOTE_WRITE as u64, 0]), OK);
     close(file);
-    let r = k.apply(kq, change(id, EVFILT_VNODE, EV_DELETE, 0, 0, 0));
+    let r = k.apply(kq, change(NEVER_OPEN as u64, EVFILT_VNODE, EV_DELETE, 0, 0, 0));
     k.require_failure(r, EBADF);
-    assert_eq!(k.call(cb_delete_file_event, &[eq, id]), 0x8002_0009u32 as i32 as i64);
+    assert_eq!(k.call(cb_delete_file_event, &[eq, NEVER_OPEN as u64]), 0x8002_0009u32 as i32 as i64);
     assert!(equeue::delete(eq));
     close(kq);
     std::fs::remove_file(&path).unwrap();

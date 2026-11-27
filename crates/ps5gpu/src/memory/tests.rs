@@ -1258,3 +1258,173 @@ fn uffd_write_watches_follow_the_watch_counts() {
     g.remove_watch(r, PAGE_BYTES, false);
     assert_eq!(perms(r), "rw-");
 }
+
+/// The span map and the backing views stay cheap under a title that
+/// commits and releases pieces of a partially resident window all the
+/// time: a few large views and 20 000 small ones, then 50 000 map / unmap
+/// notifications of 16 KiB to 1 MiB at pseudo-random places of a 64 GiB
+/// window high in the address space, through the steps `note_mapped` and
+/// `note_unmapped` take on the two indexes. The spans are compared with a
+/// page-by-page model, the shared-backing answers with a search through
+/// every span, and the replay has a time bound that work proportional to
+/// the number of spans per notification misses by far.
+#[test]
+fn span_and_view_indexes_keep_up_with_prt_commit_streams() {
+    const WINDOW: u64 = 0x0800_0000_0000;
+    const SPAN_BYTES: u64 = 64 << 30;
+    const PAGES: usize = (SPAN_BYTES / PAGE_BYTES) as usize;
+    const POOL_PAGES: u64 = (6u64 << 30) / PAGE_BYTES;
+    const SPANS: usize = 20_000;
+    const COMMANDS: usize = 50_000;
+
+    struct Index {
+        spans: BTreeMap<u64, Span>,
+        views: views::BackingViews,
+    }
+    impl Index {
+        fn map(&mut self, addr: u64, size: u64, backing: u64) -> Option<views::SharedBytes> {
+            GuestGpuMemory::unindex(&mut self.views, &self.spans, addr, addr + size);
+            GuestGpuMemory::remove_spans(&mut self.spans, addr, addr + size);
+            let shared = self.views.shared(addr, size, backing);
+            self.views.insert(addr, size, backing);
+            self.spans.insert(addr, Span { end: addr + size, backing: Some(backing) });
+            shared
+        }
+
+        fn unmap(&mut self, addr: u64, size: u64) {
+            if GuestGpuMemory::first_span(&self.spans, addr, addr + size).is_none() {
+                return;
+            }
+            GuestGpuMemory::unindex(&mut self.views, &self.spans, addr, addr + size);
+            GuestGpuMemory::remove_spans(&mut self.spans, addr, addr + size);
+        }
+
+        /// The answer of `views.shared` found by looking at every span.
+        fn shared_by_search(&self, addr: u64, size: u64, backing: u64) -> Option<views::SharedBytes> {
+            let end = backing + size;
+            self.spans
+                .iter()
+                .filter_map(|(&there, sp)| {
+                    let b = sp.backing?;
+                    let e = b + (sp.end - there);
+                    (b < end && e > backing && there != addr).then_some((b, there, e))
+                })
+                .min()
+                .map(|(b, there, e)| {
+                    let first = b.max(backing);
+                    (there + (first - b), addr + (first - backing), e.min(end) - first)
+                })
+        }
+    }
+
+    let mut index = Index { spans: BTreeMap::new(), views: views::BackingViews::default() };
+    // What a title maps besides the window: a few large views and many
+    // ordinary ones low in the address space.
+    for i in 0..4u64 {
+        index.map(0x10_0000_0000 + i * (4 << 30), 2 << 30, (8 << 30) + i * (2 << 30));
+    }
+    for i in 0..2000u64 {
+        index.map(0x20_0000_0000 + i * 0x40_0000, 0x10_0000, (20 << 30) + i * 0x10_0000);
+    }
+    let outside = index.spans.len();
+
+    // Page model of the window: backing page + 1, and whether a span
+    // starts at the page.
+    let mut backing_of = vec![0u32; PAGES];
+    let mut starts = vec![false; PAGES];
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut command = |map: Option<bool>| {
+        let r = next();
+        let pages = 1 + (r >> 8) % 64;
+        let page = (r >> 20) % (PAGES as u64 - pages);
+        (map.unwrap_or(r & 1 == 0), page, pages, (r >> 40) % (POOL_PAGES - pages))
+    };
+    let mut apply_model = |(map, page, pages, backing): (bool, u64, u64, u64)| {
+        let (a, b) = (page as usize, (page + pages) as usize);
+        for p in a..b {
+            backing_of[p] = if map { (backing + (p - a) as u64 + 1) as u32 } else { 0 };
+            starts[p] = false;
+        }
+        starts[a] = map;
+        if b < PAGES && backing_of[b] != 0 {
+            starts[b] = true;
+        }
+    };
+    let apply = |index: &mut Index, (map, page, pages, backing): (bool, u64, u64, u64)| {
+        let (addr, size) = (WINDOW + page * PAGE_BYTES, pages * PAGE_BYTES);
+        if map {
+            index.map(addr, size, backing * PAGE_BYTES)
+        } else {
+            index.unmap(addr, size);
+            None
+        }
+    };
+
+    let mut setup = Vec::new();
+    while index.spans.len() < outside + SPANS {
+        let c = command(Some(true));
+        apply(&mut index, c);
+        setup.push(c);
+    }
+    let commands: Vec<_> = (0..COMMANDS).map(|_| command(None)).collect();
+    // A view checked against the search through every span now and then.
+    let mut checked = 0;
+    let started = std::time::Instant::now();
+    let mut searching = std::time::Duration::ZERO;
+    for (i, &c) in commands.iter().enumerate() {
+        if i % 64 == 0 && c.0 {
+            let search = std::time::Instant::now();
+            let (addr, size, backing) = (WINDOW + c.1 * PAGE_BYTES, c.2 * PAGE_BYTES, c.3 * PAGE_BYTES);
+            // The answer `map` gives is taken after the old spans of the
+            // range are gone.
+            index.unmap(addr, size);
+            let expected = index.shared_by_search(addr, size, backing);
+            searching += search.elapsed();
+            assert_eq!(apply(&mut index, c), expected, "command {i}");
+            checked += expected.is_some() as usize;
+        } else {
+            apply(&mut index, c);
+        }
+    }
+    let elapsed = started.elapsed() - searching;
+    assert!(checked > 16, "{checked} views sharing backing bytes were checked");
+
+    for &c in setup.iter().chain(&commands) {
+        apply_model(c);
+    }
+    let mut expected: Vec<(u64, u64, u64)> = Vec::new();
+    for p in 0..PAGES {
+        if backing_of[p] == 0 {
+            continue;
+        }
+        if !starts[p] && p != 0 && backing_of[p - 1] != 0 {
+            let last = expected.last_mut().unwrap();
+            assert_eq!(last.2 + (last.1 - last.0), (backing_of[p] as u64 - 1) * PAGE_BYTES);
+            last.1 += PAGE_BYTES;
+        } else {
+            let addr = WINDOW + p as u64 * PAGE_BYTES;
+            expected.push((addr, addr + PAGE_BYTES, (backing_of[p] as u64 - 1) * PAGE_BYTES));
+        }
+    }
+    let spans: Vec<(u64, u64, u64)> = index.spans.range(WINDOW..).map(|(&s, sp)| (s, sp.end, sp.backing.unwrap())).collect();
+    assert!(spans == expected, "the spans differ from the page model");
+    assert_eq!(index.spans.range(..WINDOW).count(), outside, "spans outside the window are untouched");
+    assert_eq!(index.views.len(), index.spans.len(), "one view per span");
+    // Every span has its view: cutting them all away leaves none.
+    let all: Vec<(u64, u64)> = index.spans.iter().map(|(&s, sp)| (s, sp.end)).collect();
+    for (s, e) in all {
+        index.unmap(s, e - s);
+    }
+    assert!(index.spans.is_empty() && index.views.is_empty());
+
+    eprintln!("span index replay: {COMMANDS} commands over {} spans in {elapsed:?}", expected.len() + outside);
+    if !cfg!(debug_assertions) {
+        assert!(elapsed < std::time::Duration::from_millis(500), "{COMMANDS} commands took {elapsed:?}");
+    }
+}

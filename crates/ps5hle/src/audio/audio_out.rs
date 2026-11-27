@@ -769,6 +769,20 @@ fn port_state_output(port_type: i32, channels: usize) -> (u16, u8) {
     }
 }
 
+/// Volume field of a port state: only a pad speaker port reports one
+/// (127, its full scale); every other port reads -1.
+pub(crate) fn port_state_volume(port_type: i32) -> i16 {
+    if port_type == PORT_TYPE_PADSPK {
+        127
+    } else {
+        -1
+    }
+}
+
+/// Loudness the system state reads while no loudness measurement runs:
+/// the bottom of the meter's range, in LKFS.
+pub(crate) const SYSTEM_STATE_LOUDNESS_MIN: f32 = -70.0;
+
 fn cb_get_port_state(ctx: &mut CpuContext) -> HleResult {
     let addr = ctx.rsi();
     let Some((port_type, channels, _, _)) = AUDIO.status(ctx.rdi() as i32) else {
@@ -778,7 +792,7 @@ fn cb_get_port_state(ctx: &mut CpuContext) -> HleResult {
     let mut st = [0u8; PORT_STATE_SIZE];
     st[0..2].copy_from_slice(&output.to_le_bytes());
     st[2] = channel;
-    st[4..6].copy_from_slice(&127i16.to_le_bytes());
+    st[4..6].copy_from_slice(&port_state_volume(port_type).to_le_bytes());
     if addr == 0 || !ctx.write_bytes(addr, &st) {
         return AUDIO_OUT_ERROR_INVALID_POINTER;
     }
@@ -788,11 +802,13 @@ fn cb_get_port_state(ctx: &mut CpuContext) -> HleResult {
 /// `SceAudioOutSystemState`: loudness (f32), 4 reserved bytes, 3 reserved u64.
 const SYSTEM_STATE_SIZE: usize = 32;
 
-/// sceAudioOutGetSystemState(state): loudness is undefined until a
-/// measurement starts and none is emulated, so the whole state is zero.
+/// sceAudioOutGetSystemState(state): no loudness measurement is emulated,
+/// so the loudness reads its minimum and the reserved words zero.
 fn cb_get_system_state(ctx: &mut CpuContext) -> HleResult {
     let addr = ctx.rdi();
-    if addr == 0 || !ctx.write_bytes(addr, &[0u8; SYSTEM_STATE_SIZE]) {
+    let mut st = [0u8; SYSTEM_STATE_SIZE];
+    st[0..4].copy_from_slice(&SYSTEM_STATE_LOUDNESS_MIN.to_le_bytes());
+    if addr == 0 || !ctx.write_bytes(addr, &st) {
         return AUDIO_OUT_ERROR_INVALID_POINTER;
     }
     0

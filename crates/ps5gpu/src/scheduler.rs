@@ -283,6 +283,9 @@ impl Timeline {
         let j = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let work: Vec<&Note> = j.iter().filter(|(t, _)| *t == tick).map(|(_, w)| w).collect();
         log::error!("ps5gpu: GPU tick {tick} does not complete; it contains {} journaled item(s):", work.len());
+        for (rip, addr, write, ms) in ps5vm::fault_site::in_flight() {
+            log::error!("ps5gpu:   a thread at {rip:#x} waits {ms} ms in a {} fault on {addr:#x}", if write { "write" } else { "read" });
+        }
         for w in work {
             log::error!("ps5gpu:   tick {tick}: {w}");
             // `RPS5E_STUCK_CODE_DIR=<dir>` (debug aid): the code of every
@@ -300,6 +303,56 @@ impl Timeline {
                     }
                     let w: Vec<u32> = table.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                     out += &format!("s{i} table {ptr:#x}: {w:08x?}\n");
+                    // `RPS5E_STUCK_DATA_MB=<n>`: also the first n MiB behind
+                    // each user-data pointer (a structure the program walks
+                    // with offsets relative to it), as far as it is readable.
+                    let mb = std::env::var("RPS5E_STUCK_DATA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                    if mb != 0 {
+                        let mut blob = Vec::new();
+                        let mut chunk = vec![0u8; 16 << 10];
+                        while blob.len() < mb << 20 && crate::memory::global().read_backing(ptr + blob.len() as u64, &mut chunk) {
+                            blob.extend_from_slice(&chunk);
+                        }
+                        // Runs of pages by state: all zero or not in guest
+                        // memory, reads blocked (the GPU copy is newer),
+                        // write watches (mirrored); with `RPS5E_MEM_HISTORY=1`
+                        // the history of each run's first page.
+                        let page = crate::memory::PAGE_BYTES;
+                        let mem = crate::memory::global();
+                        let mut run: Option<((bool, bool, u8), u64, u64)> = None;
+                        let mut a = ptr & !(page - 1);
+                        let end = ptr + blob.len() as u64;
+                        let flush = |run: &mut Option<((bool, bool, u8), u64, u64)>, out: &mut String| {
+                            if let Some(((zero, blocked, watches), from, to)) = run.take() {
+                                *out += &format!("  pages {from:#x}..{to:#x} ({}): {} read-blocked {blocked} write-watches {watches}; {}\n", (to - from) / page, if zero { "zero" } else { "data" }, crate::memory::history::describe(from, 12).unwrap_or_default());
+                            }
+                        };
+                        while a < end {
+                            let (lo, hi) = (a.max(ptr) - ptr, (a + page).min(end) - ptr);
+                            let (blocked, watches) = mem.pages.watchers(a);
+                            let state = (blob[lo as usize..hi as usize].iter().all(|&b| b == 0), blocked, watches);
+                            match &mut run {
+                                Some((s, _, to)) if *s == state => *to = a + page,
+                                _ => {
+                                    flush(&mut run, &mut out);
+                                    run = Some((state, a, a + page));
+                                }
+                            }
+                            a += page;
+                        }
+                        flush(&mut run, &mut out);
+                        let events = crate::memory::history::dump(ptr & !(page - 1), end, 200_000);
+                        if !events.is_empty() {
+                            let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}-n{n}-s{i}-history.txt"));
+                            if let Err(e) = std::fs::write(&path, events) {
+                                log::error!("ps5gpu: {}: {e}", path.display());
+                            }
+                        }
+                        let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}-n{n}-s{i}.data"));
+                        if let Err(e) = std::fs::write(&path, &blob) {
+                            log::error!("ps5gpu: {}: {e}", path.display());
+                        }
+                    }
                     for (k, d) in w.chunks(4).enumerate() {
                         let base = d[0] as u64 | ((d[1] & 0xFFFF) as u64) << 32;
                         let (stride, records) = ((d[1] >> 16) & 0x3FFF, d[2]);
@@ -314,6 +367,25 @@ impl Timeline {
                         let v: Vec<u32> = data.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                         let page = crate::memory::global().describe_address(base).unwrap_or_default();
                         out += &format!("  +{:#x}: V# base {base:#x} stride {stride} records {records} ({page}): {v:08x?}\n", k * 16);
+                    }
+                }
+                // The command stream around the dispatch packet (1 MiB
+                // before it, 64 KiB after, as far as readable).
+                if std::env::var_os("RPS5E_STUCK_DATA_MB").is_some() && packet.packet_address != 0 {
+                    let mut stream = Vec::new();
+                    let mut chunk = vec![0u8; 4096];
+                    let from = (packet.packet_address & !4095).saturating_sub(1 << 20);
+                    let mut a = from;
+                    while a < (packet.packet_address & !4095) + (64 << 10) {
+                        if !crate::memory::global().read_backing(a, &mut chunk) {
+                            chunk.fill(0);
+                        }
+                        stream.extend_from_slice(&chunk);
+                        a += 4096;
+                    }
+                    let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}-n{n}-stream-{from:x}.data"));
+                    if let Err(e) = std::fs::write(&path, &stream) {
+                        log::error!("ps5gpu: {}: {e}", path.display());
                     }
                 }
                 let path = std::path::Path::new(&dir).join(format!("cs-{cs:x}-n{n}.txt"));

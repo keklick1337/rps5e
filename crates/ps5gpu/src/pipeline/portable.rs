@@ -28,7 +28,7 @@
 
 use super::descriptors::{BindingDesc, BINDLESS_SET_MARKER};
 use super::prewarm::{self, ComputeRecord, GraphicsRecord, ModuleRecord, Reader, Writer};
-use super::sources::{CodeImage, ProgramSource};
+use super::sources::{CodeImage, ModuleSource, ProgramSource};
 use super::state::{FixedFunctionKey, MAX_COLOR_ATTACHMENTS, MAX_VIEWPORTS};
 use super::ShaderReflection;
 use std::path::Path;
@@ -373,6 +373,92 @@ pub fn describe(list_path: &Path) -> Result<String, String> {
     for (k, n) in &part_diffs {
         let _ = writeln!(out, "  {k}: {n}");
     }
+    // The programs with the most modules, each with the fields its modules
+    // differ in, the values, and how the program uses a differing binding.
+    let top = top_describe();
+    if top != 0 {
+        let mut ranked: Vec<(&(u64, u8), &(std::collections::BTreeSet<u64>, Vec<&ModuleRecord>))> = by_code.iter().filter(|(_, (_, ms))| ms.len() > 1).collect();
+        let words = |ms: &[&ModuleRecord]| ms.iter().map(|m| m.spirv.len()).max().unwrap_or(0);
+        ranked.sort_by_key(|(code, (_, ms))| (std::cmp::Reverse(ms.len()), std::cmp::Reverse(words(ms)), **code));
+        let _ = writeln!(out, "the {} programs with the most modules:", top.min(ranked.len()));
+        for ((hash, stage), (addresses, ms)) in ranked.into_iter().take(top) {
+            let total: usize = ms.iter().map(|m| m.spirv.len()).sum();
+            let _ = writeln!(
+                out,
+                "program {hash:016x} stage {stage}: {} modules at {} addresses (first {:#x}), largest {} words, {} words in all",
+                ms.len(),
+                addresses.len(),
+                addresses.first().copied().unwrap_or(0),
+                words(ms),
+                total
+            );
+            let sources: Vec<&ModuleSource> = ms.iter().filter_map(|m| m.source.as_deref()).collect();
+            // Records of an earlier planner: the specialization today's
+            // plan makes of the same dispatch is another one, so nothing
+            // asks for their modules. A list recorded today holds one
+            // module per distinct current request.
+            let mut current: std::collections::HashSet<std::sync::Arc<[u32]>> = std::collections::HashSet::new();
+            let mut stale = 0;
+            for s in &sources {
+                match super::sources::current_request(s) {
+                    Ok(Some(request)) => {
+                        stale += 1;
+                        current.insert(request);
+                    }
+                    _ => {
+                        current.insert(s.request.clone());
+                    }
+                }
+            }
+            if stale != 0 {
+                let _ = writeln!(out, "  {stale} modules of a specialization the current planner does not make; recorded today: {} modules", current.len());
+            }
+            if let (Some(dir), Some(s)) = (dump_describe(), sources.first()) {
+                // The code from the program's address on, as the
+                // disassembler reads a dumped program.
+                let p = &s.program;
+                let code: Vec<u8> = (0u64..).map_while(|i| p.image.read(p.address + i * 4)).flat_map(u32::to_le_bytes).collect();
+                let path = dir.join(format!("{hash:016x}.bin"));
+                if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, code)) {
+                    let _ = writeln!(out, "  {}: {e}", path.display());
+                }
+            }
+            let uses: BTreeMap<String, String> = sources
+                .first()
+                .and_then(|s| super::sources::resource_uses(s).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|f| f.split_once(" = ").map(|(n, v)| (n.to_string(), v.to_string())))
+                .collect();
+            let mut values: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+            for s in &sources {
+                for f in super::sources::request_fields(s).unwrap_or_default() {
+                    let (name, value) = f.split_once(" = ").unwrap_or((&f, ""));
+                    *values.entry(name.to_string()).or_default().entry(value.to_string()).or_default() += 1;
+                }
+            }
+            for (name, values) in values.iter().filter(|(_, v)| v.len() > 1) {
+                let _ = writeln!(out, "  {name}: {} values{}", values.len(), uses.get(name).map(|u| format!(" (uses: {u})")).unwrap_or_default());
+                for (value, n) in values.iter().take(8) {
+                    let shown: String = value.chars().take(400).collect();
+                    let _ = writeln!(out, "    {n} x {shown}");
+                }
+            }
+            if verbose_describe() {
+                // One line per module: its value of every differing field
+                // but the layout (which fields move together).
+                for m in ms {
+                    let Some(fields) = m.source.as_deref().and_then(|s| super::sources::request_fields(s).ok()) else { continue };
+                    let differing: Vec<&str> = fields
+                        .iter()
+                        .filter(|f| f.split_once(" = ").is_some_and(|(name, _)| name != "layout" && values.get(name).is_some_and(|v| v.len() > 1)))
+                        .map(|f| f.as_str())
+                        .collect();
+                    let _ = writeln!(out, "  module {:016x}: {}", m.key, differing.join("; "));
+                }
+            }
+        }
+    }
     // Pipelines by module pair.
     let mut pairs: HashMap<(u64, u64), Vec<&GraphicsRecord>> = HashMap::new();
     for g in &graphics {
@@ -420,6 +506,18 @@ pub fn describe(list_path: &Path) -> Result<String, String> {
 /// `RPS5E_SHADER_INFO_VERBOSE=1`: `describe` prints the differing values.
 fn verbose_describe() -> bool {
     std::env::var("RPS5E_SHADER_INFO_VERBOSE").is_ok_and(|v| v == "1")
+}
+
+/// `RPS5E_SHADER_INFO_TOP=<n>`: `describe` details the `n` programs with
+/// the most modules.
+fn top_describe() -> usize {
+    std::env::var("RPS5E_SHADER_INFO_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// `RPS5E_SHADER_INFO_DUMP=<dir>`: `describe` writes the code of each
+/// program it details to `<dir>/<plan hash>.bin` (for `ps5shader-dis`).
+fn dump_describe() -> Option<std::path::PathBuf> {
+    std::env::var_os("RPS5E_SHADER_INFO_DUMP").filter(|v| !v.is_empty()).map(Into::into)
 }
 
 /// Read a portable file from `path` (size-checked before it is read).

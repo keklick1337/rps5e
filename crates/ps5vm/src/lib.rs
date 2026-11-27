@@ -34,6 +34,99 @@ pub mod fault_site {
     pub fn get() -> u64 {
         RIP.with(|c| c.get())
     }
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Protection faults being resolved right now, one slot per fault:
+    /// instruction address (0: free), fault address with the write flag in
+    /// bit 63, and the time it began (microseconds since the first fault).
+    static IN_FLIGHT: [[AtomicU64; 3]; 64] = [const { [const { AtomicU64::new(0) }; 3] }; 64];
+
+    fn micros() -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
+    }
+
+    /// A fault at `rip` on `addr` is handed to its resolver; the slot to
+    /// pass to [`leave`] (None: every slot is taken). Atomics only: called
+    /// in signal handlers.
+    pub fn enter(rip: u64, addr: u64, write: bool) -> Option<usize> {
+        let now = micros();
+        for (i, s) in IN_FLIGHT.iter().enumerate() {
+            if s[0].compare_exchange(0, rip.max(1), Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                s[1].store(addr | (write as u64) << 63, Ordering::Relaxed);
+                s[2].store(now, Ordering::Release);
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn leave(slot: Option<usize>) {
+        if let Some(i) = slot {
+            IN_FLIGHT[i][0].store(0, Ordering::Release);
+        }
+    }
+
+    /// The faults being resolved: (instruction address, fault address,
+    /// write, milliseconds so far). For reports of a stalled GPU: a guest
+    /// thread waiting in a fault is one that has not finished its writes.
+    pub fn in_flight() -> Vec<(u64, u64, bool, u64)> {
+        let now = micros();
+        IN_FLIGHT
+            .iter()
+            .filter_map(|s| {
+                let rip = s[0].load(Ordering::Acquire);
+                let (a, t) = (s[1].load(Ordering::Relaxed), s[2].load(Ordering::Acquire));
+                (rip != 0).then(|| (rip, a & !(1 << 63), a >> 63 != 0, now.saturating_sub(t) / 1000))
+            })
+            .collect()
+    }
+}
+
+/// What the calling host thread has handed to foreign code (a driver
+/// compiling a pipeline): the report of a host fault on that thread names
+/// it.
+pub mod thread_note {
+    use std::cell::RefCell;
+    thread_local! {
+        static NOTE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    /// Clears the thread's note when dropped.
+    pub struct Guard(());
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = NOTE.try_with(|n| n.borrow_mut().take());
+        }
+    }
+
+    /// Note `what` for this thread until the guard is dropped.
+    pub fn set(what: String) -> Guard {
+        NOTE.with(|n| *n.borrow_mut() = Some(what));
+        Guard(())
+    }
+
+    /// The thread's note (None also while it is being replaced: fault
+    /// handlers call this).
+    pub fn get() -> Option<String> {
+        NOTE.try_with(|n| n.try_borrow().ok().and_then(|n| n.clone())).ok().flatten()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn a_note_lasts_as_long_as_its_guard() {
+            assert_eq!(super::get(), None);
+            let guard = super::set("compute cs 1".into());
+            assert_eq!(super::get().as_deref(), Some("compute cs 1"));
+            // Another thread has its own.
+            assert_eq!(std::thread::spawn(super::get).join().unwrap(), None);
+            drop(guard);
+            assert_eq!(super::get(), None);
+        }
+    }
 }
 
 use std::sync::Mutex;

@@ -34,18 +34,27 @@ pub const PARAM_ID_TIME_FORMAT: i32 = 3;
 pub const PARAM_ID_TIME_ZONE: i32 = 4;
 pub const PARAM_ID_SUMMERTIME: i32 = 5;
 pub const PARAM_ID_SYSTEM_NAME: i32 = 6;
-pub const PARAM_ID_GAME_PARENTAL_LEVEL: i32 = 7;
-pub const PARAM_ID_CC_ENABLE: i32 = 100;
-pub const PARAM_ID_SCREEN_READER: i32 = 208;
 /// System language as queried by PS5 titles.
 pub const PARAM_ID_LANG_PS5: i32 = 400;
-pub const PARAM_ID_ENTER_BUTTON_ASSIGN: i32 = 1000;
 
 const PARAM_DATE_FORMAT_DDMMYYYY: i32 = 1;
 const PARAM_TIME_FORMAT_24HOUR: i32 = 1;
-const PARAM_GAME_PARENTAL_OFF: i32 = 0;
-const PARAM_CC_DISABLED: i32 = 0;
-const PARAM_ENTER_BUTTON_ASSIGN_CROSS: i32 = 1;
+
+/// The settings-backed integer parameters (100..=111, 200..=213 and 300)
+/// as a console with its settings untouched answers them inside a title;
+/// the ones not listed read 0.
+fn settings_param_value(param_id: i32) -> Option<i32> {
+    match param_id {
+        101 => Some(1),
+        102 => Some(2),
+        103 | 107 | 109 => Some(100),
+        104 | 110 => Some(0x20202),
+        209 => Some(1),
+        210 => Some(71),
+        100..=111 | 200..=213 | 300 => Some(0),
+        _ => None,
+    }
+}
 /// Console time zone of a host UTC offset (seconds) and DST flag: the
 /// zone's standard offset in minutes (summer time excluded) and the summer
 /// time flag, as the console stores them.
@@ -94,23 +103,17 @@ pub fn skip_notice_screen() -> bool {
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
-/// Integer system parameter values (language, date/time formats, ...).
-/// Unknown ids read as 0.
-pub fn param_int_value(param_id: i32, language: i32) -> i32 {
+/// Integer system parameter values (language, date/time formats, the
+/// settings-backed ones); None for an id the system does not have: 1..=5,
+/// 100..=111, 200..=213, 300 and 400 exist.
+pub fn param_int_value(param_id: i32, language: i32) -> Option<i32> {
     match param_id {
-        PARAM_ID_LANG | PARAM_ID_LANG_PS5 => language,
-        PARAM_ID_DATE_FORMAT => PARAM_DATE_FORMAT_DDMMYYYY,
-        PARAM_ID_TIME_FORMAT => PARAM_TIME_FORMAT_24HOUR,
-        PARAM_ID_TIME_ZONE => host_time_zone().0,
-        PARAM_ID_SUMMERTIME => host_time_zone().1,
-        PARAM_ID_GAME_PARENTAL_LEVEL => PARAM_GAME_PARENTAL_OFF,
-        PARAM_ID_CC_ENABLE => PARAM_CC_DISABLED,
-        PARAM_ID_SCREEN_READER => 0,
-        PARAM_ID_ENTER_BUTTON_ASSIGN => PARAM_ENTER_BUTTON_ASSIGN_CROSS,
-        _ => {
-            log::warn!("[SystemService] unsupported int param_id {param_id}, using 0");
-            0
-        }
+        PARAM_ID_LANG | PARAM_ID_LANG_PS5 => Some(language),
+        PARAM_ID_DATE_FORMAT => Some(PARAM_DATE_FORMAT_DDMMYYYY),
+        PARAM_ID_TIME_FORMAT => Some(PARAM_TIME_FORMAT_24HOUR),
+        PARAM_ID_TIME_ZONE => Some(host_time_zone().0),
+        PARAM_ID_SUMMERTIME => Some(host_time_zone().1),
+        _ => settings_param_value(param_id),
     }
 }
 
@@ -145,13 +148,18 @@ fn cb_get_main_app_title_id(ctx: &mut CpuContext) -> HleResult {
     write_or_fault(ctx, out, &buf)
 }
 
+/// sceSystemServiceParamGetInt(paramId, int* value): an id the system does
+/// not have and a null pointer are PARAMETER, and nothing is written.
 fn cb_param_get_int(ctx: &mut CpuContext) -> HleResult {
     let id = ctx.rdi() as i32;
     let out = ctx.rsi();
     if out == 0 {
         return ERR_PARAMETER;
     }
-    let v = param_int_value(id, crate::app_info::system_language());
+    let Some(v) = param_int_value(id, crate::app_info::system_language()) else {
+        log::debug!("[SystemService] int param_id {id} does not exist");
+        return ERR_PARAMETER;
+    };
     write_or_fault(ctx, out, &v.to_le_bytes())
 }
 
@@ -543,6 +551,43 @@ mod tests {
         assert_eq!(ctx.read_bytes(base + 68, 60).unwrap(), vec![b'x'; 60]);
     }
 
+    /// sceSystemServiceParamGetInt answers ids 1..=5, 100..=111, 200..=213,
+    /// 300 and 400 with four bytes; every other id and a null pointer are
+    /// PARAMETER and leave the value alone.
+    #[test]
+    fn param_get_int_knows_only_the_system_ids() {
+        const BASE: u64 = 0x5A9B_0000_0000;
+        let vm = ps5vm::VirtualMemory::new();
+        vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();
+        let mut ctx = CpuContext::new(&vm);
+        let call = |ctx: &mut CpuContext, id: i32, out: u64| {
+            ctx.set(crate::context::CpuRegister::Rdi, id as u32 as u64);
+            ctx.set(crate::context::CpuRegister::Rsi, out);
+            cb_param_get_int(ctx)
+        };
+        let known = |id: i32| matches!(id, 1..=5 | 100..=111 | 200..=213 | 300 | 400);
+        for id in (-2..=2048).chain([i32::MIN, i32::MAX]) {
+            ctx.write_u64(BASE, 0x5555_5555_5555_5555);
+            let r = call(&mut ctx, id, BASE);
+            if known(id) {
+                assert_eq!(r, OK, "id {id}");
+                assert_eq!(ctx.read_u32(BASE + 4), Some(0x5555_5555), "id {id} wrote more than 4 bytes");
+            } else {
+                assert_eq!(r, ERR_PARAMETER, "id {id}");
+                assert_eq!(ctx.read_u64(BASE), Some(0x5555_5555_5555_5555), "id {id} was written");
+            }
+            assert_eq!(call(&mut ctx, id, 0), ERR_PARAMETER, "id {id} with a null pointer");
+        }
+        let value = |ctx: &mut CpuContext, id: i32| {
+            assert_eq!(call(ctx, id, BASE), OK);
+            ctx.read_u32(BASE).unwrap()
+        };
+        assert_eq!(value(&mut ctx, PARAM_ID_LANG), value(&mut ctx, PARAM_ID_LANG_PS5));
+        let settings: Vec<u32> = [100, 101, 102, 103, 104, 107, 109, 110, 208, 209, 210, 300].map(|id| value(&mut ctx, id)).to_vec();
+        assert_eq!(settings, [0, 1, 2, 100, 0x20202, 100, 100, 0x20202, 0, 1, 71, 0]);
+        let _ = vm.unmap(BASE, 0x1000);
+    }
+
     /// The player dialog param as the console fills it, and the calls
     /// answered with the firmware's fixed results.
     #[test]
@@ -730,21 +775,22 @@ mod tests {
 
     #[test]
     fn param_ints() {
-        assert_eq!(param_int_value(PARAM_ID_LANG, 1), 1);
-        assert_eq!(param_int_value(PARAM_ID_LANG_PS5, 5), 5);
-        assert_eq!(param_int_value(PARAM_ID_ENTER_BUTTON_ASSIGN, 1), 1, "cross");
-        assert_eq!(param_int_value(PARAM_ID_DATE_FORMAT, 1), 1, "DD/MM/YYYY");
-        assert_eq!(param_int_value(PARAM_ID_TIME_FORMAT, 1), 1, "24 hour");
-        assert_eq!((param_int_value(PARAM_ID_TIME_ZONE, 1), param_int_value(PARAM_ID_SUMMERTIME, 1)), host_time_zone());
+        assert_eq!(param_int_value(PARAM_ID_LANG, 1), Some(1));
+        assert_eq!(param_int_value(PARAM_ID_LANG_PS5, 5), Some(5));
+        assert_eq!(param_int_value(PARAM_ID_DATE_FORMAT, 1), Some(1), "DD/MM/YYYY");
+        assert_eq!(param_int_value(PARAM_ID_TIME_FORMAT, 1), Some(1), "24 hour");
+        let (zone, summer) = host_time_zone();
+        assert_eq!((param_int_value(PARAM_ID_TIME_ZONE, 1), param_int_value(PARAM_ID_SUMMERTIME, 1)), (Some(zone), Some(summer)));
         // IST-5:30, BRT+3, UTC, CET in summer (CEST, +2 h).
         assert_eq!(time_zone_params(19_800, false), (330, 0));
         assert_eq!(time_zone_params(-10_800, false), (-180, 0));
         assert_eq!(time_zone_params(0, false), (0, 0));
         assert_eq!(time_zone_params(7_200, true), (60, 1));
-        assert_eq!(param_int_value(PARAM_ID_GAME_PARENTAL_LEVEL, 1), 0);
-        assert_eq!(param_int_value(PARAM_ID_CC_ENABLE, 1), 0);
-        assert_eq!(param_int_value(PARAM_ID_SCREEN_READER, 1), 0);
-        assert_eq!(param_int_value(12345, 1), 0);
+        // The system has no parameter 7 (parental level), 1000 (enter
+        // button) or any other id outside its table.
+        for id in [0, 6, 7, 401, 999, 1000, 12345] {
+            assert_eq!(param_int_value(id, 1), None, "id {id}");
+        }
     }
 
     #[test]

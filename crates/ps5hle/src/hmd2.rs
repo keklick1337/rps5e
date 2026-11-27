@@ -55,6 +55,14 @@ const RT_BLOCK_SIZE: u64 = 0x1_0000;
 const RT_BYTES_PER_ELEMENT: u64 = 4;
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// The initialised flag is process-wide: tests that initialise the library
+/// or check its answers before initialisation take turns.
+#[cfg(test)]
+pub(crate) fn test_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 static REPROJECTION_LOCK: Mutex<()> = Mutex::new(());
 /// Guest address of the reprojection state (0: not initialised).
 static REPROJECTION_STATE: AtomicU64 = AtomicU64::new(0);
@@ -248,6 +256,7 @@ mod tests {
 
     #[test]
     fn hmd2_without_headset() {
+        let _state = test_state_lock();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D53_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

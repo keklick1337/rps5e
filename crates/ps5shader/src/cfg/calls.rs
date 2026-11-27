@@ -90,6 +90,36 @@ fn operand_width(i: &Instruction, wave64: bool) -> u32 {
     1
 }
 
+/// Dwords source `index` of `i` covers when it is a scalar register. A
+/// vector instruction broadcasts a scalar source as one dword to every
+/// lane; only a lane mask (the selector of V_CNDMASK_B32, the carry-in of
+/// an add or subtract with carry: source 2 of the VOP3 form) and the
+/// operands of 64-bit operations span a register pair.
+fn source_width(i: &Instruction, index: usize, wave64: bool) -> u32 {
+    if !matches!(i.encoding, Encoding::Vop1 | Encoding::Vop2 | Encoding::Vop3 | Encoding::Vopc | Encoding::Vop3p) {
+        return operand_width(i, wave64);
+    }
+    if i.opcode.name().contains("64") {
+        return 2;
+    }
+    let mask = index == 2
+        && matches!(
+            i.opcode,
+            Opcode::VCndmaskB32
+                | Opcode::VAddcU32
+                | Opcode::VSubbU32
+                | Opcode::VSubbrevU32
+                | Opcode::VAddCoCiU32
+                | Opcode::VSubCoCiU32
+                | Opcode::VSubrevCoCiU32
+        );
+    if mask && wave64 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Scalar load destination width (dwords).
 fn load_width(i: &Instruction) -> u32 {
     let name = i.opcode.name();
@@ -155,7 +185,8 @@ fn reads(i: &Instruction, reg: u32, wave64: bool) -> bool {
         return true;
     }
     let width = operand_width(i, wave64);
-    if i.sources.iter().any(|s| s.kind == OperandKind::ScalarRegister && overlaps(s.value, width.max(if i.opcode.is_computed_jump() { 2 } else { 1 }), reg)) {
+    let jump = if i.opcode.is_computed_jump() { 2 } else { 1 };
+    if i.sources.iter().enumerate().any(|(k, s)| s.kind == OperandKind::ScalarRegister && overlaps(s.value, source_width(i, k, wave64).max(jump), reg)) {
         return true;
     }
     // Instructions that read the register they name as destination.

@@ -53,11 +53,50 @@ pub struct DeviceAddressRange {
 pub const MAX_RANGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Device-address paging every emitter uses.
+///
+/// The page table holds one entry per page of the two guest address ranges
+/// memory the GPU reads can lie in: the pages below [`LOW_BYTES`](paging::LOW_BYTES)
+/// first, then the pages of the window at [`WINDOW_BASE`](paging::WINDOW_BASE)
+/// (automatic memory), then one entry that is always zero, which every
+/// other address reads. Host and shader find an address's entry with the
+/// same rule ([`paging::entry_of`]).
 pub mod paging {
     pub const PAGE_BITS: u32 = 14;
     pub const PAGE_SIZE: u64 = 1 << PAGE_BITS;
     pub const PAGE_OFFSET_MASK: u64 = PAGE_SIZE - 1;
     pub const ADDRESS_MASK: u64 = super::ADDRESS_MASK;
+    /// End of the low range (1 TiB).
+    pub const LOW_BYTES: u64 = 1 << 40;
+    /// The window: 512 GiB at 8 TiB.
+    pub const WINDOW_BASE: u64 = 1 << 43;
+    pub const WINDOW_BYTES: u64 = 1 << 39;
+    pub const LOW_PAGES: u64 = LOW_BYTES >> PAGE_BITS;
+    pub const WINDOW_PAGES: u64 = WINDOW_BYTES >> PAGE_BITS;
+    /// The entry of every address outside both ranges: always zero.
+    pub const NO_ENTRY: u64 = LOW_PAGES + WINDOW_PAGES;
+    pub const ENTRY_COUNT: u64 = NO_ENTRY + 1;
+
+    /// The table entry of the page `address` lies in.
+    pub const fn entry_of(address: u64) -> u64 {
+        if address < LOW_BYTES {
+            address >> PAGE_BITS
+        } else if address.wrapping_sub(WINDOW_BASE) < WINDOW_BYTES {
+            LOW_PAGES + ((address - WINDOW_BASE) >> PAGE_BITS)
+        } else {
+            NO_ENTRY
+        }
+    }
+
+    /// The entries of the whole pages of `[address, address + bytes)`
+    /// (`address` page aligned): up to two runs `(first entry, address of
+    /// its page, pages)`, one per range the bytes lie in.
+    pub fn entry_runs(address: u64, bytes: u64) -> impl Iterator<Item = (u64, u64, u64)> {
+        let end = address.saturating_add(bytes & !PAGE_OFFSET_MASK);
+        [(0, LOW_BYTES), (WINDOW_BASE, WINDOW_BASE + WINDOW_BYTES)].into_iter().filter_map(move |(first, last)| {
+            let (from, to) = (address.max(first), end.min(last));
+            (from < to).then(|| (entry_of(from), from, (to - from) >> PAGE_BITS))
+        })
+    }
 }
 
 pub(super) fn plan(plan: &mut ShaderResourcePlan) -> Vec<DeviceAddressRangePlan> {

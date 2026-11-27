@@ -576,7 +576,7 @@ mod tests {
     /// GuestUsbd without a device).
     #[test]
     fn null_and_foreign_devices_and_handles() {
-        let (vm, base) = setup(0x5DA4_0000_0000);
+        let (vm, base) = setup(0x5B02_0000_0000);
         let mut ctx = CpuContext::new(&vm);
         let foreign = base + 0x100;
         let out = base + 0x200;
@@ -622,7 +622,7 @@ mod tests {
     /// transferred count is cleared before the handle is looked up.
     #[test]
     fn synchronous_transfers() {
-        let (vm, base) = setup(0x5DA5_0000_0000);
+        let (vm, base) = setup(0x5B03_0000_0000);
         let mut ctx = CpuContext::new(&vm);
         let (foreign, data, done) = (base + 0x100, base + 0x200, base + 0x300);
         for cb in [cb_bulk_transfer, cb_interrupt_transfer] {
@@ -673,7 +673,7 @@ mod tests {
     /// the setup packet plus wLength and its data follows the setup.
     #[test]
     fn control_setup_and_transfer() {
-        let (vm, base) = setup(0x7C63_0000_0000);
+        let (vm, base) = setup(0x5B07_0000_0000);
         let mut ctx = CpuContext::new(&vm);
         let buf = base + 0x100;
         assert_eq!(call(&mut ctx, cb_fill_control_setup, &[buf, 0x80, 6, 0x0100, 0x0409, 18]), 0);
@@ -696,7 +696,7 @@ mod tests {
     /// descriptor and a packet's buffer follows the earlier packets.
     #[test]
     fn iso_transfer_packets() {
-        let (vm, base) = setup(0x7C64_0000_0000);
+        let (vm, base) = setup(0x5B08_0000_0000);
         let mut ctx = CpuContext::new(&vm);
         let t = call(&mut ctx, cb_alloc_transfer, &[3]) as u64;
         let rsp = base + 0x100;

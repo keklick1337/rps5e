@@ -881,6 +881,34 @@ fn f16_kernel(rows: u32, modes: Modes, stage: Stage) -> R<Vec<u32>> {
 mod tests {
     use super::*;
 
+    /// Prints the NaN the host returns for f32 arithmetic on NaN operands
+    /// and for invalid operations (the guest returns its first NaN operand
+    /// and 0xffc00000; the NVIDIA driver 615 returns 0x7fffffff for every
+    /// one of them, so the translator's NaN selection cannot be left to
+    /// the host there).
+    #[test]
+    #[ignore = "needs a Vulkan device"]
+    fn host_nan_probe() {
+        let Ok(dev) = GpuDevice::create(false) else { return };
+        let rows: Vec<[u32; 3]> = vec![
+            [0x7f812345, 0x3f800000, 0x40000000],
+            [0x3f800000, 0x7f812345, 0x40000000],
+            [0x3f800000, 0x40000000, 0x7f812345],
+            [0xff912345, 0x7fa54321, 0x40000000],
+            [0x7fa54321, 0xff912345, 0x40000000],
+            [0x7fc12345, 0xffe54321, 0x7fd11111],
+            [0x7f800000, 0xff800000, 0x3f800000],
+            [0x7f800000, 0x00000000, 0x3f800000],
+            [0x00000000, 0x7f800000, 0x3f800000],
+            [0x7f800000, 0x00000000, 0x7f812345],
+        ];
+        let out = run(&dev, Mode::Default, true, &rows).unwrap();
+        for (r, o) in rows.iter().zip(&out) {
+            let line: Vec<String> = ["fadd", "fsub", "fmul", "fma", "fmin", "fmax", "mul+add"].iter().map(|n| format!("{n} {:08x}", o[OPS.iter().position(|x| x == n).unwrap()])).collect();
+            println!("{:08x} {:08x} {:08x}: {}", r[0], r[1], r[2], line.join(" "));
+        }
+    }
+
     /// The host flushes on a million rows (the startup check uses 4096).
     #[test]
     #[ignore = "needs a Vulkan device"]

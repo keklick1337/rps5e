@@ -1,0 +1,17 @@
+{
+  "name": "Grand Theft Auto VI",
+  "id": "PPSA38500",
+  "version": "*",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "No hang watchdog",
+      "description": "The game's watchdog thread stops the game when its main thread makes no progress for 30 seconds. A first build of the game's large shaders takes longer than that, so the two jumps into the watchdog's stop are removed.",
+      "enabled": true,
+      "memory": [
+        {"offset": "0x847C4C5", "off": "41BF1E0000004939DE0F859300000041FFCD74134589EF4C89F3E983000000", "on": "41BF1E0000004939DE0F859300000041FFCD90904589EF4C89F3E983000000"},
+        {"offset": "0x847C411", "off": "0F83CD00000049FFC74C39FB75AC", "on": "90909090909049FFC74C39FB75AC"}
+      ]
+    }
+  ]
+}

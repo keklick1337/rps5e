@@ -15,7 +15,12 @@
 //! their dispatches without executing anything (no register, memory or
 //! label writes, no waits). The provider only queues compiles for what it
 //! finds; the dispatches themselves are recorded later by the normal path,
-//! so a wrong guess costs a compile and never changes a frame.
+//! so a wrong guess costs a compile and never changes a frame. A guess is
+//! often wrong: the dispatches are resolved from guest memory as it is at
+//! the scan, and a resource table the game fills later still holds
+//! leftovers. What the lookahead makes therefore enters the prewarm list
+//! only when a draw or dispatch first asks for it (`provider.rs`
+//! `Guesses`; `RPS5E_LIST_GUESSES=1` lists it at once).
 //!
 //! After the current buffer chain the source also reads the command
 //! buffers already queued behind it, on its own queue and the others

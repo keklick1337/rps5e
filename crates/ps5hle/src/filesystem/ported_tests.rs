@@ -1730,7 +1730,7 @@ fn posix_sync_forgets_written_paths() {
 /// directory, and a file used as a parent is ENOTDIR.
 #[test]
 fn mkdir_paths_and_errors() {
-    let f = Fixture::new(0x6A15_0000_0000, "mkdir");
+    let f = Fixture::new(0x5B06_0000_0000, "mkdir");
     let mut ctx = f.ctx();
     let empty = f.s(&ctx, 0, "");
     assert_eq!(call(&mut ctx, cb_sce_mkdir, &[empty, 0o777]), sce_error(ENOENT));
@@ -1916,7 +1916,7 @@ fn fcntl_fsync_syncs_each_write() {
     const SYNC: u64 = 0x80;
     const RDWR_CREAT: u64 = 2 | 0x200;
     let synced = || SYNCHRONOUS_WRITES.load(std::sync::atomic::Ordering::Relaxed);
-    let f = Fixture::new(0x7C3E_8000_0000, "fsync");
+    let f = Fixture::new(0x7C3E_8000_0000, "osync");
     let mut ctx = f.ctx();
     let path = f.s(&ctx, 0, &f.guest("sync.bin"));
     let file = call(&mut ctx, cb_posix_open, &[path, RDWR_CREAT, 0o600]) as u64;
@@ -2050,3 +2050,42 @@ fn poll_hangup_clears_pollout_on_sockets() {
 }
 
 const POLLOUT_HOST_WITH_HUP: i16 = libc::POLLOUT | libc::POLLHUP;
+
+/// dup2 onto a kernel socket keeps the number taken while the socket is
+/// closed and the file bound: a descriptor opened by another thread at that
+/// moment never gets the number being replaced.
+#[test]
+fn dup2_onto_a_socket_never_frees_the_number() {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    static REPLACED: AtomicI32 = AtomicI32::new(-1);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    static STOLEN: AtomicBool = AtomicBool::new(false);
+    let f = Fixture::new(0x5B0A_0000_0000, "dup2race");
+    let mut ctx = f.ctx();
+    let sv = f.base;
+    let path = f.s(&ctx, 0, &f.guest("dup2race.dat"));
+    let file = open(&mut ctx, path, 0x602) as i32;
+    assert!(file >= 3);
+    let taker = std::thread::spawn(|| {
+        while !STOP.load(Ordering::Relaxed) {
+            let fd = reserve_fd();
+            if fd == REPLACED.load(Ordering::SeqCst) {
+                STOLEN.store(true, Ordering::Relaxed);
+            }
+            release_fd(fd);
+        }
+    });
+    for _ in 0..3000 {
+        let (c, d) = crate::net::test_socketpair(&ctx, 1, sv);
+        // `c` is this test's from here to its close below.
+        REPLACED.store(c, Ordering::SeqCst);
+        assert_eq!(dup2_core(file, c), Ok(c as i64));
+        REPLACED.store(-1, Ordering::SeqCst);
+        assert_eq!(call(&mut ctx, cb_sce_close, &[c as u64]), 0);
+        assert_eq!(call(&mut ctx, cb_sce_close, &[d as u64]), 0);
+    }
+    STOP.store(true, Ordering::Relaxed);
+    taker.join().unwrap();
+    assert_eq!(call(&mut ctx, cb_sce_close, &[file as u64]), 0);
+    assert!(!STOLEN.load(Ordering::Relaxed), "the number under dup2 was handed out");
+}

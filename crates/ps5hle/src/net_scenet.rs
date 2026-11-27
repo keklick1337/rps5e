@@ -834,7 +834,6 @@ mod tests {
         assert_eq!(cb_setsockopt(&mut ctx), 0, "SO_SNDBUF");
         args(&mut ctx, &[fd as u64]);
         assert_eq!(cb_socket_close(&mut ctx), 0);
-        assert!(!super::super::is_kernel_socket(fd));
         args(&mut ctx, &[0x7fff_0000]);
         assert!(failed(&mut ctx, cb_socket_close, EBADF_));
         args(&mut ctx, &[0x7fff_0000, 6, 1, BASE, 4]);

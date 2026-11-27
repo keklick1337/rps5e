@@ -502,6 +502,140 @@ fn undefined_descriptors_fail_with_the_culprit() {
     assert!(err.message.contains("hash=0x0000000000000007"), "{err}");
 }
 
+/// v_cmp_eq_u32 vcc, 1, v5 ; s_quadmask_b64 vcc, vcc ; s_lshl_b32 s86,
+/// vcc_lo, 12 ; s_or_b32 s31, s31, s86 ; then a loop around
+/// image_sample_a v9, v5, s[12:19], s[28:31]: the S# reaches the sample
+/// through the loop's phis. The quad mask lies in the reserved bits of
+/// dword 3, which the sampler binding does not hold: the dword is the user
+/// data word behind the OR.
+#[test]
+fn sampler_quad_mask_bits_are_dropped_behind_loop_phis() {
+    let p = ShaderResourcePlan::extract(
+        assemble(&[
+            &[0x7d840a81, 0xbeea2d6a, 0x8f568c6a, 0x881f561f],
+            &[0xf0800309, 0x00e30905],
+            &[sopc(OP_S_CMP_EQ_U32, 2, 128), sopp(OP_S_CBRANCH_SCC1, -4), S_ENDPGM],
+        ]),
+        ShaderStage::Pixel,
+        0x1234,
+        0,
+        32,
+        None,
+        32,
+    )
+    .unwrap_or_else(|e| panic!("plan: {e}"));
+    assert_eq!(p.info.samplers.len(), 1);
+    let dwords = &p.descriptor_sources[p.info.samplers[0].source as usize].dwords;
+    let word3 = p.graph.resolve_invariant_phi(dwords[3]).unwrap();
+    assert_eq!((p.graph.node(word3).kind, p.graph.node(word3).payload), (ValueKind::UserData, 31));
+}
+
+/// Two lookups of a bindless image table in a wave32 program: v_readfirstlane
+/// vcc_lo, v29 ; s_lshl_b32 vcc_lo, vcc_lo, 5 ; s_buffer_load_dwordx8
+/// s[28:35], s[24:27], vcc_lo ; image_sample. Between them a compare writes
+/// its mask to s28 and s_and_b64 exec, s[28:29], exec reads the pair, whose
+/// upper half is still dword 1 of the first T#. The first image is planned
+/// as a table image all the same, and its words stay loads of the program;
+/// the second one's feed nothing else and are taken over.
+#[test]
+fn table_image_words_read_again_stay_loads() {
+    let (load, sample) = ([0x7ed4051d, 0x8f6a856a, 0xf42c070c, 0xd4000000], image_sample(14, 24, 28, 8));
+    let p = ShaderResourcePlan::extract(
+        assemble(&[&load, &sample, &[0x7d822af9, 0x06869c81, 0x87fe7e1c], &load, &sample, &[S_ENDPGM]]),
+        ShaderStage::Pixel,
+        0x1234,
+        0,
+        28,
+        None,
+        32,
+    )
+    .unwrap_or_else(|e| panic!("plan: {e}"));
+    let entries = p.memory().entries();
+    let words = |pc: u32| entries.iter().filter(|m| m.pc == pc && m.kind == MemoryResourceKind::ScalarBuffer).map(|m| m.planning_only).collect::<Vec<_>>();
+    assert_eq!(words(0x08), vec![false; 8]);
+    assert_eq!(words(0x2c), vec![true; 8]);
+    let images: Vec<_> = entries.iter().filter(|m| m.kind == MemoryResourceKind::Image).collect();
+    assert_eq!(images.len(), 2);
+    for image in images {
+        let source = &p.descriptor_sources[p.info.images[image.resource as usize].source as usize];
+        assert!(source.indirect_image.as_ref().is_some_and(|s| s.table.is_some()), "pc {:#x}", image.pc);
+    }
+}
+
+/// 33 buffers read through V#s loaded from [s[0:1] + 16 i], then
+/// buffer_store_format_x v27, v26, s[8:11] through one more: past the 32
+/// bindings the store takes its V# (and from it the format) from the
+/// registers.
+#[test]
+fn formatted_stores_past_the_buffer_bindings_use_their_registers() {
+    let mut parts: Vec<Vec<u32>> = Vec::new();
+    for i in 0..33u32 {
+        parts.push(smem(SMEM_LOAD_DWORDX4, 8, 0, 16 * i).to_vec());
+        parts.push(buffer_load_dword(1, 2, 8).to_vec());
+    }
+    parts.push(smem(SMEM_LOAD_DWORDX4, 8, 0, 16 * 40).to_vec());
+    parts.push(vec![0xe0102000, 0x80021b1a, S_ENDPGM]);
+    let slices: Vec<&[u32]> = parts.iter().map(|p| p.as_slice()).collect();
+    let p = plan(assemble(&slices), ShaderStage::Compute, 2);
+    assert_eq!(p.info.buffers.len(), ShaderResourceInfo::MAX_BUFFERS);
+    let store = p.memory().entries().iter().find(|m| m.opcode == Opcode::BufferStoreFormatX).unwrap();
+    assert!(store.device_descriptor && store.formatted);
+    assert!(p.info.uses_device_addresses);
+}
+
+/// s_bfm_b64 vcc, 32, 32 ; v_cmp_ge_u64 vcc, s[0:1], vcc ; s_cbranch_vccz:
+/// one arm sets a bit of s5, the other loads s[4:7] from [s[0:1] + 176];
+/// then buffer_load_dword v1, v0, s[4:7]. The V# depends on the arm taken,
+/// which the host does not know for the draw, and every path wrote (or
+/// was given) its four registers: the load takes it from them. With s[4:7]
+/// outside the user data one arm leaves three of them unwritten, and the
+/// plan fails.
+#[test]
+fn buffer_descriptors_chosen_by_a_branch_are_read_from_their_registers() {
+    let program = || {
+        assemble(&[
+            &[0x92eaa0a0, 0xd4e6006a, 0x0000d400, 0xbf860003],
+            &[0x8805ff05, 0x00780000, sopp(OP_S_BRANCH, 2)],
+            &[0xf4080100, 0xfa0000b0],
+            &[0xe0302000, 0x80010100, S_ENDPGM],
+        ])
+    };
+    let p = plan(program(), ShaderStage::Compute, 8);
+    let load = p.memory().entries().iter().find(|m| m.opcode == Opcode::BufferLoadDword).unwrap();
+    assert_eq!(load.pc, 0x24);
+    assert_eq!(load.buffer_descriptor.map(|d| d.provenance), Some(BufferDescriptorProvenance::Runtime));
+    assert!(p.info.buffers.is_empty() && p.info.uses_device_addresses);
+    assert!(p.resource_uses().iter().any(|u| u.pc == 0x24 && u.binding == ResourceBinding::DeviceAddress));
+
+    let err = ShaderResourcePlan::extract(program(), ShaderStage::Compute, 7, 0, 4, None, 64).unwrap_err();
+    assert!(err.message.contains("BufferLoadDword") && err.message.contains("pc=0x00000024"), "{err}");
+}
+
+/// The page-table entry of an address: its page number below 1 TiB, the
+/// window's pages after those, one zero entry for everything else (no
+/// address shares an entry with a page of another range).
+#[test]
+fn page_table_entries_cover_the_low_range_and_the_window() {
+    use paging::*;
+    assert_eq!((entry_of(0), entry_of(PAGE_SIZE - 1), entry_of(PAGE_SIZE)), (0, 0, 1));
+    assert_eq!(entry_of(LOW_BYTES - 1), LOW_PAGES - 1);
+    assert_eq!(entry_of(WINDOW_BASE), LOW_PAGES);
+    assert_eq!(entry_of(0x804_37e8_0000), LOW_PAGES + (0x4_37e8_0000 >> PAGE_BITS));
+    assert_eq!(entry_of(WINDOW_BASE + WINDOW_BYTES - 1), NO_ENTRY - 1);
+    for outside in [LOW_BYTES, 0x437_e800_0000, WINDOW_BASE - 1, WINDOW_BASE + WINDOW_BYTES, 0x7ef0_0000_0000, u64::MAX] {
+        assert_eq!(entry_of(outside), NO_ENTRY, "{outside:#x}");
+    }
+    assert_eq!(ENTRY_COUNT, (1 << 26) + (1 << 25) + 1);
+
+    let runs = |a: u64, n: u64| entry_runs(a, n).collect::<Vec<_>>();
+    assert_eq!(runs(0x10_0000_0000, 3 * PAGE_SIZE), vec![(0x10_0000_0000 >> PAGE_BITS, 0x10_0000_0000, 3)]);
+    assert_eq!(runs(0x804_37e8_0000, 2 * PAGE_SIZE), vec![(entry_of(0x804_37e8_0000), 0x804_37e8_0000, 2)]);
+    assert_eq!(runs(LOW_BYTES - PAGE_SIZE, 4 * PAGE_SIZE), vec![(LOW_PAGES - 1, LOW_BYTES - PAGE_SIZE, 1)]);
+    assert_eq!(runs(WINDOW_BASE - PAGE_SIZE, 3 * PAGE_SIZE), vec![(LOW_PAGES, WINDOW_BASE, 2)]);
+    assert!(runs(0x7ef0_0000_0000, 64 * PAGE_SIZE).is_empty());
+    assert!(runs(LOW_BYTES, PAGE_SIZE).is_empty());
+}
+
 /// Guest memory and readers for the materialisation cache tests.
 struct TestMemory {
     words: std::cell::RefCell<HashMap<u64, u32>>,
@@ -659,6 +793,191 @@ fn replay_patches_reuse_only_snapshots_no_one_holds() {
     if std::env::var("RPS5E_PATCH_IN_PLACE").is_err() {
         assert!(cache.statistics().replay_recycled > 100, "{:?}", cache.statistics());
     }
+}
+
+/// A V# without records has one specialization whatever its stride,
+/// swizzle and range-rule fields hold (a program that builds its V#s from
+/// a pointer and a count leaves the pointer's upper word in them when the
+/// count is 0): no module per leftover value. One with records keeps the
+/// specialization of its fields, and the two never share a template.
+#[test]
+fn buffers_without_records_share_one_specialization() {
+    let p = srt_test_plan();
+    let m = TestMemory::new();
+    let mut cache = ResourceMaterializationCache::default();
+    let table = 0x2_0000_0000u64;
+    fill_table(&m, table, t_sharp(0x3_0000_0000), [0x24, 0, 0, 0], 7);
+    let mut of = |buffer: [u32; 4]| cached_matches_fresh(&mut cache, &p, &m, &srt_user_data(table, buffer)).1;
+    let live = of(v_sharp(0x5000, 16, 64));
+    assert_eq!(live.buffers[0].packed_stride, 16);
+    // No records: the upper word of the "pointer" holds leftovers.
+    let empty = of(v_sharp(0x5000, 16 | 0x48F, 0));
+    assert_eq!(empty.buffers[0].packed_stride, 0);
+    assert_ne!(*empty, *live);
+    // Other leftovers: swizzle enable (word 1 bit 31), thread id, index
+    // stride and the range rule (word 3).
+    let mut junk = v_sharp(0x1234_5678, 0x3F72, 0);
+    junk[1] |= 0x8000_0000;
+    junk[3] |= 3 << 28 | 1 << 23 | 3 << 21;
+    for buffer in [junk, v_sharp(0x5000, 0, 0), v_sharp(0x9000, 16, 0)] {
+        assert_eq!(*of(buffer), *empty, "{buffer:x?}");
+    }
+    // The same fields with records are a specialization of their own.
+    let strided = of(v_sharp(0x5000, 16 | 0x48F, 8));
+    assert_eq!(strided.buffers[0].packed_stride, 16 | 0x48F);
+    junk[2] = 1;
+    assert_eq!(of(junk).buffers[0].packed_stride, 0x3F72 | 1 << 14 | 3 << 16 | 1 << 20 | 3 << 24);
+    // And the live buffer again.
+    assert_eq!(*of(v_sharp(0x7000, 16, 2)), *live);
+    assert_eq!(*of(v_sharp(0x7000, 16, 0)), *empty);
+}
+
+/// A program that builds a V# in registers from a pointer and a count of
+/// its table (`s_load_dwordx2` of the pointer, the stride OR-ed into the
+/// pointer's high word, a constant word 3): `words` between the pointer
+/// load and the load, s[16:19] the V#, then a V# loaded whole from the
+/// table into s[20:23].
+fn register_built_buffer_plan(words: &[u32]) -> ShaderResourcePlan {
+    plan(
+        assemble(&[
+            &smem(SMEM_LOAD_DWORDX2, 16, 0, 72),
+            &smem(SMEM_LOAD_DWORD, 18, 0, 128),
+            // s_mov_b32 s19, 0x00016204
+            &[sop1(OP_S_MOV_B32, 19, LITERAL), 0x0001_6204],
+            words,
+            // buffer_load_dwordx2 v0, v2, s[16:19], 8 idxen
+            &[0xe034_2008, 0x8004_0002],
+            &smem(SMEM_LOAD_DWORDX4, 20, 0, 176),
+            &buffer_load_dword(1, 0, 20),
+            &[S_ENDPGM],
+        ]),
+        ShaderStage::Compute,
+        2,
+    )
+}
+
+/// s_bitset1_b32 s17, 20: stride 16 into the pointer's high word.
+const S_BITSET1_S17_20: u32 = 0xbe91_1d94;
+const OP_S_AND_B32: u32 = 0x0E;
+const OP_S_OR_B32: u32 = 0x10;
+
+/// The stride of a V# the program builds from a pointer is whatever the
+/// pointer's upper bits hold OR-ed with the program's constant: a run-time
+/// value. Such a buffer has one specialization whatever those bits and the
+/// record count are (the module reads the fields from its registers); a V#
+/// loaded whole from the table keeps its specialized stride.
+#[test]
+fn register_built_strides_are_not_specialized() {
+    let p = register_built_buffer_plan(&[S_BITSET1_S17_20]);
+    assert_eq!(p.info.buffers.len(), 2);
+    assert!(p.info.buffers[0].runtime_stride, "word 1 is the pointer's high word OR a constant");
+    assert!(!p.info.buffers[1].runtime_stride, "a V# loaded whole is the title's descriptor");
+    let m = TestMemory::new();
+    let mut cache = ResourceMaterializationCache::default();
+    let table = 0x2_0000_0000u64;
+    let mut of = |pointer: u64, records: u32, whole: [u32; 4]| {
+        m.set_all(table + 72, &[pointer as u32, (pointer >> 32) as u32]);
+        m.set(table + 128, records);
+        m.set_all(table + 176, &whole);
+        cached_matches_fresh(&mut cache, &p, &m, &[table as u32, (table >> 32) as u32])
+    };
+    let whole = v_sharp(0x9000, 120, 4);
+    let (snapshot, clean) = of(0x10_7489_9c20, 0x48, whole);
+    assert_eq!(snapshot.buffers[0][..], [0x7489_9c20, 0x0010_0010, 0x48, 0x0001_6204], "the snapshot holds the words as they are");
+    assert_eq!(clean.buffers[0].packed_stride, RUNTIME_STRIDE);
+    assert_eq!(clean.buffers[1].packed_stride, 120);
+    // Upper pointer bits of every kind, with and without records: floats,
+    // counters, all ones (the swizzle bit among them).
+    for (pointer, records) in [(0x03f5_0010_7489_9c20u64, 0x48u32), (0x42bc_0010_0000_1000, 7), (0xffff_ffff_ffff_ffff, 1), (0x8000_0010_7489_9c20, 3), (0x0005_0000_0000_0000, 0), (0x10_7489_9c20, 0)] {
+        let (snapshot, other) = of(pointer, records, whole);
+        assert_eq!(*other, *clean, "{pointer:#x} {records}");
+        assert_eq!(snapshot.buffers[0][1], (pointer >> 32) as u32 | 1 << 20);
+        assert_eq!(snapshot.buffers[0][2], records);
+    }
+    // The whole V# still specializes on its stride.
+    let (_, strided) = of(0x10_7489_9c20, 0x48, v_sharp(0x9000, 24, 4));
+    assert_eq!(strided.buffers[0].packed_stride, RUNTIME_STRIDE);
+    assert_eq!(strided.buffers[1].packed_stride, 24);
+    assert_ne!(*strided, *clean);
+    // A specialization of another planner (a stride for the run-time
+    // buffer, the run-time mark for the whole one) is not this plan's.
+    let mut stale = (*clean).clone();
+    stale.buffers[0].packed_stride = 0x3f5 | 16;
+    assert!(apply_specialization(&p, &stale).is_err());
+    let mut stale = (*clean).clone();
+    stale.buffers[1].packed_stride = RUNTIME_STRIDE;
+    assert!(apply_specialization(&p, &stale).is_err());
+    let applied = apply_specialization(&p, &clean).unwrap();
+    assert_eq!(applied.info.buffers[0].packed_stride, RUNTIME_STRIDE);
+}
+
+/// Which words 1 are computed: an OR or an add into the loaded word is;
+/// a word whose stride bits the program's constants fix is not (the
+/// pointer's high word masked to its address bits before the OR).
+#[test]
+fn stride_fields_fixed_by_constants_stay_specialized() {
+    let runtime = |words: &[u32]| register_built_buffer_plan(words).info.buffers[0].runtime_stride;
+    assert!(!runtime(&[]), "the loaded word as it is");
+    assert!(runtime(&[S_BITSET1_S17_20]));
+    // s_or_b32 s17, s17, 0x000c0000
+    assert!(runtime(&[sop2(OP_S_OR_B32, 17, 17, LITERAL), 0x000c_0000]));
+    // s_addc_u32 s17, s17, 0
+    assert!(runtime(&[sop2(OP_S_ADDC_U32, 17, 17, 0x80)]));
+    // s_and_b32 s17, s17, 0xffff; s_or_b32 s17, s17, 0x00100000
+    let masked = [sop2(OP_S_AND_B32, 17, 17, LITERAL), 0x0000_ffff, sop2(OP_S_OR_B32, 17, 17, LITERAL), 0x0010_0000];
+    assert!(!runtime(&masked));
+    let p = register_built_buffer_plan(&masked);
+    let m = TestMemory::new();
+    let table = 0x2_0000_0000u64;
+    m.set_all(table + 72, &[0x7489_9c20, 0x03f5_0010]);
+    m.set(table + 128, 9);
+    m.set_all(table + 176, &v_sharp(0x9000, 120, 4));
+    let (snapshot, spec) = cached_matches_fresh(&mut ResourceMaterializationCache::default(), &p, &m, &[table as u32, (table >> 32) as u32]);
+    assert_eq!(snapshot.buffers[0][1], 0x0010_0010);
+    assert_eq!(spec.buffers[0].packed_stride, 16);
+}
+
+/// A program that writes memory still leaves out the descriptors behind a
+/// branch its entry registers decide: a V# the title does not set because
+/// a flag in its user data turns the access off (leftover words) makes no
+/// specialization of its own. A flag read from memory decides nothing in
+/// such a program (its store could change the word).
+#[test]
+fn descriptors_behind_a_register_predicate_are_left_out_of_writing_programs() {
+    // buffer_store_dword v6 <- v3, s8; s_cmp_lg_u32 0, s6;
+    // s_cbranch_scc0 +2; buffer_load_dword v1 <- v0, s12.
+    let guarded = |flag: &[u32]| {
+        plan(
+            assemble(&[flag, &[0xe0702000, 0x80020603, 0xbf070680, 0xbf840002], &buffer_load_dword(1, 0, 12), &[S_ENDPGM]]),
+            ShaderStage::Compute,
+            16,
+        )
+    };
+    let p = guarded(&[]);
+    assert!(!p.resource_branches.is_empty(), "the flag in s6 decides the branch");
+    let m = TestMemory::new();
+    let mut cache = ResourceMaterializationCache::default();
+    let user = |flag: u32, guarded: [u32; 4]| {
+        let mut u = vec![0, 0, 0, 0, 0, 0, flag, 0];
+        u.extend_from_slice(&v_sharp(0x5000, 4, 64));
+        u.extend_from_slice(&guarded);
+        u
+    };
+    let leftovers = [[0x3f80_0000, 0x42bc_1234, 0x0000_0777, 0x1031_40a0], [0xdead_beef, 0x7fb5_0001, 0xffff_ffff, 0x0001_6e9c]];
+    let (off, spec_off) = cached_matches_fresh(&mut cache, &p, &m, &user(0, leftovers[0]));
+    assert!(off.buffers[1].iter().all(|&w| w == 0), "the skipped load binds nothing");
+    let (_, other) = cached_matches_fresh(&mut cache, &p, &m, &user(0, leftovers[1]));
+    assert_eq!(*other, *spec_off);
+    // The flag set: the descriptor counts.
+    let (on, spec_on) = cached_matches_fresh(&mut cache, &p, &m, &user(1, v_sharp(0x9000, 16, 8)));
+    assert_eq!(on.buffers[1][..], v_sharp(0x9000, 16, 8)[..]);
+    assert_eq!(spec_on.buffers[1].packed_stride, 16);
+    assert_ne!(*spec_on, *spec_off);
+
+    // The flag loaded from memory (s_load_dword s6 <- s0): the program's
+    // store could change it, so both edges count.
+    let p = guarded(&smem(SMEM_LOAD_DWORD, 6, 0, 0));
+    assert!(p.resource_branches.is_empty());
 }
 
 #[test]

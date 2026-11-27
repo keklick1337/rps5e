@@ -822,8 +822,11 @@ mod tests {
         // Without MSG_NOSIGNAL the host still raises no SIGPIPE.
         assert_eq!(p.send(b, b"ping\0", 0), Err(EPIPE_GUEST));
         assert!(p.close(b));
-        assert!(!p.close(b));
-        assert_eq!(p.send(b, b"x", 0), Err(EBADF_));
+        // A number nothing holds: the one just closed may be another
+        // test's descriptor by now.
+        const NEVER_OPEN: i32 = 0x7FFF_0000;
+        assert!(!p.close(NEVER_OPEN));
+        assert_eq!(p.send(NEVER_OPEN, b"x", 0), Err(EBADF_));
 
         let (a, b) = p.create(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0).unwrap();
         assert_eq!(crate::net::kernel_socket_fcntl(a, 3, 0), Some(Ok(6)));

@@ -284,6 +284,14 @@ pub struct EmitOptions {
     /// with a candidate of the popped instance pending
     /// (`ps5shader::opt::rt_loops::Options::merge_bottom`).
     pub hw_rt_merge: bool,
+    /// `RPS5E_HELPER_INLINE`: a helper function of the module (the format
+    /// conversions of [`memory::emit_format_functions`]) is declared without
+    /// DontInline while its inlined copies stay smaller than the rest of
+    /// the module (`emit::Emitter::define_function`). A module with a
+    /// function call that is not inlined takes a slower compiler in the
+    /// NVIDIA driver (615): about twice the pipeline creation time for
+    /// the whole module. Off: every helper is DontInline.
+    pub helper_inline: bool,
     /// `RPS5E_WRITE_RANGE_CHECKS=1` (diagnostics): device-address stores
     /// with a planned written range note the addresses outside it
     /// (`Emitter::check_written_range`).
@@ -328,6 +336,7 @@ impl EmitOptions {
         hw_rt_probe: false,
         hw_rt_merge: false,
         write_range_checks: false,
+        helper_inline: true,
     };
     /// Every exact switch on, on a device with every feature they use
     /// (tests).
@@ -368,6 +377,7 @@ impl EmitOptions {
         hw_rt_probe: false,
         hw_rt_merge: false,
         write_range_checks: false,
+        helper_inline: false,
     };
 
     /// The switches from the environment (read once).
@@ -415,6 +425,7 @@ impl EmitOptions {
                 hw_rt_probe: opt_in("RPS5E_HW_RT_PROBE"),
                 hw_rt_merge: on("RPS5E_HW_RT_MERGE"),
                 write_range_checks: opt_in("RPS5E_WRITE_RANGE_CHECKS"),
+                helper_inline: on("RPS5E_HELPER_INLINE"),
             };
             if o.no_f32_flush {
                 log::warn!("[shader] RPS5E_NO_F32_FLUSH=1: f32 denormals are not flushed as the guest's FLOAT_MODE asks (the host's own behaviour)");

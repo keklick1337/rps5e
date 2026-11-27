@@ -144,6 +144,8 @@ pub struct Emitter<'a, 'p> {
     pub coherent_buffers: bool,
     /// Nonzero while instructions go to a scratch block (`in_prologue`).
     cse_off: u32,
+    /// Calls emitted per function id ([`Self::call`]).
+    calls: HashMap<Word, u32>,
     /// Every global variable (SPIR-V 1.4+ entry point interface).
     pub globals: Vec<Word>,
     pub builtins: HashMap<(u32, u32), Word>,
@@ -218,6 +220,16 @@ fn cse_pure(op: S) -> bool {
             | S::LogicalNot
             | S::LogicalEqual
             | S::LogicalNotEqual
+            | S::IsNan
+            | S::IsInf
+            | S::FOrdEqual
+            | S::FOrdNotEqual
+            | S::FOrdLessThan
+            | S::FOrdLessThanEqual
+            | S::FOrdGreaterThan
+            | S::FOrdGreaterThanEqual
+            | S::FUnordEqual
+            | S::FUnordNotEqual
             | S::Select
             | S::AccessChain
             | S::InBoundsAccessChain
@@ -297,6 +309,22 @@ pub(super) fn barrier_semantics(writes_buffers: bool, writes_images: bool) -> u3
     ACQUIRE_RELEASE | WORKGROUP_MEMORY | stored
 }
 
+/// Instructions in the blocks of `f`.
+fn function_instructions(f: &rspirv::dr::Function) -> usize {
+    f.blocks.iter().map(|b| b.instructions.len()).sum()
+}
+
+/// Whether a helper function of `body` instructions called `calls` times
+/// stays a real call: inlined, the copies it adds (one per call after the
+/// first) would be larger than the `rest` of the module. Measured on the
+/// NVIDIA driver (615): a module with a call that is not inlined is
+/// compiled by another, slower compiler, 2-2.3 times the pipeline
+/// creation time of the same module with the function inlinable, so a
+/// call pays only where inlining would at least double the module.
+pub(super) fn inlined_copies_outweigh(calls: u32, body: usize, rest: usize) -> bool {
+    (calls.saturating_sub(1) as usize).saturating_mul(body) > rest
+}
+
 fn id_ops(ids: &[Word]) -> Vec<Operand> {
     ids.iter().map(|&i| Operand::IdRef(i)).collect()
 }
@@ -354,6 +382,7 @@ impl<'a, 'p> Emitter<'a, 'p> {
             writes_images: writes_images(input.func),
             coherent_buffers: invalidates_data_caches(input.func),
             cse_off: 0,
+            calls: HashMap::new(),
             globals: Vec::new(),
             builtins: HashMap::new(),
             main: 0,
@@ -636,6 +665,9 @@ impl<'a, 'p> Emitter<'a, 'p> {
             }
         };
         let k: Vec<Option<u64>> = ids.iter().map(|&w| val(self, w)).collect();
+        if matches!(op, S::LogicalOr | S::LogicalAnd | S::BitwiseOr | S::BitwiseAnd) && ids.len() == 2 && ids[0] == ids[1] {
+            return Some(ids[0]);
+        }
         if op == S::Select && ids.len() == 3 {
             // Arms of u32/bool type only (`ty` checked above).
             if let Some(c) = k[0] {
@@ -1139,6 +1171,37 @@ impl<'a, 'p> Emitter<'a, 'p> {
         self.begin(merge);
     }
 
+    /// [`Self::switch_then`] where the cases with the same `key` share one
+    /// body: `f` runs once per distinct key (for its first selector) and
+    /// must do the same for every selector with that key. Any other
+    /// selector takes case 0's body.
+    pub fn switch_then_shared<K: Eq + std::hash::Hash>(&mut self, sel: Word, count: u32, key: impl Fn(u32) -> K, mut f: impl FnMut(&mut Self, u32)) {
+        let merge = self.b.id();
+        let mut group_of: HashMap<K, usize> = HashMap::new();
+        // (label, first selector) per group, in selector order.
+        let mut groups: Vec<(Word, u32)> = Vec::new();
+        let mut label_of = Vec::with_capacity(count as usize);
+        for k in 0..count {
+            let g = *group_of.entry(key(k)).or_insert_with(|| {
+                groups.push((self.b.id(), k));
+                groups.len() - 1
+            });
+            label_of.push(groups[g].0);
+        }
+        self.b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+        let default = label_of[0];
+        let targets: Vec<(Operand, Word)> = (1..count).filter(|&k| label_of[k as usize] != default).map(|k| (Operand::LiteralBit32(k), label_of[k as usize])).collect();
+        self.b.switch(sel, default, targets).unwrap();
+        for &(label, k) in &groups {
+            self.begin(label);
+            self.cse_scope_enter();
+            f(self, k);
+            self.cse_scope_exit();
+            self.b.branch(merge).unwrap();
+        }
+        self.begin(merge);
+    }
+
     // ------------------------------------------------------------------
     // Values
     // ------------------------------------------------------------------
@@ -1227,9 +1290,17 @@ impl<'a, 'p> Emitter<'a, 'p> {
     /// `body` gets its parameters and returns the value it returns. Values
     /// of other functions are out of reach, so instruction reuse is off
     /// while it is emitted.
+    ///
+    /// The function is DontInline only when its inlined copies would be
+    /// larger than the rest of the module
+    /// ([`inlined_copies_outweigh`]; `EmitOptions::helper_inline`):
+    /// the host compiler inlines every other function, and a module
+    /// without calls is compiled by the faster of the NVIDIA driver's two
+    /// compilers.
     pub(super) fn define_function(&mut self, id: Word, ret: Word, params: &[Word], body: impl FnOnce(&mut Self, &[Word]) -> R<Word>) -> R<()> {
         let fnty = self.b.type_function(ret, params.to_vec());
-        self.b.begin_function(ret, Some(id), spirv::FunctionControl::DONT_INLINE, fnty).map_err(|e| format!("{e:?}"))?;
+        let others: usize = self.b.module_ref().functions.iter().map(function_instructions).sum();
+        self.b.begin_function(ret, Some(id), spirv::FunctionControl::NONE, fnty).map_err(|e| format!("{e:?}"))?;
         let args = params.iter().map(|&t| self.b.function_parameter(t).map_err(|e| format!("{e:?}"))).collect::<R<Vec<_>>>()?;
         let entry = self.b.id();
         self.begin(entry);
@@ -1241,11 +1312,21 @@ impl<'a, 'p> Emitter<'a, 'p> {
         let v = r?;
         self.b.ret_value(v).map_err(|e| format!("{e:?}"))?;
         self.b.end_function().map_err(|e| format!("{e:?}"))?;
+        let calls = self.calls.get(&id).copied().unwrap_or(0);
+        let inline = self.feat.emit.helper_inline;
+        if let Some(f) = self.b.module_mut().functions.last_mut() {
+            if !inline || inlined_copies_outweigh(calls, function_instructions(f), others) {
+                if let Some(def) = f.def.as_mut() {
+                    def.operands[0] = Operand::FunctionControl(spirv::FunctionControl::DONT_INLINE);
+                }
+            }
+        }
         Ok(())
     }
 
     /// `OpFunctionCall` of function `id` returning `ret`.
     pub(super) fn call(&mut self, ret: Word, id: Word, args: &[Word]) -> Word {
+        *self.calls.entry(id).or_insert(0) += 1;
         self.b.function_call(ret, None, id, args.to_vec()).expect("function call")
     }
 
@@ -2748,8 +2829,14 @@ impl<'a, 'p> Emitter<'a, 'p> {
             }
             FCmp::Ord | FCmp::Uno => {
                 let nx = self.ins(S::IsNan, tb, &[x]);
-                let ny = self.ins(S::IsNan, tb, &[y]);
-                let any = self.lor(nx, ny);
+                // A value compared with itself (the NaN test of one
+                // operand) is one test.
+                let any = if x == y {
+                    nx
+                } else {
+                    let ny = self.ins(S::IsNan, tb, &[y]);
+                    self.lor(nx, ny)
+                };
                 return if p == FCmp::Uno { any } else { self.lnot(any) };
             }
         };

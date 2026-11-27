@@ -26,6 +26,7 @@
 pub mod async_copy;
 pub mod guest;
 mod through;
+mod vram;
 pub(crate) mod written_words;
 
 use crate::device::{Buffer, GpuDevice, MemoryUse};
@@ -38,12 +39,25 @@ use std::sync::Arc;
 
 pub const CACHING_PAGE_BITS: u32 = 14;
 pub const CACHING_PAGE: u64 = 1 << CACHING_PAGE_BITS;
-/// Owner of each caching page over the 1 TiB guest space.
+/// Address bits the owner index covers: the tracked guest space
+/// ([`crate::memory::SPACE_BYTES`]), the AMM window at 8 TiB included. A
+/// buffer the index does not cover is never found again and would be made
+/// anew (allocated, and copied from its predecessor) at every use.
+const INDEX_ADDRESS_BITS: u32 = 44;
+const _: () = assert!(1u64 << INDEX_ADDRESS_BITS == crate::memory::SPACE_BYTES);
+/// Owner of each caching page of the tracked guest space.
 /// Per caching page: the start (key) and end of the buffer holding it
 /// ((0, 0): none).
-type BufferPageTable = crate::page_table::MultiLevelPageTable<(u64, u64), CACHING_PAGE_BITS, 40, 14>;
-/// Entries of the BDA page table (1 TiB / 16 KiB).
-pub const BDA_PAGE_COUNT: u64 = 1 << (40 - CACHING_PAGE_BITS);
+type BufferPageTable = crate::page_table::MultiLevelPageTable<(u64, u64), CACHING_PAGE_BITS, INDEX_ADDRESS_BITS, 18>;
+/// Pages of the low range of the BDA page table (1 TiB / 16 KiB): there
+/// an entry's index is its page number.
+pub const BDA_PAGE_COUNT: u64 = ps5shader::resources::paging::LOW_PAGES;
+/// Entries of the BDA page table: the low range, the window of automatic
+/// memory, and the entry of every other address
+/// ([`ps5shader::resources::paging`]).
+pub const BDA_ENTRY_COUNT: u64 = ps5shader::resources::paging::ENTRY_COUNT;
+const _: () = assert!(ps5shader::resources::paging::PAGE_BITS == CACHING_PAGE_BITS);
+const _: () = assert!(ps5shader::resources::paging::WINDOW_BASE + ps5shader::resources::paging::WINDOW_BYTES <= crate::memory::SPACE_BYTES);
 const STAGING_BYTES: u64 = 64 << 20;
 /// Merge score above which a growing range is a stream, and the room
 /// (128 caching pages) a stream merge reserves ahead of it.
@@ -1150,6 +1164,15 @@ impl BufferCache {
             None if leap => 0,
             None => old.iter().map(|k| self.buffers[k].stream_score + 1).sum(),
         };
+        if end - start >= 64 << 20 && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "ps5gpu: buffer {start:#x}+{:#x} for {addr:#x}+{size:#x} (merges {} buffer(s) of {} MiB, leap {leap}, tick {})",
+                end - start,
+                old.len(),
+                old.iter().map(|k| self.buffers[k].size).sum::<u64>() >> 20,
+                sched.current_tick()
+            );
+        }
         let buf = Buffer::new(&self.dev, end - start, BUFFER_USAGE, MemoryUse::Device)?;
         let cb = sched.cmd();
         if !old.is_empty() {
@@ -2842,29 +2865,31 @@ impl BufferCache {
         if owed && !merge {
             sched.full_barrier();
         }
-        let first = addr >> CACHING_PAGE_BITS;
-        // The table covers the low 1 TiB; buffers above it (guest stacks
-        // and TLS high in the address space) have no entries. Writing them
-        // landed past the table and faulted the GPU.
-        if first >= BDA_PAGE_COUNT {
+        // The table covers the low 1 TiB and the window of automatic
+        // memory; a buffer outside both (guest stacks and TLS high in the
+        // address space) has no entries: every address there reads the
+        // table's zero entry.
+        let runs: Vec<(u64, u64, u64)> = ps5shader::resources::paging::entry_runs(addr, size).collect();
+        if runs.is_empty() {
             if owed && merge {
                 sched.full_barrier();
             }
             return;
         }
-        let count = (size >> CACHING_PAGE_BITS).min(BDA_PAGE_COUNT - first);
-        let entries: Vec<u64> = (0..count).map(|i| if device_address == 0 { 0 } else { device_address + (i << CACHING_PAGE_BITS) }).collect();
-        let bytes: Vec<u8> = entries.iter().flat_map(|e| e.to_le_bytes()).collect();
         let table_buf = table.buffer;
         let cb = sched.cmd();
-        let mut done = 0usize;
-        while done < bytes.len() {
-            let chunk = (bytes.len() - done).min(65536);
-            // SAFETY: recording buffer; vkCmdUpdateBuffer takes at most 64 KiB.
-            unsafe {
-                self.dev.device.cmd_update_buffer(cb, table_buf, first * 8 + done as u64, &bytes[done..done + chunk]);
+        for (first, from, count) in runs {
+            let entries = (0..count).map(|i| if device_address == 0 { 0 } else { device_address + (from - addr) + (i << CACHING_PAGE_BITS) });
+            let bytes: Vec<u8> = entries.flat_map(|e| e.to_le_bytes()).collect();
+            let mut done = 0usize;
+            while done < bytes.len() {
+                let chunk = (bytes.len() - done).min(65536);
+                // SAFETY: recording buffer; vkCmdUpdateBuffer takes at most 64 KiB.
+                unsafe {
+                    self.dev.device.cmd_update_buffer(cb, table_buf, first * 8 + done as u64, &bytes[done..done + chunk]);
+                }
+                done += chunk;
             }
-            done += chunk;
         }
         sched.full_barrier();
     }
@@ -2873,7 +2898,7 @@ impl BufferCache {
     /// table buffer and its device address.
     pub fn bda_page_table(&mut self, sched: &mut Scheduler) -> Result<(vk::Buffer, u64), vk::Result> {
         if self.bda.is_none() {
-            let table = Buffer::new(&self.dev, BDA_PAGE_COUNT * 8, BUFFER_USAGE, MemoryUse::Device)?;
+            let table = Buffer::new(&self.dev, BDA_ENTRY_COUNT * 8, BUFFER_USAGE, MemoryUse::Device)?;
             let cb = sched.cmd();
             // SAFETY: recording buffer.
             unsafe { self.dev.device.cmd_fill_buffer(cb, table.buffer, 0, vk::WHOLE_SIZE, 0) };

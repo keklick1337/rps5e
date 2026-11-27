@@ -458,7 +458,12 @@ fn public_port_lifecycle() {
     ctx.set(CpuRegister::Rdi, h as u64);
     ctx.set(CpuRegister::Rsi, base);
     assert_eq!(cb_get_port_state(&mut ctx), 0);
-    assert_eq!(&ctx.read_bytes(base, 6).unwrap(), &[1, 0, 2, 0, 127, 0]);
+    // A main port reports no volume (-1); only a pad speaker port does.
+    assert_eq!(&ctx.read_bytes(base, 6).unwrap(), &[1, 0, 2, 0, 0xFF, 0xFF]);
+    assert_eq!(port_state_volume(PORT_TYPE_PADSPK), 127);
+    for t in [PORT_TYPE_MAIN, PORT_TYPE_BGM, PORT_TYPE_VOICE, PORT_TYPE_PERSONAL, PORT_TYPE_AUX, PORT_TYPE_VIBRATION] {
+        assert_eq!(port_state_volume(t), -1, "port type {t}");
+    }
     ctx.write_u32(base + 0x100, 16384);
     ctx.set(CpuRegister::Rsi, 1);
     ctx.set(CpuRegister::Rdx, base + 0x100);
@@ -740,10 +745,12 @@ fn ex_ports_and_monitor_info() {
     assert_eq!(call(&mut ctx, cb_ex_configure_output, &[0, 0, 0, 4, 0]), ERROR_NOT_IMPLEMENTED);
     assert_eq!(call(&mut ctx, cb_ex_configure_output, &[0, 1, 0, 1, 0]), ERROR_NOT_IMPLEMENTED);
 
-    // System state: zero loudness and reserved words, exactly 32 bytes.
+    // System state: the minimum loudness (no measurement runs) and zero
+    // reserved words, exactly 32 bytes.
     ctx.write_bytes(base + 0x2000, &[0xEE; 0x40]);
     assert_eq!(call(&mut ctx, cb_get_system_state, &[base + 0x2000]), 0);
-    assert!(ctx.read_bytes(base + 0x2000, 0x20).unwrap().iter().all(|&b| b == 0));
+    assert_eq!(ctx.read_u32(base + 0x2000).map(f32::from_bits), Some(-70.0));
+    assert!(ctx.read_bytes(base + 0x2004, 0x1C).unwrap().iter().all(|&b| b == 0));
     assert_eq!(ctx.read_bytes(base + 0x2020, 1).unwrap(), [0xEE]);
     assert_eq!(call(&mut ctx, cb_get_system_state, &[0]), AUDIO_OUT_ERROR_INVALID_POINTER);
 

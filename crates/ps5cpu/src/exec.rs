@@ -870,9 +870,12 @@ fn try_fault_hook(signum: crate::ctx::c_int, info: *mut crate::ctx::siginfo_t, u
     // SAFETY: the value was stored from a `FaultHook`.
     let hook: FaultHook = unsafe { std::mem::transmute::<usize, FaultHook>(raw) };
     // SAFETY: kernel-provided signal context.
-    ps5vm::fault_site::set(unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 });
+    let rip = unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 };
+    ps5vm::fault_site::set(rip);
     // Page-fault error code bit 1: the access was a write.
+    let slot = ps5vm::fault_site::enter(rip, addr, err & 2 != 0);
     let resolved = hook(addr, err & 2 != 0);
+    ps5vm::fault_site::leave(slot);
     if resolved {
         HOOK_RESOLVED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }
@@ -894,8 +897,11 @@ fn try_write_protect_hook(info: *mut crate::ctx::siginfo_t, uc: *mut crate::ctx:
     // SAFETY: the value was stored from a `WriteProtectHook`.
     let hook: WriteProtectHook = unsafe { std::mem::transmute::<usize, WriteProtectHook>(raw) };
     // SAFETY: kernel-provided signal context.
-    ps5vm::fault_site::set(unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 });
+    let rip = unsafe { (*uc).uc_mcontext.gregs[crate::ctx::REG_RIP as usize] as u64 };
+    ps5vm::fault_site::set(rip);
+    let slot = ps5vm::fault_site::enter(rip, addr, true);
     let resolved = hook(addr);
+    ps5vm::fault_site::leave(slot);
     if resolved {
         HOOK_RESOLVED_FAULTS.fetch_add(1, Ordering::Relaxed);
     }
@@ -937,6 +943,9 @@ pub(crate) extern "C" fn guest_signal_handler(signum: crate::ctx::c_int, info: *
         if try_fault_hook(signum, info, uc) {
             return;
         }
+        if signum == crate::ctx::SIGILL {
+            host_illegal_instruction(signum, gregs(uc));
+        }
         host_fault(signum);
         return;
     }
@@ -951,6 +960,14 @@ pub(crate) extern "C" fn guest_signal_handler(signum: crate::ctx::c_int, info: *
     }
     let mut args = HandlerArgs { signum, info, uc };
     unsafe { ps5cpu_call_on_stack(&mut args as *mut _ as *mut crate::ctx::c_void, handler_body, stack) };
+}
+
+/// An illegal instruction in host code that nothing emulates: a library
+/// aborted (a driver's compiler in its fatal-error handler). Report it and
+/// end the process ([`crate::host_ill`]).
+fn host_illegal_instruction(signum: crate::ctx::c_int, g: &[crate::ctx::greg_t; 23]) -> ! {
+    use crate::ctx::{REG_RDI, REG_RDX, REG_RIP, REG_RSI};
+    crate::host_ill::report_and_exit(signum, g[REG_RIP as usize] as u64, g[REG_RDI as usize] as u64, g[REG_RSI as usize] as u64, g[REG_RDX as usize] as u64)
 }
 
 /// Restore the default action so returning re-raises the fault (core dump).
@@ -1009,6 +1026,9 @@ extern "sysv64" fn handler_body(arg: *mut crate::ctx::c_void) {
     if rip >= 0x10000 && guest_code_owner(rip).is_none() && !is_guest_stub(rip) {
         // The fault happened in host code reached from guest context
         // (an HLE callback): that is an emulator bug, not a guest crash.
+        if a.signum == crate::ctx::SIGILL {
+            host_illegal_instruction(a.signum, g);
+        }
         log::error!("[exec] host fault signal {} at rip={rip:#x} addr={fault:#x}", a.signum);
         host_fault(a.signum);
         return;

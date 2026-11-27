@@ -885,7 +885,7 @@ pub fn translate_uncached(compiler: &dyn ShaderCompiler, key: u64, src: &ModuleS
 /// The inputs of the module of `src`, one `name = value` line per field
 /// (`shader-cache info`: what two permutations of a program differ in).
 pub fn request_fields(src: &ModuleSource) -> Result<Vec<String>, CompileError> {
-    with_request(src, |_, mesh, specialization, r| {
+    with_request_as(src, true, |_, mesh, specialization, r| {
         let mut out = vec![format!("mesh = {mesh:?}")];
         out.extend(specialization.buffers.iter().enumerate().map(|(i, b)| format!("specialization.buffer[{i}] = {b:?}")));
         out.extend(specialization.images.iter().enumerate().map(|(i, b)| format!("specialization.image[{i}] = {b:?}")));
@@ -961,10 +961,79 @@ pub fn request_fields(src: &ModuleSource) -> Result<Vec<String>, CompileError> {
     })
 }
 
+/// How the program of `src` uses each buffer and image binding, one
+/// `name = uses` line per resource, named as [`request_fields`] names the
+/// specialization of that resource (`shader-cache info`: is a binding
+/// whose descriptor fields differ between permutations accessed at all,
+/// and how).
+pub fn resource_uses(src: &ModuleSource) -> Result<Vec<String>, CompileError> {
+    with_request_as(src, true, |_, _, _, r| {
+        let info = &r.resources.info;
+        let flags = |set: &[(&str, bool)]| set.iter().filter(|(_, on)| *on).map(|(n, _)| *n).collect::<Vec<_>>().join(" ");
+        let mut out: Vec<String> = info
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let uses = flags(&[
+                    ("read", b.read),
+                    ("written", b.written),
+                    ("atomic", b.atomic),
+                    ("formatted", b.formatted),
+                    ("scalar", b.scalar),
+                    ("constant-offsets", b.constant_offsets),
+                    ("image-alias", b.image_alias != ps5shader::resources::NO_INDEX),
+                    ("run-time stride", b.runtime_stride),
+                ]);
+                format!("specialization.buffer[{i}] = {uses}, {} bytes, first use at {:#x}", b.max_byte_extent, b.first_use_pc)
+            })
+            .collect();
+        out.extend(info.images.iter().enumerate().map(|(i, m)| {
+            let uses = flags(&[("read", m.read), ("written", m.written), ("atomic", m.atomic), ("fetched", m.fetched), ("packed", m.packed), ("bindless", m.bindless)]);
+            format!("specialization.image[{i}] = {:?} {uses}, first use at {:#x}", m.resource_class, m.first_use_pc)
+        }));
+        out
+    })
+}
+
 /// Decode the request of `src` (the program decoded and planned from its
 /// code image) and hand it to `f`.
 fn with_request<R>(
     src: &ModuleSource,
+    f: impl FnOnce(ShaderStage, Option<MeshConfig>, &ResourceSpecialization, &ShaderCompileRequest<'_>) -> R,
+) -> Result<R, CompileError> {
+    with_request_as(src, false, f)
+}
+
+/// The specialization today's plan makes of the dispatch a recorded
+/// `specialization` came from, as far as the record tells: a buffer whose
+/// stride fields the plan reads at run time has the run-time
+/// specialization whatever stride an earlier planner recorded for it (a
+/// recorded zero stride may also have been a zeroed descriptor, which
+/// keeps its own). None: the record is already one of this plan's.
+fn current_specialization(plan: &ShaderResourcePlan, specialization: &ResourceSpecialization) -> Option<ResourceSpecialization> {
+    use ps5shader::resources::RUNTIME_STRIDE;
+    let stale = |(b, s): (&ps5shader::resources::BufferResource, &BufferSpecialization)| b.runtime_stride && s.packed_stride != RUNTIME_STRIDE;
+    if !plan.info.buffers.iter().zip(&specialization.buffers).any(stale) {
+        return None;
+    }
+    let mut current = specialization.clone();
+    for (b, s) in plan.info.buffers.iter().zip(&mut current.buffers) {
+        if b.runtime_stride {
+            s.packed_stride = RUNTIME_STRIDE;
+        }
+    }
+    Some(current)
+}
+
+/// [`with_request`]; `describing`: a specialization recorded by an
+/// earlier planner that this plan does not make is applied as the plan
+/// makes it today ([`current_specialization`]) instead of refused, and `f`
+/// still gets the recorded one (`shader-cache info` describes such
+/// records; nothing is translated from them).
+fn with_request_as<R>(
+    src: &ModuleSource,
+    describing: bool,
     f: impl FnOnce(ShaderStage, Option<MeshConfig>, &ResourceSpecialization, &ShaderCompileRequest<'_>) -> R,
 ) -> Result<R, CompileError> {
     let p = &*src.program;
@@ -979,7 +1048,8 @@ fn with_request<R>(
     let specialization = get_specialization(&mut r).ok_or_else(|| failed("specialization"))?;
     let in_guest_memory = r.b().ok_or_else(|| failed("resources"))?;
     let layout = get_layout(&mut r, version).ok_or_else(|| failed("layout"))?;
-    let mut resources = apply_specialization(&plan, &specialization).map_err(|e| CompileError::Failed(format!("specialize: {e}")))?;
+    let applied = if describing { current_specialization(&plan, &specialization) } else { None };
+    let mut resources = apply_specialization(&plan, applied.as_ref().unwrap_or(&specialization)).map_err(|e| CompileError::Failed(format!("specialize: {e}")))?;
     resources.info.buffers_in_guest_memory = in_guest_memory;
     let mut request = ShaderCompileRequest::new(&plan, resources, layout);
     request.wave_size = p.wave_size;
@@ -988,6 +1058,27 @@ fn with_request<R>(
         return Err(failed("trailing words"));
     }
     Ok(f(stage, mesh, &specialization, &request))
+}
+
+/// The request today's planner records for the dispatch `src` was
+/// recorded from ([`current_specialization`]), when that is another one:
+/// the record is of an earlier planner and no dispatch asks for its module
+/// any more. None: the record is current (`shader-cache info` counts the
+/// modules a program would have in a list recorded today).
+pub fn current_request(src: &ModuleSource) -> Result<Option<Arc<[u32]>>, CompileError> {
+    let Some(current) = with_request_as(src, true, |_, _, specialization, r| current_specialization(r.plan, specialization))? else { return Ok(None) };
+    // The recorded words with the buffers' stride words replaced (the
+    // specialization follows the version and the mesh configuration: the
+    // base buffer count, the buffer count, three words per buffer).
+    let mut r = Reader(&src.request);
+    r.u().ok_or_else(|| failed("request version"))?;
+    get_mesh(&mut r).ok_or_else(|| failed("mesh"))?;
+    let at = src.request.len() - r.0.len() + 2;
+    let mut words = src.request.to_vec();
+    for (i, b) in current.buffers.iter().enumerate() {
+        *words.get_mut(at + 3 * i).ok_or_else(|| failed("specialization"))? = b.packed_stride;
+    }
+    Ok(Some(words.into()))
 }
 
 #[cfg(test)]
@@ -1159,6 +1250,68 @@ mod tests {
         assert_eq!(&list.modules[0].spirv[..], &direct.spirv[..]);
         drop(list);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record whose specialization holds a stride for a buffer today's
+    /// plan reads the stride of at run time (made by an earlier planner
+    /// from a V# the program builds from a pointer) is not translated
+    /// again: no dispatch asks for its module. `shader-cache info` still
+    /// describes it, and counts it as the one module today's planner
+    /// records for such dispatches.
+    #[test]
+    fn records_of_computed_strides_are_not_translated_again() {
+        use ps5shader::resources::RUNTIME_STRIDE;
+        use ps5shader::testing::asm as sa;
+        // s[16:19] = { pointer at s[0:1] + 72 with stride 16 OR-ed in,
+        // count at + 128, a constant }; buffer_load_dword v1, v0, idxen.
+        let mut code = Vec::new();
+        code.extend(sa::smem(0x01, 16, 0, 72, sa::NULL));
+        code.extend(sa::smem(0x00, 18, 0, 128, sa::NULL));
+        code.extend([sa::s_mov_b32(19, sa::LITERAL), 0x0001_6204, 0xbf8c_c07f, 0xbe91_1d94]);
+        code.extend(sa::mubuf(sa::OP_BUFFER_LOAD_DWORD, 1, 0, 4, sa::inline_u32(0), 0, true, false, false));
+        code.push(sa::S_ENDPGM);
+        let address = 0x50_0a00_0000u64;
+        let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let program = Arc::new(ProgramSource {
+            address,
+            continuation: 0,
+            stage: ShaderStage::Compute as u8,
+            user_data_base: 0,
+            user_data_count: 2,
+            wave_size: 64,
+            plan_hash: 0x5678,
+            guest_plan: false,
+            image: Arc::new(CodeImage::from_bytes(address, &bytes)),
+        });
+        let decoded = super::super::frontend::decode_code(&*program.image, address, 0).expect("decodes");
+        let user = BindingLayout::collect_user_data_registers(&decoded, 0, 2);
+        let plan = ShaderResourcePlan::extract(decoded, ShaderStage::Compute, program.plan_hash, 0, 2, None, 64).expect("plans");
+        assert!(plan.info.buffers[0].runtime_stride);
+        let mut spec = ResourceSpecialization::default_for(&plan.info);
+        spec.buffers[0].packed_stride = RUNTIME_STRIDE;
+        let resources = apply_specialization(&plan, &spec).expect("specializes");
+        let flat = ShaderCompileRequest::requires_flattened_table(&plan, &resources);
+        let layout = BindingLayout::allocate(&resources.info, user, false, flat, false, 0, false, false).expect("lays out");
+        let mut r = ShaderCompileRequest::new(&plan, resources, layout);
+        r.wave_size = 64;
+        r.local_size = [64, 1, 1];
+        let source = |spec: &ResourceSpecialization| ModuleSource { program: program.clone(), request: encode_request(&r, spec, None), reads: Arc::new(CodeImage::from_words(Vec::new())) };
+        let current = source(&spec);
+        let compiler = crate::shader::SpirvCompiler::new(features(), None);
+        retranslate(&compiler, 7, &current).expect("the run-time specialization translates");
+        assert_eq!(current_request(&current).unwrap(), None);
+        // The strides an earlier planner recorded for the same program.
+        for stride in [16u32, 0x3f5, 0x7fff, 0x1000040] {
+            let mut old = spec.clone();
+            old.buffers[0].packed_stride = stride;
+            let old = source(&old);
+            let Err(CompileError::Failed(why)) = retranslate(&compiler, 8, &old) else { panic!("stride {stride:#x} translated again") };
+            assert!(why.contains("does not match the plan"), "{why}");
+            assert_eq!(current_request(&old).unwrap().as_deref(), Some(&current.request[..]));
+            let fields = request_fields(&old).expect("described");
+            assert!(fields.iter().any(|f| f.starts_with("specialization.buffer[0]") && f.contains(&format!("packed_stride: {stride},"))), "{fields:?}");
+            assert!(resource_uses(&old).unwrap()[0].contains("run-time stride"));
+        }
     }
 
     /// Every stage option survives the encoding.

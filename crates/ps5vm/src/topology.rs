@@ -282,6 +282,37 @@ pub fn pin_current_thread_to_fast_cores_except_recorder(what: &str) -> bool {
     ok
 }
 
+/// Run `f` with the calling thread restricted to the fast cores it may
+/// run on ([`fast_cpus`]: the largest-L3 complex of an asymmetric
+/// processor, the P-cores of a hybrid one), then give the thread its
+/// former CPUs back. Work whose working set fits the large cache only
+/// (the GPU driver compiling a very large shader) runs about twice as fast
+/// there. `f` runs unrestricted on a symmetric processor, where the
+/// thread's CPUs cannot be read (Windows) or when none of them is fast.
+pub fn on_fast_cpus<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(Vec<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            pin_current_thread(&self.0);
+        }
+    }
+    let Some((fast, _)) = fast_cpus() else { return f() };
+    let Some(before) = current_cpus() else { return f() };
+    let Some(allowed) = fast_subset(&before, fast) else { return f() };
+    if !pin_current_thread(&allowed) {
+        return f();
+    }
+    let _restore = Restore(before);
+    f()
+}
+
+/// The CPUs of `allowed` that are `fast`, when that narrows the set and
+/// leaves some.
+pub fn fast_subset(allowed: &[usize], fast: &[usize]) -> Option<Vec<usize>> {
+    let subset: Vec<usize> = allowed.iter().copied().filter(|c| fast.contains(c)).collect();
+    (!subset.is_empty() && subset.len() < allowed.len()).then_some(subset)
+}
+
 /// Restrict the calling thread to `cpus`.
 fn pin_current_thread(cpus: &[usize]) -> bool {
     #[cfg(windows)]
@@ -307,6 +338,19 @@ fn pin_current_thread(cpus: &[usize]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_subset_narrows_or_declines() {
+        // A thread on both complexes of a 16-core processor with a stacked
+        // cache on CPUs 0-7 and 16-23 (CPU 3 and its sibling reserved).
+        let allowed: Vec<usize> = (0..32).filter(|c| ![3, 19].contains(c)).collect();
+        let fast: Vec<usize> = (0..8).chain(16..24).collect();
+        let subset = fast_subset(&allowed, &fast).unwrap();
+        assert_eq!(subset.len(), 14);
+        assert!(subset.iter().all(|c| fast.contains(c) && allowed.contains(c)));
+        assert_eq!(fast_subset(&subset, &fast), None, "already on the fast cores");
+        assert_eq!(fast_subset(&[8, 9, 10], &fast), None, "no fast core allowed");
+    }
 
     #[test]
     fn cpu_lists_and_sizes_parse() {

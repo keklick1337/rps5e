@@ -156,6 +156,19 @@ fn rewind_patch_set_rewind_state(ctx: &mut CpuContext) -> HleResult {
     status(mem::w32(body, if valid { b | (1 << 31) } else { b & !(1 << 31) }))
 }
 
+/// `sceAgcAcquireMemSetEngine(packet, u8 engine)`: bit 0 of `engine`
+/// becomes bit 31 of the control dword of an ACQUIRE_MEM packet; the other
+/// control bits stay. Only the opcode is inspected.
+fn acquire_mem_set_engine(ctx: &mut CpuContext) -> HleResult {
+    let (packet, engine) = (arg(ctx, 0), arg(ctx, 1) as u32 & 1);
+    match identity(packet) {
+        Some((o, _, _)) if o == op::ACQUIRE_MEM => {}
+        Some(_) => return ERR_INVALID_PACKET,
+        None => return if packet == 0 { ERR_INVALID_PACKET } else { ERR_MEMORY_FAULT },
+    }
+    status(patch_bits(packet + 4, 1 << 31, engine << 31))
+}
+
 /// `sceAgc[Async]CondExecPatchSetCommandAddress(packet, predicateAddr)`:
 /// only the opcode is checked; the low two bits of dword 1 are kept and the
 /// whole high address dword is written (decrypted libSceAgc).
@@ -549,6 +562,7 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("K2mciNVxUCE", "sceAgcSetNop", LIB_AGC, set_nop),
     ("ziVA3whp3p4", "sceAgcRewindPatchSetRewindState", LIB_AGC, rewind_patch_set_rewind_state),
     ("eWaWyFegzgQ", "sceAgcAsyncRewindPatchSetRewindState", LIB_AGC, rewind_patch_set_rewind_state),
+    ("W0WEyog0f74", "sceAgcAcquireMemSetEngine", LIB_AGC, acquire_mem_set_engine),
     ("YWTKOju587o", "sceAgcCondExecPatchSetCommandAddress", LIB_AGC, cond_exec_patch_set_command_address),
     ("3ZWa3AoyWZQ", "sceAgcAsyncCondExecPatchSetCommandAddress", LIB_AGC, cond_exec_patch_set_command_address),
     ("ORWsxIbk4TE", "sceAgcCondExecPatchSetEnd", LIB_AGC, cond_exec_patch_set_end),

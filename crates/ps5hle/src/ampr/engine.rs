@@ -53,6 +53,9 @@ pub const APP_COUNTERS: u8 = 128;
 
 static COUNTERS: [AtomicU32; COUNTER_COUNT] = [const { AtomicU32::new(0) }; COUNTER_COUNT];
 
+/// Failed commands so far (the first ones are logged).
+static FAILED_COMMANDS: AtomicU64 = AtomicU64::new(0);
+
 pub fn counter(index: u8) -> u32 {
     COUNTERS[index as usize].load(Ordering::Acquire)
 }
@@ -187,13 +190,13 @@ impl CommandEngine {
                 };
                 continue;
             };
-            let (command, result_addr, id, last) = {
+            let (command, result_addr, id, last, left) = {
                 let s = queues[p].front_mut().unwrap();
                 let c = s.commands.get(s.cursor).copied();
                 if c.is_some() {
                     s.cursor += 1;
                 }
-                (c, s.result, s.id, s.cursor == s.commands.len())
+                (c, s.result, s.id, s.cursor == s.commands.len(), s.commands.len() - s.cursor)
             };
             drop(queues);
             let (mut result, mut error_offset) = (OK, 0u32);
@@ -201,6 +204,18 @@ impl CommandEngine {
                 result = execute(&c);
                 if result != OK {
                     error_offset = c.record_offset as u32;
+                    // The submission ends here: what follows the failed
+                    // command (the title's completion writes among it) does
+                    // not run.
+                    if FAILED_COMMANDS.fetch_add(1, Ordering::Relaxed) < 32 {
+                        log::warn!(
+                            "[ampr] {} command at {:#x} failed with {:#x}: {:x?}; {left} command(s) after it dropped (priority {p}, result at {result_addr:#x})",
+                            self.name,
+                            c.record_offset,
+                            result as u32,
+                            c.data
+                        );
+                    }
                 }
             }
             let complete = result != OK || last;

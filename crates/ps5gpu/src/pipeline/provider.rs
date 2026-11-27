@@ -700,6 +700,62 @@ struct Ahead {
     /// The module the last lookahead module request is still compiling
     /// (a deferred dispatch is tried again only once it is not pending).
     last_module: u64,
+    /// Modules and compute pipelines the lookahead queued that are still
+    /// compiling and that no draw or dispatch has asked for: guesses when
+    /// they finish ([`Guesses`]).
+    guess_modules: crate::fxhash::HashSet<u64>,
+    guess_pipelines: crate::fxhash::HashSet<ComputeKey>,
+}
+
+/// `RPS5E_LIST_GUESSES=1`: every module and pipeline the compile lookahead
+/// makes is entered into the prewarm list when it is finished, whether a
+/// draw or dispatch ever asks for it or not (see [`Guesses`]).
+fn list_guesses_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_LIST_GUESSES").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("on")))
+}
+
+/// What the compile lookahead made that no draw or dispatch has asked for
+/// yet. The lookahead resolves upcoming dispatches from guest memory as it
+/// is when it scans, so a resource table the game fills later gives it
+/// leftover descriptors: a module of such a guess is one no dispatch ever
+/// runs. A guess serves the session like any other module or pipeline (and
+/// its module stays in the module cache on disk), but the prewarm list,
+/// which every later start builds whole, takes it only when a draw or
+/// dispatch first asks for exactly it: the records kept here are entered
+/// then, as they would have been had the dispatch started the compile.
+#[derive(Default)]
+struct Guesses {
+    /// By the key the list names the module with.
+    modules: crate::fxhash::HashMap<u64, GuessedModule>,
+    /// The list key of a module found under another key as well (the
+    /// relocatable key of a translation that proved address dependent).
+    aliases: crate::fxhash::HashMap<u64, u64>,
+    compute: crate::fxhash::HashMap<ComputeKey, Option<super::prewarm::ComputeRecord>>,
+    counts: GuessCounts,
+}
+
+/// A module of [`Guesses`]: its list record (None: listed already, with
+/// `RPS5E_LIST_GUESSES=1`, or no list is kept).
+struct GuessedModule {
+    alias: Option<u64>,
+    record: Option<(u8, Vec<u32>, ShaderReflection, Option<Arc<super::sources::ModuleSource>>)>,
+}
+
+/// Modules and compute pipelines made for lookahead guesses, and those of
+/// them a draw or dispatch asked for later (`guesses=` in the summary).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuessCounts {
+    pub modules: u64,
+    pub modules_used: u64,
+    pub pipelines: u64,
+    pub pipelines_used: u64,
+}
+
+impl Guesses {
+    fn holds_module(&self, key: u64) -> bool {
+        !self.modules.is_empty() && (self.modules.contains_key(&key) || self.aliases.contains_key(&key))
+    }
 }
 
 /// Outcomes of [`ShaderPipelines::compile_dispatch_ahead`].
@@ -845,7 +901,31 @@ impl std::fmt::Display for PrewarmSummary {
 /// A module of `words`.
 fn create_shader_module(dev: &GpuDevice, words: &[u32]) -> Result<vk::ShaderModule, vk::Result> {
     // SAFETY: valid SPIR-V words (the compiler's contract).
-    unsafe { dev.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None) }
+    let module = unsafe { dev.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None) }?;
+    note_module_words(module, words);
+    Ok(module)
+}
+
+/// Modules larger than this are not kept by [`note_module_words`].
+const NOTED_MODULE_WORDS: usize = 200_000;
+
+/// With `RPS5E_COMPILE_NOTES`: the SPIR-V of a module is written to
+/// `<directory>/module-<handle>.spv` when the module is made (modules up to
+/// [`NOTED_MODULE_WORDS`] words), so the module a thread's note names can be
+/// given to other tools after the driver took the process down.
+fn note_module_words(module: vk::ShaderModule, words: &[u32]) {
+    use ash::vk::Handle;
+    let Some(dir) = compile_notes_dir() else { return };
+    if words.len() > NOTED_MODULE_WORDS {
+        return;
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let _ = std::fs::write(dir.join(format!("module-{:x}.spv", module.as_raw())), bytes);
+}
+
+fn compile_notes_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("RPS5E_COMPILE_NOTES").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)).as_deref()
 }
 
 /// Descriptor writes of one draw (all stages), with owned infos. Kept by
@@ -1738,6 +1818,8 @@ pub struct ShaderPipelines {
     /// missing module, pipeline, layout or sampler fails the draw with
     /// [`Failure::Bail`] (the committing thread records it).
     speculative: bool,
+    /// Lookahead guesses are listed when they finish ([`list_guesses_env`]).
+    list_guesses: bool,
     /// The compile lookahead (`lookahead`): the page tracker the stages of
     /// upcoming dispatches are prepared against, the command position and
     /// finished-job count of the last scan, the dispatches handled at that
@@ -1978,6 +2060,8 @@ pub(crate) struct PipelineTables {
     /// Module keys and program addresses of the list as loaded.
     prewarm_listed: Shared<crate::fxhash::HashSet<u64>>,
     prewarm_listed_programs: Shared<crate::fxhash::HashSet<u64>>,
+    /// What the compile lookahead made that nothing asked for yet.
+    guesses: Shared<Guesses>,
     cache_path: Shared<Option<std::path::PathBuf>>,
     /// Set-layout bindings and push stages of each pipeline layout made.
     layout_descs: Shared<HashMap<vk::PipelineLayout, (Vec<super::descriptors::BindingDesc>, u32)>>,
@@ -2644,6 +2728,7 @@ impl ShaderPipelines {
             prewarm_counts: Shared::new(Default::default()),
             prewarm_listed: Shared::new(Default::default()),
             prewarm_listed_programs: Shared::new(Default::default()),
+            guesses: Shared::new(Default::default()),
             cache_path: Shared::new(cache_path),
             layout_descs: Shared::new(HashMap::default()),
         });
@@ -2693,6 +2778,7 @@ impl ShaderPipelines {
             bail_why: None,
             swaps_seen,
             speculative,
+            list_guesses: list_guesses_env(),
             ahead: Ahead::default(),
             dev: dev.clone(),
             memory,
@@ -2867,8 +2953,7 @@ impl ShaderPipelines {
     // ------------------------------------------------------------------
 
     fn create_module(&self, words: &[u32]) -> Result<vk::ShaderModule, vk::Result> {
-        // SAFETY: valid SPIR-V words (the compiler's contract).
-        unsafe { self.dev.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None) }
+        create_shader_module(&self.dev, words)
     }
 
     /// The module of one permutation (compiled on first use, on a compile
@@ -2951,6 +3036,14 @@ impl ShaderPipelines {
                 key
             }
         };
+        if !self.ahead.queue_only && self.t.guesses.holds_module(key) {
+            // A lookahead guess a draw or dispatch asks for: listed now (by
+            // the committing thread: a slice thread leaves the draw to it).
+            if self.speculative {
+                return Err(self.bail(crate::slices::spec::Hole::Pipeline));
+            }
+            self.list_guessed_module(key);
+        }
         if let Some(entry) = self.t.modules.get(&key) {
             self.stats.module_hits += 1;
             return match entry {
@@ -3037,6 +3130,7 @@ impl ShaderPipelines {
         if self.t.pending_modules.w().insert(key) {
             if self.ahead.queue_only {
                 self.ahead.modules.insert(key);
+                self.ahead.guess_modules.insert(key);
                 if self.ahead.programs.len() < 1 << 16 {
                     self.ahead.programs.insert(p.address, key);
                 }
@@ -3053,8 +3147,10 @@ impl ShaderPipelines {
                 pool.submit_urgent(job, key);
             }
         } else if !self.ahead.queue_only {
-            // Queued by the prewarm list or the lookahead: needed now.
+            // Queued by the prewarm list or the lookahead: needed now (and
+            // no guess any more).
             pool.hurry(key);
+            self.ahead.guess_modules.remove(&key);
         }
         if self.ahead.queue_only {
             self.ahead.last_module = key;
@@ -3333,6 +3429,142 @@ impl ShaderPipelines {
         self.ahead.queue_only = false;
     }
 
+    /// A finished module for the prewarm list under `key` (`alias`: another
+    /// key requests find it under). One made for a lookahead guess nothing
+    /// asked for (`guess`) is kept in [`Guesses`] instead, until a draw or
+    /// dispatch asks for it ([`Self::list_guessed_module`]).
+    #[allow(clippy::too_many_arguments)]
+    fn note_module(&mut self, guess: bool, key: u64, alias: Option<u64>, stage: u8, spirv: Vec<u32>, reflection: ShaderReflection, source: Option<Arc<super::sources::ModuleSource>>) {
+        if !guess {
+            self.t.prewarm.w().add_module(key, stage, spirv, reflection, source);
+            return;
+        }
+        let record = if self.list_guesses || !self.t.prewarm.is_active() {
+            self.t.prewarm.w().add_module(key, stage, spirv, reflection, source);
+            None
+        } else {
+            Some((stage, spirv, reflection, source))
+        };
+        let g = self.t.guesses.w();
+        g.counts.modules += 1;
+        if let Some(a) = alias {
+            g.aliases.insert(a, key);
+        }
+        g.modules.insert(key, GuessedModule { alias, record });
+    }
+
+    /// A draw or dispatch asks for the guessed module found under `key`:
+    /// it enters the prewarm list.
+    fn list_guessed_module(&mut self, key: u64) {
+        let g = self.t.guesses.w();
+        let listed = g.aliases.remove(&key).unwrap_or(key);
+        let Some(m) = g.modules.remove(&listed) else { return };
+        if let Some(a) = m.alias {
+            g.aliases.remove(&a);
+        }
+        g.counts.modules_used += 1;
+        if let Some((stage, spirv, reflection, source)) = m.record {
+            self.t.prewarm.w().add_module(listed, stage, spirv, reflection, source);
+        }
+    }
+
+    /// The list record `r` of the finished compute pipeline `key`: entered
+    /// now, or kept in [`Guesses`] when the pipeline was made for a
+    /// lookahead guess (`guess`) and the list does not hold the record.
+    fn note_compute(&mut self, guess: bool, key: ComputeKey, r: super::prewarm::ComputeRecord) {
+        let active = self.t.prewarm.is_active();
+        if guess && !(active && self.t.prewarm.holds_compute(&r)) {
+            let g = self.t.guesses.w();
+            g.counts.pipelines += 1;
+            if active && !self.list_guesses {
+                g.compute.insert(key, Some(r));
+                return;
+            }
+            g.compute.insert(key, None);
+        }
+        if self.t.prewarm.w().add_compute(r) {
+            self.note_unlisted(key.cs, "compute");
+        }
+    }
+
+    /// A dispatch asks for the guessed compute pipeline `key`: its record
+    /// enters the prewarm list.
+    fn list_guessed_pipeline(&mut self, key: ComputeKey) {
+        let g = self.t.guesses.w();
+        let Some(record) = g.compute.remove(&key) else { return };
+        g.counts.pipelines_used += 1;
+        if let Some(r) = record {
+            if self.t.prewarm.w().add_compute(r) {
+                self.note_unlisted(key.cs, "compute");
+            }
+        }
+    }
+
+    /// `prewarm-list=[..] guesses=[..]` for the summary: the records the
+    /// list holds now, and what the lookahead's guesses came to.
+    fn guesses_text(&self) -> String {
+        let (l, c) = (&*self.t.prewarm, self.t.guesses.counts);
+        format!(
+            " prewarm-list=[modules {} graphics {} compute {}] guesses=[modules {} made {} used {} unlisted; pipelines {} made {} used {} unlisted{}]",
+            l.modules.len(),
+            l.graphics.len(),
+            l.compute.len(),
+            c.modules,
+            c.modules_used,
+            if self.list_guesses { 0 } else { c.modules - c.modules_used },
+            c.pipelines,
+            c.pipelines_used,
+            if self.list_guesses { 0 } else { c.pipelines - c.pipelines_used },
+            if self.list_guesses { "; all listed" } else { "" }
+        )
+    }
+
+    /// Queue the compiles of `dispatches` as the compile lookahead does
+    /// for the dispatches it finds ahead (their stages prepared against
+    /// `tracker`), and wait until every one of them is made.
+    #[cfg(test)]
+    pub(crate) fn guess_ahead(&mut self, tracker: Arc<crate::memory::tracker::GuestPageTracker>, dispatches: Vec<ResolvedDispatch>) {
+        self.load_prewarm();
+        self.ahead.tracker.get_or_insert(tracker);
+        self.compile_offered(dispatches);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            self.harvest();
+            if self.t.pool.as_ref().is_none_or(|p| p.in_flight() == 0) && self.ahead.deferred.is_empty() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the lookahead's compiles did not finish");
+            if let Some(pool) = &*self.t.pool {
+                pool.wait(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    /// [`Self::guess_ahead`] without the wait: the compiles stay queued.
+    #[cfg(test)]
+    pub(crate) fn queue_guesses(&mut self, tracker: Arc<crate::memory::tracker::GuestPageTracker>, dispatches: Vec<ResolvedDispatch>) {
+        self.load_prewarm();
+        self.ahead.tracker.get_or_insert(tracker);
+        self.compile_offered(dispatches);
+    }
+
+    /// The module keys and the compute pipeline count of the prewarm list.
+    #[cfg(test)]
+    pub(crate) fn listed(&self) -> (Vec<u64>, usize) {
+        (self.t.prewarm.modules.iter().map(|m| m.key).collect(), self.t.prewarm.compute.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guess_counts(&self) -> GuessCounts {
+        self.t.guesses.counts
+    }
+
+    /// `RPS5E_LIST_GUESSES` for this provider.
+    #[cfg(test)]
+    pub(crate) fn set_list_guesses(&mut self, on: bool) {
+        self.list_guesses = on;
+    }
+
     /// Enter a finished compile job into the caches.
     fn finish(&mut self, c: Compiled) {
         match c {
@@ -3353,6 +3585,7 @@ impl ShaderPipelines {
                     self.t.compile_times.w().module.add(module_ns);
                 }
                 let from_list = self.t.prewarm_translating.w().remove(&key);
+                let guess = self.ahead.guess_modules.remove(&key) && !from_list;
                 let entry = match result {
                     Ok((m, spirv)) if relocated.is_some_and(|r| !r.proven) => {
                         // Address dependent after all: the module serves the
@@ -3361,12 +3594,12 @@ impl ShaderPipelines {
                         let plain = relocated.map_or(key, |r| r.plain_key);
                         self.t.not_relocatable.w().insert(key);
                         self.t.relocated_plain.w().insert(key, plain);
-                        self.t.prewarm.w().add_module(plain, stage as u8, spirv, m.reflection.clone(), source);
+                        self.note_module(guess, plain, Some(key), stage as u8, spirv, m.reflection.clone(), source);
                         self.t.modules.w().insert(plain, Ok(m.clone()));
                         Ok(m)
                     }
                     Ok((m, spirv)) => {
-                        self.t.prewarm.w().add_module(key, stage as u8, spirv, m.reflection.clone(), source);
+                        self.note_module(guess, key, None, stage as u8, spirv, m.reflection.clone(), source);
                         if from_list {
                             self.t.prewarm_counts.w().translated += 1;
                         }
@@ -3457,14 +3690,13 @@ impl ShaderPipelines {
                     return;
                 }
                 self.t.pending_compute.w().remove(&key);
+                let guess = self.ahead.guess_pipelines.remove(&key);
                 match result {
                     Ok(p) => {
                         crate::perf::PIPELINE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.t.disk.w().note_created();
                         if let Some(r) = record {
-                            if self.t.prewarm.w().add_compute(r) {
-                                self.note_unlisted(key.cs, "compute");
-                            }
+                            self.note_compute(guess, key, r);
                         }
                         self.queue_rebuild(rebuild);
                         if let Some(old) = self.t.compute.w().insert(key, p) {
@@ -5667,6 +5899,13 @@ impl ShaderPipelines {
     /// The compute pipeline of `key` (dispatches wait for it: later work
     /// may depend on them).
     fn compute_pipeline(&mut self, key: ComputeKey, cs: &Arc<Module>) -> Result<vk::Pipeline, Failure> {
+        if !self.ahead.queue_only && !self.t.guesses.compute.is_empty() && self.t.guesses.compute.contains_key(&key) {
+            // A lookahead guess a dispatch asks for: listed now.
+            if self.speculative {
+                return Err(self.bail(crate::slices::spec::Hole::Pipeline));
+            }
+            self.list_guessed_pipeline(key);
+        }
         if !self.t.compute_variants.is_empty() && crate::backend::ab::release_fast("spill-variants") {
             if let Some(&p) = self.t.compute_variants.get(&key) {
                 self.stats.compute_hits += 1;
@@ -5692,6 +5931,7 @@ impl ShaderPipelines {
             Some(pool) => {
                 if self.t.pending_compute.w().insert(key) {
                     if self.ahead.queue_only {
+                        self.ahead.guess_pipelines.insert(key);
                         if self.ahead.pipelines_of.len() < 1 << 16 {
                             self.ahead.pipelines_of.entry(key.cs).or_default().push(key);
                         }
@@ -5721,6 +5961,7 @@ impl ShaderPipelines {
                     }
                 } else if !self.ahead.queue_only {
                     pool.hurry(hash_of(&key));
+                    self.ahead.guess_pipelines.remove(&key);
                 }
                 if self.ahead.queue_only {
                     return Err(Failure::Compiling);
@@ -7593,6 +7834,7 @@ impl ShaderPipelines {
         ranges: &[(u64, u64, bool, bool)],
     ) -> Result<DrawOutcome, Failure> {
         dispatch_hash_log(ctx, bound[0].prepared.program.address, d, direct, threads, ranges);
+        dispatch_range_state_log(ctx, bound[0].prepared.program.address, d, ranges);
         // An indirect dispatch with thread dimensions gets its thread limits
         // on the GPU, in a shader-data copy of its own.
         let thread_dims = indirect_thread_dimensions(d);
@@ -8187,7 +8429,7 @@ fn compute_job(
         build_pipeline(cache, fast, optimised, &what, &|cache, flags| create_compute_pipeline(dev, cache, key, cs, flags))
     }
     move || {
-        let (result, built) = build(&dev, cache, &key, &cs, fast, false);
+        let (result, built) = on_large_cache(cs.words, || build(&dev, cache, &key, &cs, fast, false));
         let mut rebuild = None;
         if built.tier == Tier::Fast && result.is_ok() && fast_pipelines_mode() != FastPipelines::Only {
             let (dev, cs) = (dev.clone(), cs.clone());
@@ -8197,7 +8439,7 @@ fn compute_job(
             }) as Rebuild);
         } else if let (Ok(p), Some((compiler, source))) = (&result, variant) {
             let spill = pipeline_spill(&dev, *p);
-            if spill.is_some_and(|s| s.local > SPILL_LOCAL_BYTES) {
+            if variant_worth_building(spill, cs.words, spill_variant_max_words()) {
                 rebuild = Some(Box::new(spill_variant_job(dev.clone(), cache, key, cs.clone(), compiler, source, spill.unwrap_or_default())) as Rebuild);
             }
         }
@@ -8228,6 +8470,61 @@ pub(crate) fn spill_variants_enabled() -> bool {
 /// again as its variant: private arrays of the translation need a few
 /// words (16-48 bytes in GTA V), spills more.
 const SPILL_LOCAL_BYTES: u64 = 64;
+
+/// `RPS5E_COMPILE_LARGE_CACHE=1` (opt-in): the compute pipeline of a
+/// module of [`LARGE_CACHE_WORDS`] words or more is built with its compile
+/// thread restricted to the processor's fast cores
+/// (`ps5vm::topology::on_fast_cpus`: the complex with the largest L3 where
+/// the complexes differ). The NVIDIA driver's compiler walks lists that
+/// span the whole program, and its time for a module of 0.9 M words is
+/// bound by cache misses: 14.3 s on a core with 32 MiB of L3, 8.1 s on one
+/// with 96 MiB. Opt-in: with many such builds at once the large cache is
+/// shared and the other complex idles.
+fn compile_large_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RPS5E_COMPILE_LARGE_CACHE").is_ok_and(|v| v == "1"))
+}
+
+/// Module size (SPIR-V words) from which [`compile_large_cache`] applies.
+const LARGE_CACHE_WORDS: usize = 300_000;
+
+/// Run the pipeline build `f` of a module of `words` SPIR-V words, on the
+/// large-cache cores when [`compile_large_cache`] asks for it.
+fn on_large_cache<R>(words: usize, f: impl FnOnce() -> R) -> R {
+    if compile_large_cache() && words >= LARGE_CACHE_WORDS {
+        ps5vm::topology::on_fast_cpus(f)
+    } else {
+        f()
+    }
+}
+
+/// `RPS5E_SPILL_VARIANT_WORDS=<n>`: the largest module (SPIR-V words)
+/// whose pipeline is built again as its spill variant; 0 lifts the limit.
+/// The variant of a program has nearly twice the code, the driver needs
+/// more than twice the time for it (a minute per program of 0.9 M words),
+/// and for programs this large it never spilled less: in GRAND THEFT AUTO
+/// VI's list none of 445 variants of modules over 700 000 words replaced
+/// its pipeline (15 of 62 between 400 000 and 700 000 words did, 356 of
+/// 368 between 50 000 and 100 000).
+fn spill_variant_max_words() -> usize {
+    static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORDS.get_or_init(|| match std::env::var("RPS5E_SPILL_VARIANT_WORDS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => SPILL_VARIANT_WORDS,
+    })
+}
+
+/// The default of [`spill_variant_max_words`].
+const SPILL_VARIANT_WORDS: usize = 700_000;
+
+/// Whether a compute pipeline with the statistics `spill`, built from a
+/// module of `words` SPIR-V words, is built again as its spill variant:
+/// it spills ([`SPILL_LOCAL_BYTES`]) and its module is not over
+/// `max_words`.
+fn variant_worth_building(spill: Option<Spill>, words: usize, max_words: usize) -> bool {
+    spill.is_some_and(|s| s.local > SPILL_LOCAL_BYTES) && words <= max_words
+}
 
 /// Salt of the module key of a spill variant (its own module cache entry).
 const SPILL_VARIANT_SALT: u64 = 0x5b11_1a7e_0f75_c0de;
@@ -8328,7 +8625,7 @@ fn spill_variant_job(
         let Ok(module) = create_shader_module(&dev, &c.spirv) else { return Compiled::Nothing };
         let variant = Module { module, reflection: c.reflection, address, words: c.spirv.len(), relocation: cs.relocation.clone() };
         let what = || format!("compute cs {address:#x} spill variant ({} words)", variant.words);
-        let (result, built) = build_pipeline(cache, false, true, &what, &|cache, flags| create_compute_pipeline(&dev, cache, &key, &variant, flags));
+        let (result, built) = on_large_cache(variant.words, || build_pipeline(cache, false, true, &what, &|cache, flags| create_compute_pipeline(&dev, cache, &key, &variant, flags)));
         // SAFETY: the module is not used by any other pipeline.
         unsafe { dev.device.destroy_shader_module(module, None) };
         let Ok(p) = result else { return Compiled::Nothing };
@@ -8524,9 +8821,29 @@ fn create_graphics(
     if has_depth {
         info = info.depth_stencil_state(&depth_stencil);
     }
+    let _note = note_driver_compile(|| {
+        let of = |m: Option<&Module>| m.map_or((0, 0), |m| (m.address, m.words));
+        format!("graphics vs program {:#x} {} words, ps program {:#x} {} words", of(vs).0, of(vs).1, of(ps).0, of(ps).1)
+    });
     // SAFETY: every referenced structure lives through the call.
     let pipelines = unsafe { dev.device.create_graphics_pipelines(pipeline_cache, &[info], None) }.map_err(|(_, e)| e)?;
     Ok(pipelines[0])
+}
+
+/// Before the driver compiles a pipeline the calling thread notes what it
+/// is about to compile (until the returned guard is dropped): a compile
+/// that faults inside the driver ends the process, and the fault report
+/// names the pipeline. With `RPS5E_COMPILE_NOTES=<directory>` the note is
+/// also written to `<directory>/<thread name>` (replacing the thread's
+/// previous one).
+#[must_use]
+fn note_driver_compile(what: impl FnOnce() -> String) -> ps5vm::thread_note::Guard {
+    let what = what();
+    if let Some(dir) = compile_notes_dir() {
+        let thread = std::thread::current();
+        let _ = std::fs::write(dir.join(thread.name().unwrap_or("unnamed")), &what);
+    }
+    ps5vm::thread_note::set(what)
 }
 
 /// Create the compute pipeline of `key` (any thread).
@@ -8557,6 +8874,10 @@ fn create_compute_pipeline(dev: &GpuDevice, pipeline_cache: vk::PipelineCache, k
     let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(key.layout).flags(flags);
     let t = std::time::Instant::now();
     log::trace!("ps5gpu: creating compute pipeline of module {:#018x}", key.cs);
+    let _note = note_driver_compile(|| {
+        use ash::vk::Handle;
+        format!("compute cs {:016x} program {:#x} {} words module-{:x}.spv subgroup {size}", key.cs, cs.address, cs.words, cs.module.as_raw())
+    });
     // SAFETY: valid create info.
     let pipelines = unsafe { dev.device.create_compute_pipelines(pipeline_cache, &[info], None) }.map_err(|(_, e)| e)?;
     if dev.caps.pipeline_executable_info && pipeline_stats_logged() {
@@ -8919,6 +9240,11 @@ impl PipelineProvider for ShaderPipelines {
         self.staging.used()
     }
 
+    fn object_counts(&self) -> Option<(usize, usize, usize)> {
+        let s = self.stats();
+        Some((s.modules, s.graphics_pipelines, s.compute_pipelines))
+    }
+
     fn settle_compiles(&mut self) {
         self.settle_rebuilds();
     }
@@ -9020,7 +9346,9 @@ impl PipelineProvider for ShaderPipelines {
         ) + &{
             let (built, used) = super::created::program_counts();
             format!(" created-programs={built}/{used}used")
-        } + " " + &self.t.compile_times.format() + &crate::shader::stats::line()
+        } + &self.guesses_text()
+            + " "
+            + &self.t.compile_times.format() + &crate::shader::stats::line()
             + &self.bindless_stats().map_or(String::new(), |b| {
                 format!(
                     " bindless=[binds {} reads {} records {} looks {} maps {} slots {} tables {} all-memory {} all-uses {} entries {}u/{}m first {} quick {} lookups {} same {} failed {} uncovered {} page-reads {}]",
@@ -9260,6 +9588,14 @@ mod compile_mode_tests {
         assert!(!spills_less(Spill { local: 944, shared: 8000, registers: 168 }, Spill { local: 560, shared: 12096, registers: 255 }));
         assert_eq!(spill_from_statistics(vec![("Register Count".to_string(), 40)].into_iter()), None, "no local-memory statistic");
         assert_eq!(spill_from_statistics(vec![("Scratch Memory Size".to_string(), 64)].into_iter()).map(|s| s.local), Some(64));
+        // A variant is built for a spilling pipeline of a module within
+        // the size limit only.
+        assert!(variant_worth_building(Some(before), 400_000, SPILL_VARIANT_WORDS));
+        assert!(variant_worth_building(Some(before), SPILL_VARIANT_WORDS, SPILL_VARIANT_WORDS));
+        assert!(!variant_worth_building(Some(before), 903_568, SPILL_VARIANT_WORDS), "GTA VI's ray-tracing resolve programs");
+        assert!(variant_worth_building(Some(before), 903_568, usize::MAX));
+        assert!(!variant_worth_building(Some(Spill { local: 48, shared: 0, registers: 40 }), 1_000, SPILL_VARIANT_WORDS), "no spills");
+        assert!(!variant_worth_building(None, 1_000, SPILL_VARIANT_WORDS), "no statistics");
     }
 
     /// A relocatable module serves the program wherever the code words its
@@ -9342,6 +9678,58 @@ fn dispatch_hash_log(ctx: &mut DrawContext, program: u64, d: &ResolvedDispatch, 
     }
     let args = if direct { String::from("direct") } else { format!("{:016x}", hash(ctx, d.packet.indirect_address, 12)) };
     log::info!("ps5gpu: dhash #{n} p{program:#x} q{} threads {threads:?} args {args} [{}]", d.packet.queue, parts.join(" "));
+}
+
+/// `RPS5E_RANGE_STATE=<cs>,<cs>,...` (diagnostics, hex program addresses):
+/// before each dispatch of those programs, the state of the pages of each
+/// of its buffer ranges is logged as a `rstate` line, without changing it:
+/// pages in all, pages that are all zero in guest memory, pages whose
+/// newest bytes are on the GPU, and of the zero pages those the GPU holds
+/// no newer bytes for (`zero-cpu`: the dispatch reads zeros there).
+fn dispatch_range_state_log(ctx: &mut DrawContext, program: u64, d: &ResolvedDispatch, ranges: &[(u64, u64, bool, bool)]) {
+    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("RPS5E_RANGE_STATE")
+            .map(|v| v.split(',').filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_default()
+    });
+    if list.is_empty() || !list.contains(&program) {
+        return;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 50_000 {
+        return;
+    }
+    let page = crate::memory::PAGE_BYTES;
+    let mut parts = Vec::new();
+    let mut bytes = vec![0u8; page as usize];
+    // `RPS5E_RANGE_STATE_SPAN=<bytes>`: each range is looked at over at
+    // least this many bytes (the memory after a header a program names).
+    static SPAN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let span = *SPAN.get_or_init(|| std::env::var("RPS5E_RANGE_STATE_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    for &(a, len, written, _) in ranges {
+        let len = len.max(span);
+        let (mut pages, mut zero, mut gpu, mut zero_cpu) = (0u32, 0u32, 0u32, 0u32);
+        let mut first_zero_cpu = 0u64;
+        let mut p = a & !(page - 1);
+        while p < a + len.min(64 << 20) {
+            let z = ctx.buffers.cache().memory().read_backing(p, &mut bytes) && bytes.iter().all(|&b| b == 0);
+            let g = ctx.buffers.has_gpu_dirty(p, page);
+            pages += 1;
+            zero += z as u32;
+            gpu += g as u32;
+            if z && !g {
+                if zero_cpu == 0 {
+                    first_zero_cpu = p;
+                }
+                zero_cpu += 1;
+            }
+            p += page;
+        }
+        parts.push(format!("{a:#x}+{len:#x}{} pages {pages} zero {zero} gpu {gpu} zero-cpu {zero_cpu}@{first_zero_cpu:#x}", if written { "w" } else { "" }));
+    }
+    log::info!("ps5gpu: rstate #{n} p{program:#x} q{} tick {} packet {:#x} [{}]", d.packet.queue, ctx.sched.current_tick(), d.packet.packet_address, parts.join(" | "));
 }
 
 /// The device-address page table a stage reads guest memory through: the

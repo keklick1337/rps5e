@@ -295,6 +295,27 @@ fn corpus(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../ps5shader/tests/corpus").join(name)
 }
 
+/// A pixel program with float multiplies and multiply-adds: the NaN test
+/// of a value is emitted once in a block, however many operations ask for
+/// it (an operation that tests one operand against itself asks twice).
+#[test]
+fn nan_tests_are_emitted_once_per_value() {
+    use rspirv::spirv::Op;
+    let m = compile_emit(&corpus("2649290b5c831c65.bin"), None, |_, _| true, None, super::EmitOptions::ALL).unwrap().unwrap();
+    let (mut at, mut tested, mut tests) = (5, std::collections::HashSet::new(), 0);
+    while at < m.spirv.len() {
+        let (count, op) = ((m.spirv[at] >> 16) as usize, m.spirv[at] & 0xFFFF);
+        if op == Op::Label as u32 {
+            tested.clear();
+        } else if op == Op::IsNan as u32 {
+            tests += 1;
+            assert!(tested.insert(m.spirv[at + 3]), "the NaN test of %{} is repeated in its block", m.spirv[at + 3]);
+        }
+        at += count.max(1);
+    }
+    assert!(tests > 100, "{tests} NaN tests");
+}
+
 /// `RPS5E_ZERO_MAX`: a compute program with 26 `v_max_f32 v, 0, v` is
 /// emitted shorter with the switch than without it.
 #[test]

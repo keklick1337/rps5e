@@ -169,6 +169,11 @@ def record_launch(argv, freq, event, pages, poll):
 def record_attach(pid, freq, event, pages, poll, duration, rescan):
     rec = Recorder(pid)
     rings = {}
+    # UPROF_THREADS=<regex>: only threads whose name matches are sampled (a
+    # process with many threads exceeds the ring memory an unprivileged user
+    # may lock, perf_event_mlock_kb).
+    only = re.compile(os.environ["UPROF_THREADS"]) if os.environ.get("UPROF_THREADS") else None
+    skipped = set()
     t0 = time.monotonic()
     stop = [False]
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True))
@@ -179,8 +184,17 @@ def record_attach(pid, freq, event, pages, poll, duration, rescan):
             last_scan = now
             rec.snapshot()
             for t in pe.tids(pid):
-                if t in rings:
+                if t in rings or t in skipped:
                     continue
+                if only is not None:
+                    try:
+                        with open(f"/proc/{pid}/task/{t}/comm") as f:
+                            name = f.read().strip()
+                    except OSError:
+                        continue
+                    if not only.search(name):
+                        skipped.add(t)
+                        continue
                 try:
                     fd = pe.open_event(sample_attr(event, freq, pe.F_COMM | pe.F_MMAP | pe.F_MMAP2), t)
                 except OSError as e:

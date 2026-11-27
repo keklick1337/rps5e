@@ -120,3 +120,29 @@ pub fn describe(addr: u64, max: usize) -> Option<String> {
     hits.reverse();
     Some(if hits.is_empty() { format!("page {page:#x}: no events in {count} recorded") } else { format!("page {page:#x}: {}", hits.join("; ")) })
 }
+
+/// Every recorded event overlapping `[lo, hi)`, oldest first, one per line
+/// (at most `max`, the newest ones).
+pub fn dump(lo: u64, hi: u64, max: usize) -> String {
+    let Some(r) = ring() else { return String::new() };
+    let now = r.start.elapsed().as_micros() as u64;
+    let n = r.next.load(Ordering::Acquire) as usize;
+    let count = n.min(ENTRIES);
+    let mut hits: Vec<String> = Vec::new();
+    for k in 0..count {
+        let i = (n - 1 - k) % ENTRIES;
+        let s = &r.slots[i];
+        let (a, e) = (s[0].load(Ordering::Relaxed), s[1].load(Ordering::Relaxed));
+        if a >= hi || e <= lo {
+            continue;
+        }
+        let meta = s[3].load(Ordering::Acquire);
+        let tick = s[2].load(Ordering::Relaxed);
+        hits.push(format!("{:>9.3} ms ago {} {a:#x}+{:#x} tick {tick}", now.saturating_sub(meta >> 8) as f64 / 1000.0, Event::name(meta & 0xFF), e - a));
+        if hits.len() >= max {
+            break;
+        }
+    }
+    hits.reverse();
+    hits.join("\n")
+}

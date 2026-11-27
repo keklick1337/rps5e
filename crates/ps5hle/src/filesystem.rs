@@ -1260,6 +1260,9 @@ struct FdTable {
     /// Descriptors carrying FD_CLOEXEC (a per-descriptor flag: duplicates
     /// start without it).
     cloexec: HashSet<i32>,
+    /// Numbers dup2 is replacing: their old object is being closed and the
+    /// new one is not bound yet, so no other thread may be given them.
+    replacing: HashSet<i32>,
     /// Access mode and status flags (O_NONBLOCK, O_APPEND, ...) of each
     /// table entry, shared by its duplicates as they share the open file.
     status: HashMap<i32, Arc<Mutex<u32>>>,
@@ -1269,6 +1272,7 @@ impl FdTable {
     /// Bind `fd` to `handle` with its descriptor flags cleared.
     fn bind(&mut self, fd: i32, handle: Handle) {
         self.reserved.remove(&fd);
+        self.replacing.remove(&fd);
         self.map.insert(fd, handle);
         self.cloexec.remove(&fd);
         self.status.insert(fd, Arc::new(Mutex::new(0)));
@@ -1288,7 +1292,7 @@ impl FdTable {
     /// allocates descriptors; 0-2 are the standard streams.
     fn lowest_free(&self, from: i32) -> i32 {
         let mut fd = from.max(3);
-        while self.map.contains_key(&fd) || self.reserved.contains(&fd) {
+        while self.map.contains_key(&fd) || self.reserved.contains(&fd) || self.replacing.contains(&fd) {
             fd += 1;
         }
         fd
@@ -1298,7 +1302,7 @@ impl FdTable {
 static FDS: LazyLock<Mutex<FdTable>> =
     // The standard streams are always open.
     LazyLock::new(|| {
-        Mutex::new(FdTable { map: HashMap::new(), reserved: (0..=2).collect(), cloexec: HashSet::new(), status: HashMap::new() })
+        Mutex::new(FdTable { map: HashMap::new(), reserved: (0..=2).collect(), cloexec: HashSet::new(), replacing: HashSet::new(), status: HashMap::new() })
     });
 
 fn fds() -> std::sync::MutexGuard<'static, FdTable> {
@@ -3239,12 +3243,17 @@ fn dup2_core(old: i32, new: i32) -> FsResult<i64> {
         return Ok(new as i64);
     }
     // Replacing an open descriptor closes it, kernel sockets, kqueues and
-    // JIT shared memory included.
+    // JIT shared memory included. The number stays taken from the close to
+    // the bind: a descriptor another thread opens meanwhile gets another.
+    fds().replacing.insert(new);
     if !crate::net::kernel_socket_close(new) && crate::sync::kqueue::close(new) {
         crate::sync::equeue::descriptor_closed(new);
     }
     crate::memory::jit::close(new);
-    fds().bind_duplicate(new, old).ok_or(EBADF)?;
+    let mut t = fds();
+    let bound = t.bind_duplicate(new, old);
+    t.replacing.remove(&new);
+    bound.ok_or(EBADF)?;
     Ok(new as i64)
 }
 
@@ -5710,8 +5719,11 @@ pub(crate) mod tests {
             assert_eq!(fcntl_core(fd as i32, u32::MAX as u64, 0), Err(EINVAL));
             ctx.set(Rdi, fd as u64);
             assert_eq!(cb_sce_close(&mut ctx), 0);
-            assert_eq!(fcntl(&mut ctx, fd, 1, 0), -1);
-            assert_eq!(fcntl_core(fd as i32, F_GETFD, 0), Err(EBADF));
+            // A number nothing holds: the one just closed may be another
+            // test's descriptor by now.
+            const NEVER_OPEN: i32 = 0x7FFF_0000;
+            assert_eq!(fcntl(&mut ctx, NEVER_OPEN as _, 1, 0), -1);
+            assert_eq!(fcntl_core(NEVER_OPEN, F_GETFD, 0), Err(EBADF));
             ctx.set(Rdi, BASE);
             ctx.set(Rsi, O_CLOEXEC);
             let cloexec_fd = cb_sce_open(&mut ctx);
@@ -5966,7 +5978,9 @@ pub(crate) mod tests {
         assert_eq!(cb_sce_futimes(&mut ctx), sce_error(EINVAL));
         set(&mut ctx, &[wfd as u64]);
         assert_eq!(cb_sce_close(&mut ctx), 0);
-        set(&mut ctx, &[wfd as u64, 0]);
+        // A number nothing holds: the one just closed may be another
+        // test's descriptor by now.
+        set(&mut ctx, &[0x7FFF_0000, 0]);
         assert_eq!(cb_sce_futimes(&mut ctx), sce_error(EBADF));
 
         let _ = vm.unmap(BASE, 0x10000);

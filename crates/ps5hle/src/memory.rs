@@ -156,7 +156,7 @@ fn free_callback(addr: u64, len: u64) {
 pub fn register_callbacks(alloc: RangeCallback, free: RangeCallback) {
     let st = lock();
     *CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()) = Some((alloc, free));
-    for m in &st.physical.mappings {
+    for m in st.physical.mappings.values() {
         if m.map_vaddr != 0 && m.map_size != 0 {
             alloc(m.map_vaddr, m.map_size);
         }
@@ -321,9 +321,12 @@ impl Range {
     }
 }
 
+/// The ranges of the guest address space by start address. They do not
+/// overlap, and two neighbours that could merge are merged, so a change
+/// only ever touches the ranges it overlaps and their two neighbours.
 #[derive(Default)]
 struct VirtualRanges {
-    ranges: Vec<Range>,
+    ranges: BTreeMap<u64, Range>,
 }
 
 impl VirtualRanges {
@@ -334,61 +337,88 @@ impl VirtualRanges {
         l.rtype == r.rtype && l.protection == r.protection && l.memory_type == r.memory_type && l.name == r.name
     }
 
-    fn lower_bound(&self, start: u64) -> usize {
-        self.ranges.partition_point(|r| r.start < start)
+    /// Start of the first range that ends after `addr`: the one holding
+    /// `addr`, else the next one (None: none).
+    fn first_ending_after(&self, addr: u64) -> Option<u64> {
+        if let Some((&k, r)) = self.ranges.range(..=addr).next_back() {
+            if r.end() > addr {
+                return Some(k);
+            }
+        }
+        self.ranges.range(addr..).next().map(|(&k, _)| k)
     }
 
-    fn merge_around(&mut self, mut index: usize) {
-        if index >= self.ranges.len() {
-            return;
+    /// The ranges ending after `start`, in address order.
+    fn from(&self, start: u64) -> impl Iterator<Item = &Range> + '_ {
+        let first = self.first_ending_after(start);
+        first.into_iter().flat_map(move |k| self.ranges.range(k..).map(|(_, r)| r))
+    }
+
+    /// Starts of the ranges overlapping `[start, start + size)`.
+    fn overlapping(&self, start: u64, size: u64) -> Vec<u64> {
+        if size == 0 {
+            return Vec::new();
         }
-        if index != 0 {
-            let (prev, cur) = (&self.ranges[index - 1], &self.ranges[index]);
+        let end = end_of(start, size);
+        self.from(start).take_while(|r| r.start < end).map(|r| r.start).collect()
+    }
+
+    /// Merge the range at `key` into the one before it when they fit,
+    /// then the ranges after it into it while they fit.
+    fn merge_around(&mut self, mut key: u64) {
+        let Some(cur) = self.ranges.get(&key) else { return };
+        if let Some((&pk, prev)) = self.ranges.range(..key).next_back() {
             if prev.end() == cur.start && Self::same_merge_key(prev, cur) {
                 let add = cur.size;
-                self.ranges[index - 1].size += add;
-                self.ranges.remove(index);
-                index -= 1;
+                self.ranges.remove(&key);
+                self.ranges.get_mut(&pk).unwrap().size += add;
+                key = pk;
             }
         }
-        while index + 1 < self.ranges.len() {
-            let (cur, next) = (&self.ranges[index], &self.ranges[index + 1]);
-            if cur.end() != next.start || !Self::same_merge_key(cur, next) {
-                break;
-            }
+        loop {
+            let cur = &self.ranges[&key];
+            let end = cur.end();
+            let Some(next) = self.ranges.get(&end).filter(|n| end > key && Self::same_merge_key(cur, n)) else { break };
             let add = next.size;
-            self.ranges[index].size += add;
-            self.ranges.remove(index + 1);
+            self.ranges.remove(&end);
+            self.ranges.get_mut(&key).unwrap().size += add;
         }
     }
 
-    fn merge_all(&mut self) {
-        if self.ranges.len() < 2 {
-            return;
-        }
-        self.ranges.sort_by_key(|r| r.start);
-        let mut merged: Vec<Range> = Vec::with_capacity(self.ranges.len());
-        for r in self.ranges.drain(..) {
-            if let Some(last) = merged.last_mut() {
-                if last.end() == r.start && Self::same_merge_key(last, &r) {
-                    last.size += r.size;
-                    continue;
-                }
+    /// Merge every pair of neighbours that fits among the ranges touching
+    /// `[start, end]` (the range before `start` and the one at `end`
+    /// included).
+    fn merge_span(&mut self, start: u64, end: u64) {
+        let mut key = match self.ranges.range(..start).next_back() {
+            Some((&k, _)) => k,
+            None => match self.ranges.range(start..).next() {
+                Some((&k, _)) => k,
+                None => return,
+            },
+        };
+        loop {
+            let cur = &self.ranges[&key];
+            let cur_end = cur.end();
+            if let Some(next) = self.ranges.get(&cur_end).filter(|n| cur_end > key && Self::same_merge_key(cur, n)) {
+                let add = next.size;
+                self.ranges.remove(&cur_end);
+                self.ranges.get_mut(&key).unwrap().size += add;
+                continue;
             }
-            merged.push(r);
+            match self.ranges.range(key + 1..).next() {
+                Some((&k, _)) if k <= end => key = k,
+                _ => return,
+            }
         }
-        self.ranges = merged;
     }
 
     fn find_overlap(&self, start: u64, size: u64) -> Option<&Range> {
-        let pos = self.lower_bound(start);
-        if let Some(r) = self.ranges.get(pos) {
+        if let Some((_, r)) = self.ranges.range(start..).next() {
             if overlap(start, size, r.start, r.size) {
                 return Some(r);
             }
         }
-        if pos > 0 {
-            let r = &self.ranges[pos - 1];
+        if let Some((_, r)) = self.ranges.range(..start).next_back() {
             if overlap(start, size, r.start, r.size) {
                 return Some(r);
             }
@@ -401,49 +431,40 @@ impl VirtualRanges {
         if start == 0 || size == 0 || self.find_overlap(start, size).is_some() {
             return false;
         }
-        let pos = self.lower_bound(start);
-        self.ranges.insert(
-            pos,
-            Range { start, size, offset, protection, memory_type, rtype, disallow_merge, name: truncate_name(name) },
-        );
-        self.merge_around(pos);
+        self.ranges.insert(start, Range { start, size, offset, protection, memory_type, rtype, disallow_merge, name: truncate_name(name) });
+        self.merge_around(start);
         true
     }
 
+    /// Cut `[start, start + size)` out of the ranges (no merging).
     fn remove_unlocked(&mut self, start: u64, size: u64) -> bool {
         if size == 0 {
             return false;
         }
         let rem_end = end_of(start, size);
-        let mut out = Vec::with_capacity(self.ranges.len() + 1);
         let mut removed = false;
-        for r in self.ranges.drain(..) {
-            if !overlap(start, size, r.start, r.size) {
-                out.push(r);
-                continue;
-            }
+        for k in self.overlapping(start, size) {
+            let r = self.ranges.remove(&k).unwrap();
             removed = true;
             if r.start < start {
-                out.push(r.piece(r.start, start));
+                self.ranges.insert(r.start, r.piece(r.start, start));
             }
             if rem_end < r.end() {
-                out.push(r.piece(rem_end, r.end()));
+                self.ranges.insert(rem_end, r.piece(rem_end, r.end()));
             }
         }
-        self.ranges = out;
         removed
     }
 
     fn remove(&mut self, start: u64, size: u64) -> bool {
-        let pos = self.lower_bound(start);
-        if let Some(r) = self.ranges.get(pos) {
-            if r.start == start && r.size == size {
-                self.ranges.remove(pos);
-                return true;
-            }
+        if self.ranges.get(&start).is_some_and(|r| r.size == size) {
+            self.ranges.remove(&start);
+            return true;
         }
         let removed = self.remove_unlocked(start, size);
-        self.merge_all();
+        if removed {
+            self.merge_span(start, end_of(start, size));
+        }
         removed
     }
 
@@ -463,18 +484,14 @@ impl VirtualRanges {
         let end = start + size;
         let mut current = start;
         while current < end {
-            let Some(c) = self.ranges.iter().find(|r| r.rtype == expected && current >= r.start && current < r.end()) else {
+            let Some((_, c)) = self.ranges.range(..=current).next_back().filter(|(_, r)| r.rtype == expected && current < r.end()) else {
                 return false;
             };
             current = end.min(c.end());
         }
         self.remove_unlocked(start, size);
-        let pos = self.lower_bound(start);
-        self.ranges.insert(
-            pos,
-            Range { start, size, offset, protection, memory_type, rtype, disallow_merge, name: truncate_name(name) },
-        );
-        self.merge_around(pos);
+        self.ranges.insert(start, Range { start, size, offset, protection, memory_type, rtype, disallow_merge, name: truncate_name(name) });
+        self.merge_around(start);
         true
     }
 
@@ -483,37 +500,29 @@ impl VirtualRanges {
             return;
         }
         let edit_end = end_of(start, size);
-        let mut out = Vec::with_capacity(self.ranges.len() + 2);
-        for r in self.ranges.drain(..) {
-            if !overlap(start, size, r.start, r.size) {
-                out.push(r);
-                continue;
-            }
+        for k in self.overlapping(start, size) {
+            let r = self.ranges.remove(&k).unwrap();
             let mid_start = start.max(r.start);
             let mid_end = edit_end.min(r.end());
             if r.start < mid_start {
-                out.push(r.piece(r.start, mid_start));
+                self.ranges.insert(r.start, r.piece(r.start, mid_start));
             }
             let mut mid = r.piece(mid_start, mid_end);
             f(&mut mid);
-            out.push(mid);
+            self.ranges.insert(mid_start, mid);
             if mid_end < r.end() {
-                out.push(r.piece(mid_end, r.end()));
+                self.ranges.insert(mid_end, r.piece(mid_end, r.end()));
             }
         }
-        self.ranges = out;
-        self.merge_all();
+        self.merge_span(start, edit_end);
     }
 
     fn rename(&mut self, start: u64, size: u64, name: &str) {
         let name = truncate_name(name);
-        let pos = self.lower_bound(start);
-        if let Some(r) = self.ranges.get_mut(pos) {
-            if r.start == start && r.size == size {
-                r.name = name;
-                self.merge_around(pos);
-                return;
-            }
+        if let Some(r) = self.ranges.get_mut(&start).filter(|r| r.size == size) {
+            r.name = name;
+            self.merge_around(start);
+            return;
         }
         self.edit(start, size, |r| r.name = name.clone());
     }
@@ -526,15 +535,12 @@ impl VirtualRanges {
     /// address order (holes are simply absent).
     fn pieces(&self, start: u64, size: u64) -> Vec<Range> {
         let end = start.saturating_add(size);
-        let first = self.ranges.partition_point(|r| r.end() <= start);
-        self.ranges[first..].iter().take_while(|r| r.start < end).map(|r| r.piece(r.start.max(start), r.end().min(end))).collect()
+        self.from(start).take_while(|r| r.start < end).map(|r| r.piece(r.start.max(start), r.end().min(end))).collect()
     }
 
     /// The range containing `addr`, or with `flags == 1` the next one.
     fn query(&self, addr: u64, flags: i32) -> Option<Range> {
-        let next = self.ranges.partition_point(|r| r.start <= addr);
-        if next > 0 {
-            let cur = &self.ranges[next - 1];
+        if let Some((_, cur)) = self.ranges.range(..=addr).next_back() {
             if addr < cur.end() {
                 return Some(cur.clone());
             }
@@ -542,7 +548,8 @@ impl VirtualRanges {
         if flags != 1 {
             return None;
         }
-        self.ranges.get(next).cloned()
+        let next = addr.checked_add(1)?;
+        self.ranges.range(next..).next().map(|(_, r)| r.clone())
     }
 
     /// The ranges exactly covering `[start, start+size)`, clipped; None
@@ -554,11 +561,7 @@ impl VirtualRanges {
         let end = start + size;
         let mut current = start;
         let mut out = Vec::new();
-        let first = self.ranges.partition_point(|r| r.end() <= current);
-        for r in &self.ranges[first..] {
-            if r.end() <= current {
-                continue;
-            }
+        for r in self.from(current) {
             if r.start > current {
                 return None;
             }
@@ -577,17 +580,13 @@ impl VirtualRanges {
         if addr == 0 || size == 0 || size > u64::MAX - addr {
             return 0;
         }
-        let next = self.ranges.partition_point(|r| r.start <= addr);
-        if next == 0 {
-            return 0;
-        }
-        let first = &self.ranges[next - 1];
+        let Some((_, first)) = self.ranges.range(..=addr).next_back() else { return 0 };
         if addr >= first.end() || !first.rtype.committed() {
             return 0;
         }
         let mut clamped = size.min(first.end() - addr);
         let mut expected = addr + clamped;
-        for r in &self.ranges[next..] {
+        for (_, r) in self.ranges.range(first.start + 1..) {
             if r.start != expected || !r.rtype.committed() || clamped >= size {
                 break;
             }
@@ -610,7 +609,7 @@ impl VirtualRanges {
         let mut used = 0;
         let mut next_granule = 0u64;
         let mut next_region = 0u64;
-        for r in &self.ranges {
+        for r in self.ranges.values() {
             if !r.rtype.committed() || r.size == 0 {
                 continue;
             }
@@ -718,7 +717,10 @@ struct PhysicalMemory {
     automatic_free: BTreeMap<u64, u64>,
     /// Free ranges of system memory (`AllocationKind::System`).
     system_free: BTreeMap<u64, u64>,
-    mappings: Vec<AllocatedBlock>,
+    /// Views of direct memory by guest address (they do not overlap).
+    mappings: BTreeMap<u64, AllocatedBlock>,
+    /// How many views map each byte of direct memory.
+    viewed: spans::RefSpans,
 }
 
 impl PhysicalMemory {
@@ -839,17 +841,10 @@ impl PhysicalMemory {
             automatic = true;
         }
         if automatic {
-            let mapped: Vec<(u64, u64)> = self
-                .mappings
-                .iter()
-                .filter_map(|m| {
-                    let f = start.max(m.start_addr);
-                    let l = end.min(m.start_addr + m.size);
-                    (f < l).then_some((f, l - f))
-                })
-                .collect();
-            for (f, l) in mapped {
-                remove_free_range(&mut self.automatic_free, f, l);
+            // What a view still maps stays taken.
+            let (free, viewed) = (&mut self.automatic_free, &self.viewed);
+            for (f, l) in viewed.referenced(start, size) {
+                remove_free_range(free, f, l);
             }
         }
     }
@@ -939,7 +934,7 @@ impl PhysicalMemory {
         let Some(span) = self.allocated_span(phys, len, false) else { return false };
         let has_automatic = span.iter().any(|b| b.kind == AllocationKind::Automatic);
         let first = &span[0];
-        self.mappings.push(AllocatedBlock {
+        self.insert_view(AllocatedBlock {
             start_addr: phys,
             size: len,
             map_vaddr: vaddr,
@@ -965,42 +960,59 @@ impl PhysicalMemory {
         true
     }
 
+    /// Enter a view (one already at its address is replaced).
+    fn insert_view(&mut self, b: AllocatedBlock) {
+        self.viewed.add(b.start_addr, b.size);
+        if let Some(old) = self.mappings.insert(b.map_vaddr, b) {
+            self.viewed.sub(old.start_addr, old.size);
+        }
+    }
+
+    /// Starts of the views overlapping `[vaddr, vaddr + size)`.
+    fn views_over(&self, vaddr: u64, size: u64) -> Vec<u64> {
+        let end = end_of(vaddr, size);
+        let first = match self.mappings.range(..=vaddr).next_back() {
+            Some((&k, b)) if overlap(vaddr, size, b.map_vaddr, b.map_size) => k,
+            _ => vaddr,
+        };
+        self.mappings.range(first..end).filter(|(_, b)| overlap(vaddr, size, b.map_vaddr, b.map_size)).map(|(&k, _)| k).collect()
+    }
+
     /// Remove a view (or part of one) of direct memory.
     fn unmap(&mut self, vaddr: u64, size: u64) -> bool {
-        for i in 0..self.mappings.len() {
-            let b = &self.mappings[i];
-            if vaddr < b.map_vaddr || vaddr >= b.map_vaddr + b.map_size || size > b.map_vaddr + b.map_size - vaddr {
-                continue;
-            }
-            let phys = b.start_addr + vaddr - b.map_vaddr;
-            let b = self.mappings[i].clone();
-            if vaddr == b.map_vaddr && size == b.map_size {
-                self.mappings.remove(i);
-            } else if vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size {
-                let mut right = b.clone();
-                right.start_addr += vaddr + size - b.map_vaddr;
-                right.size = b.map_vaddr + b.map_size - (vaddr + size);
-                right.map_size = right.size;
-                right.map_vaddr = vaddr + size;
-                let m = &mut self.mappings[i];
-                m.size = vaddr - b.map_vaddr;
-                m.map_size = m.size;
-                self.mappings.push(right);
-            } else if vaddr == b.map_vaddr {
-                let m = &mut self.mappings[i];
-                m.start_addr += size;
-                m.size -= size;
-                m.map_vaddr += size;
-                m.map_size -= size;
-            } else {
-                let m = &mut self.mappings[i];
-                m.size = vaddr - b.map_vaddr;
-                m.map_size = m.size;
-            }
-            self.reclaim_automatic(phys, size);
-            return true;
+        let Some((&key, b)) = self.mappings.range(..=vaddr).next_back() else { return false };
+        if vaddr >= b.map_vaddr + b.map_size || size > b.map_vaddr + b.map_size - vaddr {
+            return false;
         }
-        false
+        let phys = b.start_addr + vaddr - b.map_vaddr;
+        let b = b.clone();
+        if vaddr == b.map_vaddr && size == b.map_size {
+            self.mappings.remove(&key);
+        } else if vaddr > b.map_vaddr && vaddr + size < b.map_vaddr + b.map_size {
+            let mut right = b.clone();
+            right.start_addr += vaddr + size - b.map_vaddr;
+            right.size = b.map_vaddr + b.map_size - (vaddr + size);
+            right.map_size = right.size;
+            right.map_vaddr = vaddr + size;
+            let m = self.mappings.get_mut(&key).unwrap();
+            m.size = vaddr - b.map_vaddr;
+            m.map_size = m.size;
+            self.mappings.insert(right.map_vaddr, right);
+        } else if vaddr == b.map_vaddr {
+            let mut m = self.mappings.remove(&key).unwrap();
+            m.start_addr += size;
+            m.size -= size;
+            m.map_vaddr += size;
+            m.map_size -= size;
+            self.mappings.insert(m.map_vaddr, m);
+        } else {
+            let m = self.mappings.get_mut(&key).unwrap();
+            m.size = vaddr - b.map_vaddr;
+            m.map_size = m.size;
+        }
+        self.viewed.sub(phys, size);
+        self.reclaim_automatic(phys, size);
+        true
     }
 
     fn protect_mapping(&mut self, vaddr: u64, size: u64, prot: i32) {
@@ -1008,38 +1020,33 @@ impl PhysicalMemory {
             return;
         }
         let end = vaddr + size;
-        let mut updated = Vec::with_capacity(self.mappings.len() + 2);
-        for b in self.mappings.drain(..) {
+        for key in self.views_over(vaddr, size) {
+            let b = self.mappings.remove(&key).unwrap();
             let bend = b.map_vaddr + b.map_size;
-            if !overlap(vaddr, size, b.map_vaddr, b.map_size) {
-                updated.push(b);
-                continue;
-            }
             let os = vaddr.max(b.map_vaddr);
             let oe = end.min(bend);
             if b.map_vaddr < os {
                 let mut left = b.clone();
                 left.size = os - b.map_vaddr;
                 left.map_size = left.size;
-                updated.push(left);
+                self.mappings.insert(left.map_vaddr, left);
             }
-            let mut mid = b.clone();
-            mid.start_addr = b.start_addr + os - b.map_vaddr;
-            mid.size = oe - os;
-            mid.map_vaddr = os;
-            mid.map_size = mid.size;
-            mid.prot = prot;
-            updated.push(mid);
             if oe < bend {
                 let mut right = b.clone();
                 right.start_addr = b.start_addr + oe - b.map_vaddr;
                 right.size = bend - oe;
                 right.map_vaddr = oe;
                 right.map_size = right.size;
-                updated.push(right);
+                self.mappings.insert(right.map_vaddr, right);
             }
+            let mut mid = b;
+            mid.start_addr += os - mid.map_vaddr;
+            mid.size = oe - os;
+            mid.map_vaddr = os;
+            mid.map_size = mid.size;
+            mid.prot = prot;
+            self.mappings.insert(mid.map_vaddr, mid);
         }
-        self.mappings = updated;
     }
 
     /// The block containing `phys`, or with `next` the following one.
@@ -1057,9 +1064,10 @@ impl PhysicalMemory {
 
     /// Views of `[phys, phys+len)`, clipped, ordered by address.
     fn find_mappings(&self, phys: u64, len: u64) -> Vec<AllocatedBlock> {
+        // Every view is looked at: direct memory is released rarely.
         let mut out: Vec<AllocatedBlock> = self
             .mappings
-            .iter()
+            .values()
             .filter(|m| overlap(phys, len, m.start_addr, m.size))
             .map(|m| {
                 let os = phys.max(m.start_addr);
@@ -1077,10 +1085,8 @@ impl PhysicalMemory {
     }
 
     fn set_name(&mut self, vaddr: u64, len: u64, name: &str) {
-        for b in &mut self.mappings {
-            if overlap(vaddr, len, b.map_vaddr, b.map_size) {
-                b.name = truncate_name(name);
-            }
+        for key in self.views_over(vaddr, len) {
+            self.mappings.get_mut(&key).unwrap().name = truncate_name(name);
         }
     }
 }
@@ -2060,7 +2066,8 @@ impl MemState {
                 // Replace direct views in place: the new view atomically
                 // replaces the old ones.
                 let mut covered = 0;
-                for m in &self.physical.mappings {
+                let first = self.physical.mappings.range(..=in_addr).next_back().map_or(in_addr, |(&k, _)| k);
+                for m in self.physical.mappings.range(first..in_addr + len).map(|(_, m)| m) {
                     let s = in_addr.max(m.map_vaddr);
                     let e = (in_addr + len).min(m.map_vaddr + m.map_size);
                     if s >= e {
@@ -3574,6 +3581,7 @@ fn cb_get_direct_memory_type(ctx: &mut CpuContext) -> HleResult {
 }
 
 pub(crate) mod jit;
+pub(crate) mod spans;
 
 pub fn register(reg: &mut HleRegistry) {
     // Guest accesses to pages the GPU memory tracker protects are resolved

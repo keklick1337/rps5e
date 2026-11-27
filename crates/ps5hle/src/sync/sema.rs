@@ -101,19 +101,20 @@ struct Inner {
 
 impl Inner {
     /// Hand tokens to the waiters in list order, waking the threads that
-    /// sleep on their own condvar; returns how many got theirs.
+    /// sleep on their own condvar; returns how many got theirs. The first
+    /// waiter that needs more than is left ends the pass: the waiters
+    /// behind it keep waiting even when the tokens would fit them (the
+    /// tokens stay in the count, where a poll or a new wait may take them).
     fn wake_waiters(&mut self) -> u32 {
         let mut count = self.count;
         let mut n = 0;
-        for w in self.waiters.iter_mut() {
-            if count == 0 {
+        for w in self.waiters.iter_mut().filter(|w| w.result == WaitResult::Pending) {
+            if w.need > count {
                 break;
             }
-            if w.result == WaitResult::Pending && w.need <= count {
-                count -= w.need;
-                w.settle(WaitResult::Ok);
-                n += 1;
-            }
+            count -= w.need;
+            w.settle(WaitResult::Ok);
+            n += 1;
         }
         self.count = count;
         n
@@ -823,17 +824,27 @@ mod tests {
     fn signal_hands_tokens_to_waiters_in_order() {
         let h = create("t".into(), true, 0, 10);
         let first = thread::spawn(move || wait(h, 3, None));
-        thread::sleep(Duration::from_millis(20));
+        wait_for_waiters(h, 1);
         let second = thread::spawn(move || wait(h, 1, None));
-        thread::sleep(Duration::from_millis(20));
-        // Two tokens fit only the second waiter; the first keeps waiting.
-        assert_eq!(signal(h, 2), OK);
-        assert_eq!(second.join().unwrap(), OK);
+        wait_for_waiters(h, 2);
+        // One token does not fit the head (it needs 3), so the pass stops
+        // there: the smaller waiter behind it keeps waiting too.
+        assert_eq!(signal(h, 1), OK);
+        thread::sleep(Duration::from_millis(30));
+        assert!(!second.is_finished(), "a waiter behind a blocked head was served");
         assert_eq!(value(h), Some(1));
-        // A poll may still take what is left; the queued waiter needs 3.
-        assert_eq!(signal(h, 2), OK);
-        assert_eq!(first.join().unwrap(), OK);
+        // A poll still takes the free token.
+        assert_eq!(poll(h, 1), OK);
         assert_eq!(value(h), Some(0));
+        // Three more serve the head; the waiter behind it needs its own.
+        assert_eq!(signal(h, 3), OK);
+        assert_eq!(first.join().unwrap(), OK);
+        thread::sleep(Duration::from_millis(30));
+        assert!(!second.is_finished());
+        assert_eq!(signal(h, 1), OK);
+        assert_eq!(second.join().unwrap(), OK);
+        assert_eq!(value(h), Some(0));
+        assert!(delete(h));
     }
 
     #[test]
@@ -1043,7 +1054,8 @@ mod tests {
                 assert_eq!(t.join().unwrap(), OK);
             }
             assert!(t0.elapsed() < Duration::from_secs(5), "targeted={targeted}: a waiter missed its wakeup");
-            // Different needs: a signal serves every waiter it fits, in order.
+            // Different needs: a signal stops at the first waiter it does
+            // not fit, and the ones behind it wait with it.
             let big = thread::spawn(move || {
                 long_slices();
                 wait(h, 3, None)
@@ -1055,10 +1067,12 @@ mod tests {
             });
             wait_for_waiters(h, 2);
             assert_eq!(signal(h, 2), OK);
-            assert_eq!(small.join().unwrap(), OK);
-            assert_eq!(value(h), Some(1));
+            thread::sleep(Duration::from_millis(30));
+            assert!(!small.is_finished() && !big.is_finished(), "targeted={targeted}");
+            assert_eq!(value(h), Some(2));
             assert_eq!(signal(h, 2), OK);
             assert_eq!(big.join().unwrap(), OK);
+            assert_eq!(small.join().unwrap(), OK);
             assert_eq!(value(h), Some(0));
             assert!(delete(h));
         }

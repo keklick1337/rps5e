@@ -13,7 +13,7 @@ use super::memory::{MemoryAccessTable, MemoryResourceKind};
 use super::table_reads;
 use super::tracker;
 use super::validator::RuntimeValueValidator;
-use super::value::{ValueId, ValueKind};
+use super::value::{ScalarOp, ValueId, ValueKind};
 use super::ResourcePlanError;
 use crate::ir_types::Program;
 use std::collections::{HashMap, HashSet};
@@ -68,6 +68,33 @@ impl PlanOptions {
             && !(memory.formatted && !memory.typed)
     }
 }
+
+/// Which bound V#s have their stride fields read by the module at run
+/// time instead of compiled in ([`BufferResource::runtime_stride`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeStrides {
+    Never,
+    /// Those whose word 1 the program computes.
+    Computed,
+    All,
+}
+
+/// `RPS5E_RUNTIME_STRIDES`: `0` compiles every bound V# for its stride
+/// fields (one module per value of a stride the program computes), `all`
+/// reads them at run time for every bound V# (to check the run-time path
+/// against the reference cases); by default only the V#s whose stride the
+/// program computes read them at run time.
+fn runtime_strides() -> RuntimeStrides {
+    static MODE: std::sync::OnceLock<RuntimeStrides> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("RPS5E_RUNTIME_STRIDES").as_deref() {
+        Ok("0") | Ok("off") => RuntimeStrides::Never,
+        Ok("all") => RuntimeStrides::All,
+        _ => RuntimeStrides::Computed,
+    })
+}
+
+/// The bits of V# word 1 that hold STRIDE and SWIZZLE_ENABLE.
+const STRIDE_FIELD_BITS: u32 = 0xBFFF_0000;
 
 /// Dwords each written device-address range owns in the flattened table:
 /// base low, base high, size.
@@ -252,6 +279,16 @@ impl ShaderResourcePlan {
             plan.info.uses_device_addresses = true;
         }
 
+        for index in 0..plan.info.buffers.len() {
+            let source = plan.info.buffers[index].source as usize;
+            let word = plan.descriptor_sources.get(source).and_then(|s| s.dwords.get(1).copied());
+            plan.info.buffers[index].runtime_stride = match runtime_strides() {
+                RuntimeStrides::Never => false,
+                RuntimeStrides::Computed => word.is_some_and(|w| plan.computes_stride_field(w)),
+                RuntimeStrides::All => true,
+            };
+        }
+
         let mut materialization = Vec::new();
         materialization.extend(plan.info.buffers.iter().map(|b| b.source));
         for image in &plan.info.images {
@@ -334,6 +371,56 @@ impl ShaderResourcePlan {
         let mut validator = RuntimeValueValidator::new(&self.graph, self.table_reads.len());
         let ok = validator.validate(value);
         (ok, validator.control_dependent)
+    }
+
+    /// `word` (word 1 of a V#) gets its stride field from an operation on
+    /// data that is not constant: the program computes the word (`pointer
+    /// high | stride << 16`, an add with carry into it, ...) and some bit
+    /// of STRIDE or SWIZZLE_ENABLE is not fixed by the program's constants.
+    /// A word read as it is (user data, a table or buffer word) is the
+    /// title's descriptor word; a select or join of such words is one too.
+    fn computes_stride_field(&self, word: ValueId) -> bool {
+        let mut seen = HashSet::new();
+        let mut pending = vec![word];
+        while let Some(value) = pending.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            let node = self.graph.node(value);
+            match node.kind {
+                ValueKind::Select => pending.extend(node.operands.iter().skip(1).copied()),
+                ValueKind::Phi => pending.extend(node.operands.iter().copied()),
+                ValueKind::Operation if self.known_bits(value, 0).0 & STRIDE_FIELD_BITS != STRIDE_FIELD_BITS => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// `(mask, bits)`: the bits of a dword value the program's constants
+    /// fix, through AND, OR and constant shifts.
+    fn known_bits(&self, value: ValueId, depth: u32) -> (u32, u32) {
+        let node = self.graph.node(value);
+        if node.is_constant() {
+            return (u32::MAX, node.payload as u32);
+        }
+        if node.kind != ValueKind::Operation || node.operands.len() != 2 || depth >= 16 {
+            return (0, 0);
+        }
+        let (ma, a) = self.known_bits(node.operands[0], depth + 1);
+        let shift = self.graph.constant_u32(node.operands[1]).filter(|&n| n < 32);
+        match (node.op, shift) {
+            (ScalarOp::ShiftLeft32, Some(n)) => (ma << n | ((1u32 << n) - 1), a << n),
+            (ScalarOp::ShiftRightLogical32, Some(n)) => (ma >> n | !(u32::MAX >> n), a >> n),
+            (ScalarOp::And32 | ScalarOp::Or32, _) => {
+                let (mb, b) = self.known_bits(node.operands[1], depth + 1);
+                // A zero fixes an AND's bit, a one an OR's.
+                let (fa, fb) = if node.op == ScalarOp::And32 { (ma & !a, mb & !b) } else { (ma & a, mb & b) };
+                let mask = (ma & mb) | fa | fb;
+                (mask, if node.op == ScalarOp::And32 { a & b } else { a | b } & mask)
+            }
+            _ => (0, 0),
+        }
     }
 
     /// Every flattened slot an indirect table's descriptor depends on is read

@@ -456,8 +456,9 @@ pub(super) fn patch_replayed_into(
 /// specialization and snapshot layout: per buffer the stride / swizzle
 /// and format word, per image whether it is null or valid, its format
 /// and its swizzle / level / type word, and the sampler words when a
-/// depth compare may be emulated. Addresses, sizes and record counts are
-/// left out: draws that differ only there share one specialization.
+/// depth compare may be emulated. Addresses, sizes and record counts
+/// (but for whether a buffer has records at all) are left out: draws that
+/// differ only there share one specialization.
 /// `spans`: as for [`patch_replayed`].
 pub(super) fn specialization_signature(plan: &ShaderResourcePlan, spans: &[(u32, u32)], words: &[u32], out: &mut Vec<u32>) -> bool {
     out.clear();
@@ -466,13 +467,34 @@ pub(super) fn specialization_signature(plan: &ShaderResourcePlan, spans: &[(u32,
         return false;
     }
     let get = |(s, e): (u32, u32)| words.get(s as usize..e as usize);
-    for &span in &spans[..nb] {
+    for (buffer, &span) in plan.info.buffers.iter().zip(&spans[..nb]) {
         let Some(w) = get(span) else { return false };
         if w.len() != 4 {
             return false;
         }
-        out.push(w[1] >> 16);
-        out.push(w[3]);
+        // A descriptor the snapshot zeroes (its type bits name no buffer)
+        // or one without records has the one specialization of
+        // [`buffer_specialization`] whatever its stride fields hold; it
+        // never shares a template with a descriptor that has records.
+        let zeroed = w[3] >> 30 != 0;
+        if buffer.runtime_stride && !zeroed {
+            // Its stride fields are read by the module: with or without
+            // records, whatever they hold, one specialization.
+            out.push(u32::MAX - 1);
+            out.push(if buffer.formatted { w[3] & 0x7FFFF } else { 0 });
+        } else if zeroed || no_records(w) {
+            out.push(u32::MAX);
+            out.push(if zeroed {
+                1 << 30
+            } else if buffer.formatted {
+                w[3] & 0x7FFFF
+            } else {
+                0
+            });
+        } else {
+            out.push(w[1] >> 16);
+            out.push(w[3]);
+        }
     }
     for (image, &span) in plan.info.images.iter().zip(&spans[nb..nb + ni]) {
         let Some(d) = get(span) else { return false };
@@ -1357,7 +1379,47 @@ fn storage_mip_count(image: &ImageResource, d: &[u32]) -> u32 {
     }
 }
 
-fn buffer_specialization(words: &[u32], formatted: bool) -> BufferSpecialization {
+/// A V# without records (NUM_RECORDS 0): every OOB_SELECT rule puts every
+/// access through it out of range (`index < records`, `records != 0`, and
+/// the raw rule's payload inside `records - soffset` bytes all fail), so
+/// its stride, swizzle, thread-id and range-rule fields decide nothing. A
+/// program that builds its V#s from a pointer and a count leaves whatever
+/// the pointer's upper word holds in those fields when the count is 0.
+pub(super) fn no_records(words: &[u32]) -> bool {
+    words[2] == 0
+}
+
+/// The module-affecting fields of a V#. One without records
+/// ([`no_records`]) has one specialization whatever its stride fields
+/// hold: that of a zero stride with the range rule 0, whose module puts
+/// every access out of range, as the console does for a V# without
+/// records. Its format and destination select stay (an out-of-range
+/// formatted load still returns the constant 1 of a component selected as
+/// one).
+///
+/// `runtime_stride` ([`BufferResource::runtime_stride`]): the stride
+/// fields are whatever the program computed, so they are not part of the
+/// specialization at all ([`RUNTIME_STRIDE`]: the module decodes them from
+/// the descriptor words in its registers and applies the range rules to
+/// them, with or without records). `zeroed`: the snapshot zeroed the
+/// descriptor (its type bits name no buffer) and binds nothing, while the
+/// program's registers still hold the words: that keeps the specialization
+/// of a zero stride, which puts every access out of range.
+fn buffer_specialization(words: &[u32], formatted: bool, runtime_stride: bool, zeroed: bool) -> BufferSpecialization {
+    if runtime_stride && !zeroed {
+        return BufferSpecialization {
+            packed_stride: RUNTIME_STRIDE,
+            descriptor_format: if formatted { (words[3] >> 12) & 0x7F } else { INVALID_FORMAT },
+            descriptor_swizzle: if formatted { words[3] & 0xFFF } else { IDENTITY_DESTINATION_SELECT },
+        };
+    }
+    if no_records(words) {
+        return BufferSpecialization {
+            packed_stride: 0,
+            descriptor_format: if formatted { (words[3] >> 12) & 0x7F } else { INVALID_FORMAT },
+            descriptor_swizzle: if formatted { words[3] & 0xFFF } else { IDENTITY_DESTINATION_SELECT },
+        };
+    }
     let stride = (words[1] >> 16) & 0x3FFF;
     let swizzle_enabled = words[1] >> 31 != 0;
     let index_stride = (words[3] >> 21) & 3;
@@ -1463,12 +1525,13 @@ fn build_specialization(plan: &ShaderResourcePlan, snapshot: &mut MaterializedSn
         if words.len() != 4 {
             return Err(other(format!("buffer descriptor {index} has invalid width")));
         }
-        if words[3] >> 30 != 0 {
+        let zeroed = words[3] >> 30 != 0;
+        if zeroed {
             words.iter_mut().for_each(|w| *w = 0);
             snapshot.buffer_zeroed.resize(index + 1, false);
             snapshot.buffer_zeroed[index] = true;
         }
-        buffers.push(buffer_specialization(words, buffer.formatted));
+        buffers.push(buffer_specialization(words, buffer.formatted, buffer.runtime_stride, zeroed));
     }
 
     for index in 0..images.len() {
@@ -1712,7 +1775,7 @@ fn build_specialization(plan: &ShaderResourcePlan, snapshot: &mut MaterializedSn
             if words[3] >> 30 != 0 {
                 words = vec![0; 4];
             }
-            buffers.push(buffer_specialization(&words, true));
+            buffers.push(buffer_specialization(&words, true, false, false));
             snapshot.buffers.push(words.into());
         }
         let mapping_offset = mapping_cursor;
@@ -1794,7 +1857,18 @@ pub fn apply_specialization(plan: &ShaderResourcePlan, specialization: &Resource
         )));
     }
     let mut info = source.clone();
-    for (buffer, s) in info.buffers.iter_mut().zip(&specialization.buffers) {
+    for (index, (buffer, s)) in info.buffers.iter_mut().zip(&specialization.buffers).enumerate() {
+        // A V# with run-time stride fields has two specializations: the
+        // run-time one and that of a zeroed descriptor. Any other was made
+        // by a planner that specialized the stride of this buffer; no draw
+        // asks for its module.
+        let stride_at_run_time = s.packed_stride == RUNTIME_STRIDE;
+        if (s.packed_stride & RUNTIME_STRIDE != 0 && !stride_at_run_time) || (buffer.runtime_stride != stride_at_run_time && s.packed_stride != 0) {
+            return Err(ResourcePlanError::new(format!(
+                "shader resource specialization does not match the plan: hash=0x{:016X} stage={:?} buffer {index} stride fields {:#x}, run-time stride {}",
+                plan.hash, plan.stage, s.packed_stride, buffer.runtime_stride
+            )));
+        }
         buffer.packed_stride = s.packed_stride;
         buffer.descriptor_format = s.descriptor_format;
         buffer.descriptor_swizzle = s.descriptor_swizzle;

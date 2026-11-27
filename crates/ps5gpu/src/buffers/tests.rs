@@ -286,6 +286,43 @@ fn buffer_download_through_staging_ring() {
     dev.wait_idle();
 }
 
+/// A mirror in the AMM window (8 TiB) is found again by its pages: the
+/// second and third use of ranges inside it make no buffer.
+#[test]
+#[ignore]
+fn buffers_in_the_amm_window_are_found_again() {
+    let mem = test_memory();
+    let len = 4 << 20;
+    let (view, _) = crate::testutil::amm_guest_mapping(mem, len);
+    assert!(view >= 0x800_0000_0000, "{view:#x}");
+    // SAFETY: freshly mapped, unwatched guest view.
+    unsafe { std::ptr::write_bytes(view as *mut u8, 0x5A, len) };
+    let dev = GpuDevice::create(false).expect("device");
+    let tracker = Arc::new(GuestPageTracker::new(mem.pages.clone()));
+    let shared = Arc::new(Mutex::new(Shared {
+        sched: Scheduler::new(&dev).unwrap(),
+        cache: BufferCache::new(&dev, mem, tracker.clone()).unwrap(),
+    }));
+    mem.attach(Arc::new(Store { shared: shared.clone(), tracker: tracker.clone() }), Arc::new(NoImages), Arc::new(NoUnmap));
+    {
+        let mut g = shared.lock().unwrap();
+        let Shared { sched, cache } = &mut *g;
+        let a = view + 8 * CACHING_PAGE;
+        let first = cache.obtain(sched, a, 4 * CACHING_PAGE, false).unwrap();
+        let key = cache.find_containing(a, 4 * CACHING_PAGE).expect("the buffer is indexed");
+        assert_eq!(cache.stats.misses, 1);
+        let again = cache.obtain(sched, a + 100, CACHING_PAGE, false).unwrap();
+        let written = cache.obtain(sched, a + CACHING_PAGE, 2 * CACHING_PAGE, true).unwrap();
+        assert_eq!(cache.stats.misses, 1, "uses inside the buffer made buffers");
+        assert_eq!((again.buffer, written.buffer), (first.buffer, first.buffer));
+        assert_eq!(again.offset, first.offset + 100);
+        assert_eq!(cache.find_containing(a + CACHING_PAGE, 16), Some(key));
+        assert_eq!(read_device(&dev, sched, first.buffer, first.offset, 16), vec![0x5A; 16]);
+        sched.flush();
+    }
+    dev.wait_idle();
+}
+
 /// An unmap of part of a buffer drops the whole buffer: the GPU data it
 /// holds outside the unmapped range reaches guest memory first.
 #[test]

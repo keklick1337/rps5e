@@ -23,8 +23,10 @@
 //!   (written with the mirror's own table entries).
 //!
 //! The table has the layout of the mirror page table
-//! ([`super::BDA_PAGE_COUNT`] entries of [`super::CACHING_PAGE`] bytes), so
-//! the emitted translation is the same for both.
+//! ([`super::BDA_ENTRY_COUNT`] entries, a page of [`super::CACHING_PAGE`]
+//! bytes each), so the emitted translation is the same for both. Imports
+//! and their page maps cover its low range ([`super::BDA_PAGE_COUNT`]
+//! pages); the entries of the window of automatic memory stay zero here.
 
 use super::{BDA_PAGE_COUNT, BUFFER_USAGE, CACHING_PAGE, CACHING_PAGE_BITS};
 use crate::device::{Buffer, GpuDevice, MemoryUse};
@@ -130,7 +132,7 @@ pub struct GuestImports {
     alias_base: u64,
     alias_size: u64,
     chunks: Vec<Chunk>,
-    /// The import table (device-local, [`BDA_PAGE_COUNT`] u64 entries).
+    /// The import table (device-local, [`super::BDA_ENTRY_COUNT`] u64 entries).
     pub table: Buffer,
     /// Pages that have an import (one bit per page).
     backed: Vec<u64>,
@@ -201,7 +203,7 @@ impl GuestImports {
             log::warn!("ps5gpu: guest memory cannot be imported (alias {base:#x}+{size:#x}, host import {}, alignment {align:#x})", dev.caps.external_memory_host);
             return Ok(None);
         }
-        let table = Buffer::new(dev, BDA_PAGE_COUNT * 8, BUFFER_USAGE, MemoryUse::Device)?;
+        let table = Buffer::new(dev, super::BDA_ENTRY_COUNT * 8, BUFFER_USAGE, MemoryUse::Device)?;
         let cb = sched.cmd();
         // SAFETY: recording buffer.
         unsafe { dev.device.cmd_fill_buffer(cb, table.buffer, 0, vk::WHOLE_SIZE, 0) };

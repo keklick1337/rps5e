@@ -56,6 +56,7 @@ pub mod blit;
 pub mod layout;
 pub mod pool;
 pub mod sampled_dcc;
+mod vram;
 
 use crate::buffers::BufferCache;
 use crate::device::{Buffer, GpuDevice, Image, ImageView, MemoryUse};

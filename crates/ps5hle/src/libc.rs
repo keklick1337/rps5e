@@ -1924,7 +1924,7 @@ mod tests {
     }
 
     /// malloc_usable_size: at least the requested size for small and large
-    /// blocks, 0 for NULL, a freed block or an address inside a block.
+    /// blocks, 0 for NULL or an address inside a block.
     #[test]
     fn malloc_usable_size_covers_the_request() {
         let vm = ps5vm::VirtualMemory::new();
@@ -1942,8 +1942,9 @@ mod tests {
         assert!((33..33 + DEFAULT_ALIGN).contains(&u), "usable {u}");
         assert_eq!(call(&mut ctx, cb_malloc_usable_size, 0), 0);
         assert_eq!(call(&mut ctx, cb_malloc_usable_size, large + 8), 0);
+        // A freed block is not asked about: the heap is the process's, and
+        // another test may hold that address again by then.
         call(&mut ctx, cb_free, large);
-        assert_eq!(call(&mut ctx, cb_malloc_usable_size, large), 0, "freed block");
         call(&mut ctx, cb_free, small);
         call(&mut ctx, cb_free, odd);
     }

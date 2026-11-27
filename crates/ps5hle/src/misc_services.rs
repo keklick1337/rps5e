@@ -32,11 +32,12 @@ pub(crate) fn fill_random(buf: &mut [u8]) {
     }
 }
 
-/// sceRandomGetRandomNumber(void* buf, size_t size): at most 64 bytes.
+/// sceRandomGetRandomNumber(void* buf, size_t size): at most 64 bytes; a
+/// null buffer is refused even when no byte is asked for.
 fn cb_random_get_random_number(ctx: &mut CpuContext) -> HleResult {
     let dst = ctx.rdi();
     let size = ctx.rsi();
-    if (dst == 0 && size != 0) || size > MAX_RANDOM_BYTES {
+    if dst == 0 || size > MAX_RANDOM_BYTES {
         return RANDOM_ERROR_INVALID;
     }
     if size == 0 {
@@ -441,8 +442,17 @@ mod tests {
         ctx.set(Rsi, 64);
         assert_eq!(cb_random_get_random_number(&mut ctx), 0);
         assert_ne!(ctx.read_bytes(BASE, 64).unwrap(), vec![0u8; 64]);
+        // A null buffer is refused for any size, zero included; a real
+        // buffer with size 0 succeeds and is left alone.
         ctx.set(Rdi, 0);
+        for size in [0, 1] {
+            ctx.set(Rsi, size);
+            assert_eq!(cb_random_get_random_number(&mut ctx), RANDOM_ERROR_INVALID, "size {size}");
+        }
+        ctx.write_bytes(BASE + 0x100, &[0xA5]);
+        ctx.set(Rdi, BASE + 0x100);
         ctx.set(Rsi, 0);
         assert_eq!(cb_random_get_random_number(&mut ctx), 0);
+        assert_eq!(ctx.read_bytes(BASE + 0x100, 1).unwrap(), [0xA5]);
     }
 }

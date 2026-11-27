@@ -555,3 +555,46 @@ fn finds_hoisted_table_calls() {
         }
     }
 }
+
+/// A caller that keeps its loop bound in s13, next to the link in
+/// s[14:15]: v_cmpx_gt_i32 s13, v0 at the loop head, the callee's pointer
+/// copied from s[6:7] to s[16:17], the call through s[4:5].
+const BOUND_BESIDE_LINK_CALLER: [u32; 10] =
+    [0x7d28000d, 0xbf880007, 0xbe8e0304, 0xbe8f0305, 0xbe900306, 0xbe910307, 0x4a0000c0, 0xbe8e210e, 0xbf82fff7, 0xbf810000];
+/// Its callee: three scalar loads through the pointer in s[16:17], a
+/// global load through the address they give, the return through s[14:15].
+const POINTER_READING_CALLEE: [u32; 20] = [
+    0xbeeb03ff, 0x0000001f, 0xbfa00001, 0x340c0a82, 0xf4041a88, 0xfa000000, 0xf4040488, 0xfa00000c, 0xf4000408, 0xfa000014, 0xd7460006, 0x04190306,
+    0xbf8cc07f, 0xdc3c8000, 0x066a0006, 0xbf8c3f70, 0x060c0c12, 0x06101010, 0x060e0e13, 0xbefd210e,
+];
+
+/// A scalar source of a vector instruction is one register (the value is
+/// broadcast to the lanes): the compare operand in the register before a
+/// held link does not read the link, so the call is modelled and the
+/// callee's loads are planned. A lane-mask source spans the register pair
+/// and does read it.
+#[test]
+fn scalar_operands_of_vector_instructions_are_one_register() {
+    let site = CallSite { user_data_count: 16, ..SITE };
+    let program = decode(&BOUND_BESIDE_LINK_CALLER);
+    let calls = find_user_data_calls(&program, site);
+    assert_eq!(calls, vec![UserDataCall { pc: 0x1c, link: 14, user_data_register: 4 }]);
+    let callee = {
+        let mut words = POINTER_READING_CALLEE.to_vec();
+        *words.last_mut().unwrap() = 0xbe80200e;
+        words
+    };
+    let linked = link_calls(&program, &BOUND_BESIDE_LINK_CALLER, &calls, &[callee], &[], &[]).unwrap().code;
+    cfg_of(&linked).unwrap();
+    let plan = ps5shader::resources::ShaderResourcePlan::extract(decode(&linked), ps5shader::resources::ShaderStage::Compute, 1, 0, 16, None, 64).unwrap();
+    let callee_loads = plan.memory().entries().iter().filter(|m| m.pc >= 0x28).count();
+    assert!(callee_loads >= 6, "{callee_loads} memory records in the callee");
+
+    // v_cndmask_b32 v12, v50, v51, s13: the mask is s[13:14].
+    // (one word longer: the branch back to it moves with it).
+    let mut mask = linked.clone();
+    mask.splice(0..1, [0xd501000c, 0x00366732]);
+    assert_eq!(mask[9], 0xbf82fff7);
+    mask[9] = 0xbf82fff6;
+    expect("escapes", cfg_of(&mask));
+}

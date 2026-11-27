@@ -3417,6 +3417,19 @@ fn builders_follow_the_console_library() {
     let r = e.call("sceAgcAcbAcquireMem", &[e.cb(), 0x4000, 0x1000, 0x1000, 40], &[]);
     assert_eq!(built(r, 8), [0xC006_5800, 0, 0x10, 0, 0x10, 0, 2, 0xC000]);
 
+    // AcquireMemSetEngine: bit 0 of the engine byte into control bit 31,
+    // the other control bits kept; any other opcode is refused untouched.
+    let r = e.call("sceAgcDcbAcquireMem", &[e.cb(), 0, 0xFBFF_FFFF, 0x4123, 0x12_3456_7880, 0x200], &[0x10_0000]);
+    assert_eq!(e.call("sceAgcAcquireMemSetEngine", &[r as u64, 1], &[]), 0);
+    assert_eq!(built(r, 8), [0xC006_5800, 0x8200_7FC0, 3, 0, 0x1234_5678, 0, 0xFFFF, 0xC123]);
+    assert_eq!(e.call("sceAgcAcquireMemSetEngine", &[r as u64, 0x102], &[]), 0);
+    assert_eq!(built(r, 2)[1], 0x0200_7FC0);
+    assert_eq!(e.call("sceAgcAcquireMemSetEngine", &[r as u64, 0xFF], &[]), 0);
+    assert_eq!(built(r, 2)[1], 0x8200_7FC0);
+    let other = e.call("sceAgcDcbCondExec", &[e.cb(), 0x12_3456_1002, 7], &[]);
+    assert_eq!(e.call("sceAgcAcquireMemSetEngine", &[other as u64, 1], &[]), ERR_INVALID_PACKET);
+    assert_eq!(built(other, 5), [0xC003_2200, 0x3456_1000, 0x12, 0, 7]);
+
     // CondExec takes any arguments.
     let r = e.call("sceAgcDcbCondExec", &[e.cb(), 0, 0x4005], &[]);
     assert_ne!(r, 0);

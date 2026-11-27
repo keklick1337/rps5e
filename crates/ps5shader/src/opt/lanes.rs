@@ -120,11 +120,124 @@ pub fn eliminate_read_lanes(func: &mut Function) -> usize {
             }
         }
     }
+    // Spills carried around a loop: the lane's value differs per incoming
+    // edge, so it becomes a phi of the lane's values.
+    let mut carried: HashMap<(Value, u64), Value> = HashMap::default();
+    for b in func.order.clone() {
+        for v in func.block(b).insts.clone() {
+            if func.op(v) != Op::ReadLane || replace.contains_key(&v) {
+                continue;
+            }
+            let (src, lane) = (func.args(v)[0], func.args(v)[1]);
+            let Some(k) = func.as_const(lane) else { continue };
+            let mut memo = HashMap::default();
+            if let Some(LaneIs::PhiOf(p)) = lane_source(func, src, k, &uniform, &mut memo) {
+                let phi = carried_phi(func, p, k, &memo, &mut carried);
+                replace.insert(v, phi);
+            }
+        }
+    }
     let n = replace.len();
     func.replace_uses(&replace);
     n
 }
 
+/// What one lane of a vector value holds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaneIs {
+    /// This value (equal in every invocation).
+    Value(Value),
+    /// What the lane holds at this phi: a phi of the lane's incoming values.
+    PhiOf(Value),
+}
+
+/// The contents of lane `lane` of `v`, through v_writelane selects and
+/// phis (loops included: a phi stands for itself while its incoming values
+/// are resolved). `None`: unknown; `memo` is then of no use.
+fn lane_source(func: &Function, v: Value, lane: u64, uniform: &[bool], memo: &mut HashMap<Value, LaneIs>) -> Option<LaneIs> {
+    if let Some(&known) = memo.get(&v) {
+        return Some(known);
+    }
+    if memo.len() > 4096 {
+        return None;
+    }
+    let d = func.value(v);
+    let found = if uniform[v.index()] || d.op == Op::Undef {
+        LaneIs::Value(v)
+    } else {
+        match d.op {
+            Op::Select => {
+                let c = func.value(d.args[0]);
+                let written = if c.op == Op::ICmp(ICmp::Eq) {
+                    let (l, r) = (c.args[0], c.args[1]);
+                    if func.op(l) == Op::LaneId {
+                        Some(func.as_const(r)?)
+                    } else if func.op(r) == Op::LaneId {
+                        Some(func.as_const(l)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                match written {
+                    Some(k) if k == lane => {
+                        let x = d.args[1];
+                        if !uniform[x.index()] {
+                            return None;
+                        }
+                        LaneIs::Value(x)
+                    }
+                    Some(_) => lane_source(func, d.args[2], lane, uniform, memo)?,
+                    None => {
+                        let (x, y) = (lane_source(func, d.args[1], lane, uniform, memo)?, lane_source(func, d.args[2], lane, uniform, memo)?);
+                        if x != y {
+                            return None;
+                        }
+                        x
+                    }
+                }
+            }
+            Op::Phi => {
+                memo.insert(v, LaneIs::PhiOf(v));
+                for &a in &d.args {
+                    lane_source(func, a, lane, uniform, memo)?;
+                }
+                LaneIs::PhiOf(v)
+            }
+            _ => return None,
+        }
+    };
+    memo.insert(v, found);
+    Some(found)
+}
+
+/// The phi of lane `lane`'s values at vector phi `p` (made once per phi and
+/// lane), placed with `p`.
+fn carried_phi(func: &mut Function, p: Value, lane: u64, memo: &HashMap<Value, LaneIs>, carried: &mut HashMap<(Value, u64), Value>) -> Value {
+    if let Some(&phi) = carried.get(&(p, lane)) {
+        return phi;
+    }
+    let (block, ty, args) = {
+        let d = func.value(p);
+        (d.block.expect("placed phi"), d.ty, d.args.clone())
+    };
+    let phi = func.new_value(Op::Phi, ty, args.clone());
+    func.value_mut(phi).block = Some(block);
+    func.block_mut(block).insts.insert(0, phi);
+    carried.insert((p, lane), phi);
+    for (i, a) in args.into_iter().enumerate() {
+        let incoming = match memo[&a] {
+            LaneIs::Value(x) => x,
+            LaneIs::PhiOf(q) => carried_phi(func, q, lane, memo, carried),
+        };
+        func.value_mut(phi).args[i] = incoming;
+    }
+    phi
+}
+
+/// Does `v` use `target` in the same pass of the code (not through a phi:
+/// what a phi carries is `target` of an earlier loop iteration)?
 fn depends_on(func: &Function, v: Value, target: Value) -> bool {
     let mut stack = vec![v];
     let mut seen = HashSet::default();
@@ -132,7 +245,7 @@ fn depends_on(func: &Function, v: Value, target: Value) -> bool {
         if x == target {
             return true;
         }
-        if !seen.insert(x) || seen.len() > 65536 {
+        if !seen.insert(x) || seen.len() > 65536 || func.op(x) == Op::Phi {
             continue;
         }
         stack.extend(func.args(x).iter().copied());
@@ -1268,5 +1381,69 @@ mod tests {
         assert_eq!(eliminate_masked_selects(&mut f), 0);
         let elapsed = t.elapsed();
         assert!(elapsed.as_secs() < 10, "{elapsed:?}");
+    }
+
+    /// A scalar spilled to a lane before a loop and updated in it (a mask
+    /// with one bit cleared per iteration): the read at the loop's head
+    /// becomes a phi of the two written values, and the read after the
+    /// update of an iteration is the value written in it, though that value
+    /// is computed from the head's read.
+    #[test]
+    fn a_spill_carried_around_a_loop_reads_as_a_phi() {
+        // b0 -> b1 (header) -> b2 (body, back to b1 or out) -> b3
+        let Rig { mut f, blocks, m: _, data } = rig(4);
+        let (init, bit, vec) = (data[0], data[1], data[2]);
+        let lane = f.append(blocks[0], Op::LaneId, Type::U32, vec![]);
+        let k = f.const_u32(14);
+        let at_k = f.append(blocks[0], Op::ICmp(ICmp::Eq), Type::BOOL, vec![lane, k]);
+        // A vector that differs per lane, with `init` written to lane 14.
+        let varying = f.append(blocks[0], Op::IAdd, Type::U32, vec![vec, lane]);
+        let w0 = f.append(blocks[0], Op::Select, Type::U32, vec![at_k, init, varying]);
+        link(&mut f, blocks[0], Terminator::Branch(blocks[1]));
+        f.block_mut(blocks[1]).merge = Merge::Loop { merge: blocks[3], continue_block: blocks[2] };
+        let p = f.append(blocks[1], Op::Phi, Type::U32, vec![w0]);
+        let head = f.append(blocks[1], Op::ReadLane, Type::U32, vec![p, k]);
+        let zero = f.const_u32(0);
+        let done = f.append(blocks[1], Op::ICmp(ICmp::Eq), Type::BOOL, vec![head, zero]);
+        link(&mut f, blocks[1], Terminator::CondBranch { cond: done, then_block: blocks[3], else_block: blocks[2] });
+        let next = f.append(blocks[2], Op::Xor, Type::U32, vec![head, bit]);
+        let w1 = f.append(blocks[2], Op::Select, Type::U32, vec![at_k, next, p]);
+        let again = f.append(blocks[2], Op::ReadLane, Type::U32, vec![w1, k]);
+        let use_again = f.append(blocks[2], Op::IAdd, Type::U32, vec![again, bit]);
+        link(&mut f, blocks[2], Terminator::Branch(blocks[1]));
+        f.value_mut(p).args.push(w1);
+        f.block_mut(blocks[3]).term = Terminator::Return;
+        assert_eq!(eliminate_read_lanes(&mut f), 2);
+        let cond = f.args(done)[0];
+        assert_eq!(f.op(cond), Op::Phi);
+        assert_eq!(f.block(blocks[1]).insts[0], cond, "phis lead their block");
+        assert_eq!(f.args(cond), &[init, next]);
+        assert_eq!(f.args(next)[0], cond);
+        assert_eq!(f.args(use_again)[0], next);
+    }
+
+    /// A lane whose written value differs per invocation is still read.
+    #[test]
+    fn a_carried_lane_of_varying_values_is_still_read() {
+        let Rig { mut f, blocks, m: _, data } = rig(4);
+        let (init, vec) = (data[0], data[2]);
+        let lane = f.append(blocks[0], Op::LaneId, Type::U32, vec![]);
+        let k = f.const_u32(14);
+        let at_k = f.append(blocks[0], Op::ICmp(ICmp::Eq), Type::BOOL, vec![lane, k]);
+        let varying = f.append(blocks[0], Op::IAdd, Type::U32, vec![vec, lane]);
+        let w0 = f.append(blocks[0], Op::Select, Type::U32, vec![at_k, init, varying]);
+        link(&mut f, blocks[0], Terminator::Branch(blocks[1]));
+        f.block_mut(blocks[1]).merge = Merge::Loop { merge: blocks[3], continue_block: blocks[2] };
+        let p = f.append(blocks[1], Op::Phi, Type::U32, vec![w0]);
+        let head = f.append(blocks[1], Op::ReadLane, Type::U32, vec![p, k]);
+        let zero = f.const_u32(0);
+        let done = f.append(blocks[1], Op::ICmp(ICmp::Eq), Type::BOOL, vec![head, zero]);
+        link(&mut f, blocks[1], Terminator::CondBranch { cond: done, then_block: blocks[3], else_block: blocks[2] });
+        let w1 = f.append(blocks[2], Op::Select, Type::U32, vec![at_k, varying, p]);
+        link(&mut f, blocks[2], Terminator::Branch(blocks[1]));
+        f.value_mut(p).args.push(w1);
+        f.block_mut(blocks[3]).term = Terminator::Return;
+        assert_eq!(eliminate_read_lanes(&mut f), 0);
+        assert_eq!(f.args(done)[0], head);
     }
 }

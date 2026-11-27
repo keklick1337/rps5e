@@ -8,7 +8,7 @@
 
 use super::emit::{Emitter, R, SCOPE_DEVICE, SCOPE_WORKGROUP};
 use ps5shader::interp::buffer::{format_source, FormatInfo, FormatKind, FormatSource};
-use ps5shader::resources::{bindless, native_binding_index, DescriptorBindingKind, ResourceBinding, ResourceOperand, ShaderStage};
+use ps5shader::resources::{bindless, native_binding_index, DescriptorBindingKind, ResourceBinding, ResourceOperand, ShaderStage, RUNTIME_STRIDE};
 use ps5shader::ssa::*;
 use rspirv::dr::Operand;
 use rspirv::spirv::{Capability, Decoration, GlslStd450Op as GLOp, Op as S, StorageClass as SC, Word};
@@ -58,6 +58,10 @@ pub struct Resources {
     /// The functions converting a preloaded formatted element through a
     /// run-time format ([`format_function_enabled`]), without and with d16.
     pub format_fns: [Option<Word>; 2],
+    /// The functions encoding one component of a formatted store through a
+    /// run-time format ([`format_store_function_enabled`]), without and
+    /// with d16.
+    pub format_store_fns: [Option<Word>; 2],
     /// Private arrays of [`Emitter::pick`], by (element type, length).
     pub pick_arrays: HashMap<(Word, u32), (Word, Word)>,
     pub u32_block: Option<Word>,
@@ -638,10 +642,26 @@ impl Emitter<'_, '_> {
     fn translate_address(&mut self, addr: Word) -> R<(Word, Word)> {
         let table = self.page_table()?;
         let t64 = self.ty(Type::U64);
-        let shift = self.cu(ps5shader::resources::paging::PAGE_BITS);
+        // The entry of the address's page (`paging::entry_of`): its page
+        // number below the end of the low range; in the window, the pages
+        // from the window's base on after those; the zero entry for every
+        // other address.
+        use ps5shader::resources::paging;
+        let tb = self.t_bool();
+        let shift = self.cu(paging::PAGE_BITS);
         let page64 = self.ins(S::ShiftRightLogical, t64, &[addr, shift]);
-        let limit = self.c64(crate::buffers::BDA_PAGE_COUNT - 1);
-        let page64 = self.ins(S::BitwiseAnd, t64, &[page64, limit]);
+        let low_end = self.c64(paging::LOW_BYTES);
+        let low = self.ins(S::ULessThan, tb, &[addr, low_end]);
+        let base = self.c64(paging::WINDOW_BASE);
+        let offset = self.ins(S::ISub, t64, &[addr, base]);
+        let bytes = self.c64(paging::WINDOW_BYTES);
+        let inside = self.ins(S::ULessThan, tb, &[offset, bytes]);
+        let window_page = self.ins(S::ShiftRightLogical, t64, &[offset, shift]);
+        let first = self.c64(paging::LOW_PAGES);
+        let window_entry = self.ins(S::IAdd, t64, &[window_page, first]);
+        let none = self.c64(paging::NO_ENTRY);
+        let high = self.ins(S::Select, t64, &[inside, window_entry, none]);
+        let page64 = self.ins(S::Select, t64, &[low, page64, high]);
         let tu = self.t_u32();
         let page = self.ins(S::UConvert, tu, &[page64]);
         let p = self.ptr(SC::StorageBuffer, t64);
@@ -1152,7 +1172,11 @@ impl Emitter<'_, '_> {
                 let b = self.iadd(offset, adjust);
                 self.band(b, three)
             }
-            Target::Device { .. } => self.band(offset, three),
+            Target::Device { base } => {
+                let (lo, _) = self.split64(base);
+                let s = self.iadd(lo, offset);
+                self.band(s, three)
+            }
         };
         let eight = self.cu(8);
         let shift = self.imul(low, eight);
@@ -1289,10 +1313,13 @@ enum Swizzle {
 
 impl Emitter<'_, '_> {
     /// The specialized V# stride fields of a bound buffer (stride |
-    /// swizzle << 14 | index stride << 16 | add-tid << 20).
+    /// swizzle << 14 | index stride << 16 | add-tid << 20 | OOB_SELECT <<
+    /// 24). None for a buffer whose stride fields are run-time values
+    /// ([`RUNTIME_STRIDE`]): its accesses decode them from the descriptor
+    /// words in the program's registers, as device-address accesses do.
     fn packed_stride(&self, v: Value) -> Option<u32> {
         let i = self.buffer_resource(v)?;
-        self.input.request.resources.info.buffers.get(i as usize).map(|b| b.packed_stride)
+        self.input.request.resources.info.buffers.get(i as usize).map(|b| b.packed_stride).filter(|&p| p != RUNTIME_STRIDE)
     }
 
     fn buffer_address(&mut self, v: Value, attr: &BufferAttr, desc: Word, vindex: Word, voffset: Word, soffset: Word) -> BufferAddress {
@@ -1310,7 +1337,8 @@ impl Emitter<'_, '_> {
         let w3 = self.extract(tu, desc, 3);
         let oob = self.bits(w3, 28, 2);
         // Bound buffers are compiled for their descriptor's stride fields;
-        // device-address accesses decode them at run time.
+        // device-address accesses and buffers whose stride the program
+        // computes decode them at run time.
         let packed = self.packed_stride(v);
         let known = packed.map(|p| (p & 0x3FFF, (p >> 24) & 3));
         let (stride, swizzle, index_stride, add_tid) = match packed {
@@ -3076,7 +3104,8 @@ fn format_call(e: &mut Emitter, p: &Preloaded, format: Word, d16: bool) -> Word 
     e.call(t4, id, &args)
 }
 
-/// Define the conversion functions [`format_call`] used.
+/// Define the conversion functions [`format_call`] and [`store_field`]
+/// used.
 pub(super) fn emit_format_functions(e: &mut Emitter) -> R<()> {
     for d16 in [false, true] {
         let Some(id) = e.res.format_fns[d16 as usize] else { continue };
@@ -3102,6 +3131,17 @@ pub(super) fn emit_format_functions(e: &mut Emitter) -> R<()> {
                 .collect();
             let p = Preloaded { words: args[1..1 + words].to_vec(), low, ok };
             Ok(format_components_preloaded(e, &p, format, d16))
+        })?;
+    }
+    for d16 in [false, true] {
+        let Some(id) = e.res.format_store_fns[d16 as usize] else { continue };
+        let tu = e.t_u32();
+        // (format, component, register value) -> the component's field.
+        e.define_function(id, tu, &[tu; 3], |e, args| {
+            let seven = e.cu(7);
+            let c = e.shl(args[1], seven);
+            let sel = e.bor(args[0], c);
+            Ok(store_field_switch(e, sel, 4 * 128, args[2], d16, |s| (s & 127, s >> 7)))
         })?;
     }
     Ok(())
@@ -3611,24 +3651,56 @@ fn ufloat_to_f32(e: &mut Emitter, raw: Word, bits: u32) -> Word {
     e.select(tu, is0, den, r)
 }
 
+/// `RPS5E_FORMAT_STORE_FUNCTION=0`: every formatted store through a
+/// run-time descriptor encodes its components inline, a switch over the
+/// formats per component. On (default) the encoding of one component is
+/// one function of the module ([`emit_format_functions`]) every such store
+/// calls per component.
+pub fn format_store_function_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("RPS5E_FORMAT_STORE_FUNCTION").is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("off")))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_store(
     e: &mut Emitter,
     v: Value,
     t: Target,
     a: &BufferAddress,
-    _desc: Word,
+    desc: Word,
     components: u32,
     typed: Option<u32>,
     d16: bool,
     value: Word,
     vty: Type,
 ) -> R<()> {
+    if typed.is_none() && e.buffer_resource(v).is_none() {
+        return format_store_runtime(e, t, a, desc, components, d16, value, vty);
+    }
     let (format, _) = access_format(e, v, typed)?;
     let Some(info) = FormatInfo::new(format) else {
         // An invalid format (0 among them) stores raw dwords.
         return raw_store(e, t, a, Access::Dwords(components as u8), value, vty);
     };
+    store_element(e, t, a, &info, |e, c| {
+        if c >= components {
+            return e.cu(0);
+        }
+        let d = component(e, value, vty, c);
+        if d16 {
+            super::convert::store_component_d16(e, &info, c, d)
+        } else {
+            super::convert::store_component(e, &info, c, d)
+        }
+    })
+}
+
+/// Store a formatted element of `info` whose component fields `field`
+/// gives (unshifted, masked to their widths): nothing unless every
+/// component's bytes are in range; a packed format is one dword, any other
+/// a store of each component's bytes.
+fn store_element(e: &mut Emitter, t: Target, a: &BufferAddress, info: &FormatInfo, mut field: impl FnMut(&mut Emitter, u32) -> Word) -> R<()> {
+    let info = *info;
     let tu = e.t_u32();
     let mut ok: Option<Word> = None;
     for c in 0..info.count {
@@ -3644,19 +3716,7 @@ fn format_store(
     e.if_then(ok, |e| {
         let r = (|| -> R<()> {
             let zero = e.cu(0);
-            let enc: Vec<Word> = (0..info.count)
-                .map(|c| {
-                    if c >= components {
-                        return zero;
-                    }
-                    let d = component(e, value, vty, c);
-                    if d16 {
-                        super::convert::store_component_d16(e, &info, c, d)
-                    } else {
-                        super::convert::store_component(e, &info, c, d)
-                    }
-                })
-                .collect();
+            let enc: Vec<Word> = (0..info.count).map(|c| field(e, c)).collect();
             if info.packed {
                 let mut word = zero;
                 for c in 0..info.count as usize {
@@ -3683,6 +3743,89 @@ fn format_store(
         }
     });
     err.map_or(Ok(()), Err)
+}
+
+/// The memory layout of a formatted element of unified format `f` (`None`:
+/// an invalid format, stored as raw dwords): what [`store_element`] does
+/// with the component fields depends on nothing else.
+fn layout_case(f: u32) -> Option<(bool, u32, [u32; 4], [u32; 4], [u32; 4])> {
+    FormatInfo::new(f).map(|info| (info.packed, info.count, info.bits, info.byte_offset, info.bit_offset))
+}
+
+/// A formatted store through a descriptor the shader selects at run time
+/// (written through its device address): the format comes from the V#
+/// word 3. Each register component is encoded once for the format's kind
+/// and that component's width ([`store_field`]); one switch over the 128
+/// formats, whose formats with the same memory layout share a case, then
+/// stores the element. An invalid format stores the raw dwords.
+#[allow(clippy::too_many_arguments)]
+fn format_store_runtime(e: &mut Emitter, t: Target, a: &BufferAddress, desc: Word, components: u32, d16: bool, value: Word, vty: Type) -> R<()> {
+    let tu = e.t_u32();
+    let w3 = e.extract(tu, desc, 3);
+    let format = e.bits(w3, 12, 7);
+    let enc: Vec<Word> = (0..components.min(4))
+        .map(|c| {
+            let d = component(e, value, vty, c);
+            store_field(e, format, c, d, d16)
+        })
+        .collect();
+    let zero = e.cu(0);
+    let mut err = None;
+    e.switch_then_shared(format, 128, layout_case, |e, f| {
+        let r = match FormatInfo::new(f) {
+            None => raw_store(e, t, a, Access::Dwords(components as u8), value, vty),
+            // Components the store does not carry are stored as zero.
+            Some(info) => store_element(e, t, a, &info, |_, c| enc.get(c as usize).copied().unwrap_or(zero)),
+        };
+        if let Err(m) = r {
+            err.get_or_insert(m);
+        }
+    });
+    err.map_or(Ok(()), Err)
+}
+
+/// The field of component `c` of run-time format `format` encoding the
+/// register value `data` (`data` itself for an invalid format or past the
+/// format's components, where nothing reads it).
+fn store_field(e: &mut Emitter, format: Word, c: u32, data: Word, d16: bool) -> Word {
+    if !format_store_function_enabled() {
+        return store_field_switch(e, format, 128, data, d16, |f| (f, c));
+    }
+    let tu = e.t_u32();
+    let id = match e.res.format_store_fns[d16 as usize] {
+        Some(id) => id,
+        None => {
+            let id = e.b.id();
+            e.res.format_store_fns[d16 as usize] = Some(id);
+            id
+        }
+    };
+    let c = e.cu(c);
+    e.call(tu, id, &[format, c, data])
+}
+
+/// [`store_field`] as a switch over the `count` values of `sel`, each
+/// naming a (format, component) through `of`: the selectors whose format
+/// kind and component width agree share one case.
+fn store_field_switch(e: &mut Emitter, sel: Word, count: u32, data: Word, d16: bool, of: impl Fn(u32) -> (u32, u32)) -> Word {
+    let tu = e.t_u32();
+    e.switch_value_shared(
+        sel,
+        count,
+        tu,
+        |s| {
+            let (f, c) = of(s);
+            conversion_case(f, c)
+        },
+        |e, s| {
+            let (f, c) = of(s);
+            match FormatInfo::new(f) {
+                Some(info) if c < info.count && d16 => super::convert::store_component_d16(e, &info, c, data),
+                Some(info) if c < info.count => super::convert::store_component(e, &info, c, data),
+                _ => data,
+            }
+        },
+    )
 }
 
 /// DS_MIN_F32 / DS_MAX_F32 replacement value (see `AtomicOp::DsFMin`).

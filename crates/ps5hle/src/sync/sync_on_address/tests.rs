@@ -262,6 +262,7 @@ fn wake_zero_is_noop() {
 
 #[test]
 fn guest_entry_points() {
+    let _scratch = crate::test_bases::scratch_lock(BASE);
     let w = word(9, 0);
     let t = word(9, 1);
     store32(w, 5);
@@ -291,6 +292,7 @@ fn guest_entry_points() {
 /// cases).
 #[test]
 fn umtx_op_wait_wake_and_timeouts() {
+    let _scratch = crate::test_bases::scratch_lock(BASE);
     use crate::context::CpuRegister::{Rcx, Rdi, Rdx, Rsi, R8};
     const WAIT: u64 = 2;
     const WAKE: u64 = 3;
@@ -422,6 +424,7 @@ fn umtx_op_wait_wake_and_timeouts() {
 /// UMTX_OP_NWAKE_PRIVATE wakes every waiter of each listed address.
 #[test]
 fn umtx_nwake_private_wakes_each_listed_address() {
+    let _scratch = crate::test_bases::scratch_lock(BASE);
     use crate::context::CpuRegister::{Rcx, Rdi, Rdx, Rsi, R8};
     let (a, b, list) = (word(14, 0), word(14, 1), word(14, 4));
     store32(a, 1);
@@ -452,6 +455,7 @@ fn umtx_nwake_private_wakes_each_listed_address() {
 /// plus a wake of their own address.
 #[test]
 fn byte_and_halfword_waits() {
+    let _scratch = crate::test_bases::scratch_lock(BASE);
     let w = word(15, 0);
     store64(w, 0);
     let b = w + 1;
@@ -508,6 +512,7 @@ fn sync_on_address_nids_match_names() {
 /// without waiters succeeds; NULL is EFAULT (reference GuestUmtxOp cases).
 #[test]
 fn umtx_op_semaphore() {
+    let _scratch = crate::test_bases::scratch_lock(BASE);
     use crate::context::CpuRegister::{Rcx, Rdi, Rdx, Rsi, R8};
     const SEM_WAIT: u64 = 19;
     const SEM_WAKE: u64 = 20;

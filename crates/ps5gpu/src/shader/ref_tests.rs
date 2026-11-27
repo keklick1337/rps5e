@@ -179,14 +179,42 @@ fn compile_case_full(
     runs: usize,
     split: Option<bool>,
 ) -> Result<crate::pipeline::compiler::CompiledShader, String> {
+    compile_case_planned(c, features, validator, runs, split, &|_| {})
+}
+
+/// [`compile_case_full`] with the plan changed by `replan` before it is
+/// materialised.
+fn compile_case_planned(
+    c: &RefCase,
+    features: Features,
+    validator: Option<&std::path::Path>,
+    runs: usize,
+    split: Option<bool>,
+    replan: &dyn Fn(&mut ShaderResourcePlan),
+) -> Result<crate::pipeline::compiler::CompiledShader, String> {
+    compile_case_with_user_data(c, features, validator, runs, split, replan, case_user_data(c))
+}
+
+/// [`compile_case_planned`] with the descriptors of `user_data` instead of
+/// the case's own.
+fn compile_case_with_user_data(
+    c: &RefCase,
+    features: Features,
+    validator: Option<&std::path::Path>,
+    runs: usize,
+    split: Option<bool>,
+    replan: &dyn Fn(&mut ShaderResourcePlan),
+    user_data: Vec<u32>,
+) -> Result<crate::pipeline::compiler::CompiledShader, String> {
     let bytes: Vec<u8> = c.code.iter().flat_map(|w| w.to_le_bytes()).collect();
     let program = decode_blob(&bytes, CODE_ADDRESS).map_err(|e| format!("decode: {e}"))?;
     let wave = c.compute.wave_size;
     let user = BindingLayout::collect_user_data_registers(&program, 0, 64);
     let gds = BindingLayout::uses_global_data_share(&program);
     let shader_base = BindingLayout::reads_shader_base(&program);
-    let plan = ShaderResourcePlan::extract(program, ShaderStage::Compute, 1, 0, 64, None, wave).map_err(|e| format!("plan: {e:?}"))?;
-    let user_data = case_user_data(c);
+    let mut plan = ShaderResourcePlan::extract(program, ShaderStage::Compute, 1, 0, 64, None, wave).map_err(|e| format!("plan: {e:?}"))?;
+    replan(&mut plan);
+    let plan = plan;
     let initial = c.initial;
     let code = c.code;
     let read = move |a: u64| -> Option<u32> {
@@ -354,6 +382,52 @@ fn horizontal_gather_uses_const_offsets() {
     let spirv = compile_case(&horizontal, FEATURES, spirv_val().as_deref()).unwrap();
     let masks = gather_operand_masks(&spirv);
     assert!(masks.iter().any(|m| m & ImageOperands::CONST_OFFSETS.bits() != 0), "no gather with constant offsets: {masks:?}");
+}
+
+/// A gather needs a 2D host image: gathering through a volume T# (what a
+/// program translated for descriptors that are not its own may hold) is
+/// refused, never emitted (an `OpImageGather` of a 3D image is invalid
+/// SPIR-V, and a driver compiler aborts the process on it).
+#[test]
+fn gather_of_a_volume_image_is_refused() {
+    use ps5shader::resources::format::image_format::{TYPE_1D, TYPE_2D, TYPE_3D};
+    let c = case("ImageGather2DInstructionWith1DDescriptor");
+    let compile = |ty: u32| {
+        let mut user = case_user_data(c);
+        assert_eq!(user[3] >> 28, TYPE_1D, "the case's T# is its first user data");
+        user[3] = (user[3] & 0x0FFF_FFFF) | (ty << 28);
+        compile_case_with_user_data(c, FEATURES, spirv_val().as_deref(), super::exec_run_minimum(), None, &|_| {}, user).map(|out| out.spirv)
+    };
+    let plane = compile(TYPE_2D).unwrap();
+    assert!(has_op(&plane, rspirv::spirv::Op::ImageGather));
+    let e = compile(TYPE_3D).expect_err("a gather the host cannot express");
+    assert!(e.contains("gather of a Dim3D image"), "{e}");
+}
+
+/// Programs are also translated for descriptors that are not their own
+/// (the compile lookahead guesses them): whatever type the T# of an image
+/// case has, the case is refused or compiles to a valid module.
+#[test]
+fn image_cases_with_any_descriptor_type_are_refused_or_valid() {
+    use ps5shader::resources::format::image_format::{TYPE_1D, TYPE_2D_MSAA_ARRAY};
+    let Some(val) = spirv_val() else { return };
+    let mut invalid = Vec::new();
+    for c in image::all() {
+        let own = case_user_data(c);
+        if own.len() < 8 || !(TYPE_1D..=TYPE_2D_MSAA_ARRAY).contains(&(own[3] >> 28)) {
+            continue;
+        }
+        for ty in TYPE_1D..=TYPE_2D_MSAA_ARRAY {
+            let mut user = own.clone();
+            user[3] = (user[3] & 0x0FFF_FFFF) | (ty << 28);
+            if let Err(e) = compile_case_with_user_data(c, FEATURES, Some(&val), super::exec_run_minimum(), None, &|_| {}, user) {
+                if e.starts_with("spirv-val") {
+                    invalid.push(format!("{} with T# type {ty}: {e}", c.name));
+                }
+            }
+        }
+    }
+    assert!(invalid.is_empty(), "{} invalid modules:\n{}", invalid.len(), invalid.join("\n"));
 }
 
 /// The image operands mask of every `OpImageSample*` in a module.
@@ -941,6 +1015,220 @@ fn runtime_format_xyz_loads_through_device_addresses_compile() {
     eprintln!("runtime-format XYZ load: {} SPIR-V words", spirv.len());
     assert!(spirv.len() < RUNTIME_XYZ_WORDS_MAX, "{} SPIR-V words", spirv.len());
 }
+
+/// The function control word of every function of a module.
+fn function_controls(spirv: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut i = 5;
+    while i < spirv.len() {
+        let (op, n) = (spirv[i] & 0xffff, (spirv[i] >> 16) as usize);
+        if op == rspirv::spirv::Op::Function as u32 {
+            out.push(spirv[i + 3]);
+        }
+        i += n.max(1);
+    }
+    out
+}
+
+/// The format conversion function of a module is left to the host
+/// compiler to inline (a module with a real call takes the NVIDIA driver's
+/// slower compiler: GRAND THEFT AUTO VI's ray-tracing resolve programs,
+/// 0.9 M words with 7-14 conversion calls, took 30-41 s per pipeline with
+/// DontInline and 14-20 s without); `helper_inline` off keeps DontInline,
+/// and so do copies that would outweigh the module.
+#[test]
+fn format_functions_are_inlinable() {
+    use rspirv::spirv::{FunctionControl, Op};
+    let c = case("BufferLoadFormatXGpuSelectedDescriptors");
+    let spirv = compile_case(c, FEATURES, spirv_val().as_deref()).unwrap();
+    assert_eq!(has_op(&spirv, Op::FunctionCall), super::memory::format_function_enabled());
+    let controls = function_controls(&spirv);
+    assert!(controls.iter().all(|&c| c == FunctionControl::NONE.bits()), "{controls:?}");
+    let off = Features { emit: super::EmitOptions { helper_inline: false, ..FEATURES.emit }, ..FEATURES };
+    let spirv = compile_case(c, off, spirv_val().as_deref()).unwrap();
+    let controls = function_controls(&spirv);
+    let helpers = controls.len() - 1;
+    assert_eq!(helpers != 0, super::memory::format_function_enabled());
+    assert_eq!(controls.iter().filter(|&&c| c == FunctionControl::DONT_INLINE.bits()).count(), helpers, "{controls:?}");
+    // One call never grows the module; 130 calls of a 1 600-instruction
+    // body in a module of 40 000 instructions (Ghost of Yotei) would.
+    use super::emit::inlined_copies_outweigh;
+    assert!(!inlined_copies_outweigh(1, 1_600, 100));
+    assert!(!inlined_copies_outweigh(14, 1_600, 160_000));
+    assert!(inlined_copies_outweigh(130, 1_600, 40_000));
+    assert!(!inlined_copies_outweigh(0, 1_600, 0));
+}
+
+/// buffer_store_format_x through descriptors the program selects at run
+/// time (written through their device addresses; three of Grand Theft
+/// Auto VI's compute programs store one component this way inside a loop
+/// over the lanes' descriptors) compiles, with the encoding in one
+/// function of the module or inline. The case is
+/// BufferLoadFormatXGpuSelectedDescriptors with its load and raw store
+/// replaced by `v_mov_b32 v4, v30; s_nop; buffer_store_format_x v4`.
+#[test]
+fn runtime_format_stores_through_device_addresses_compile() {
+    use rspirv::spirv::Op;
+    let c = case("BufferLoadFormatXGpuSelectedDescriptors");
+    let mut code = c.code.to_vec();
+    let load = code.iter().position(|&w| w == 0xe000_3000).expect("buffer_load_format_x");
+    assert_eq!(code[load + 2], 0xe070_1000, "buffer_store_dword follows the load");
+    let srsrc = code[load + 1];
+    code.splice(load..load + 4, [0x7e08_031e, 0xbf80_0000, 0xe010_3000, srsrc]);
+    let x = RefCase { code: Box::leak(code.clone().into_boxed_slice()), ..*c };
+    let spirv = compile_case(&x, FEATURES, spirv_val().as_deref()).unwrap();
+    eprintln!("runtime-format X store: {} SPIR-V words", spirv.len());
+    assert!(has_op(&spirv, Op::Switch));
+    assert_eq!(has_op(&spirv, Op::FunctionCall), super::memory::format_store_function_enabled());
+    assert!(spirv.len() < RUNTIME_STORE_WORDS_MAX, "{} SPIR-V words", spirv.len());
+    // XYZW: the same switches, three more components encoded.
+    code[load + 2] = 0xe01c_3000;
+    let xyzw = RefCase { code: Box::leak(code.into_boxed_slice()), ..*c };
+    let spirv4 = compile_case(&xyzw, FEATURES, spirv_val().as_deref()).unwrap();
+    eprintln!("runtime-format XYZW store: {} SPIR-V words", spirv4.len());
+    assert!(spirv4.len() < spirv.len() + if super::memory::format_store_function_enabled() { 1_000 } else { 16_000 }, "{} then {} SPIR-V words", spirv.len(), spirv4.len());
+}
+
+/// A module that reads through device addresses finds an address's
+/// page-table entry by the rule the host fills the table with
+/// (`paging::entry_of`): it compares with the end of the low range and with
+/// the window, and never wraps an address into the low range.
+#[test]
+fn device_addresses_find_their_page_table_entry_by_the_shared_rule() {
+    use ps5shader::resources::paging;
+    let spirv = compile_case(case("BufferLoadFormatXGpuSelectedDescriptors"), FEATURES, spirv_val().as_deref()).unwrap();
+    let mut constants = Vec::new();
+    let mut at = 5;
+    while at < spirv.len() {
+        let (count, op) = ((spirv[at] >> 16) as usize, spirv[at] & 0xFFFF);
+        if op == rspirv::spirv::Op::Constant as u32 && count == 5 {
+            constants.push(spirv[at + 3] as u64 | (spirv[at + 4] as u64) << 32);
+        }
+        at += count.max(1);
+    }
+    for c in [paging::LOW_BYTES, paging::WINDOW_BASE, paging::WINDOW_BYTES, paging::LOW_PAGES, paging::NO_ENTRY] {
+        assert!(constants.contains(&c), "{c:#x} missing among {constants:x?}");
+    }
+    assert!(!constants.contains(&(paging::LOW_PAGES - 1)), "a page-number mask");
+}
+
+/// A program that builds its V# in registers from a pointer and a count
+/// of a table (as Grand Theft Auto VI's LBVH programs do: `s_load_dwordx2`
+/// of the pointer, `s_bitset1_b32` of the stride into its high word, a
+/// constant word 3) with the table at byte 0x40 of the case's memory:
+/// `pointer_high` is the pointer's upper dword, `records` the count.
+fn register_built_case(pointer_high: u32, records: u32, masked: bool) -> RefCase {
+    use ps5shader::testing::asm as sa;
+    let mut code = Vec::new();
+    code.extend(sa::smem(0x01, 16, 0, 72, sa::NULL));
+    code.extend(sa::smem(0x00, 18, 0, 128, sa::NULL));
+    code.extend([sa::s_mov_b32(19, sa::LITERAL), 0x0001_6204]);
+    code.push(0xbf8c_c07f);
+    if masked {
+        // s_and_b32 s17, s17, 0xffff: the stride bits are the program's.
+        code.extend([sa::sop2(0x0E, 17, 17, sa::LITERAL), 0xffff]);
+    }
+    // s_bitset1_b32 s17, 20
+    code.push(0xbe91_1d94);
+    // buffer_load_dwordx2 v[1:2], v0, s[16:19], 8 idxen
+    code.extend(sa::mubuf(0x0D, 1, 0, 4, sa::inline_u32(0), 8, true, false, false));
+    code.push(0xbf8c_3f70);
+    // buffer_store_dword v1, v0, s[16:19], 0 idxen
+    code.extend(sa::mubuf(sa::OP_BUFFER_STORE_DWORD, 1, 0, 4, sa::inline_u32(0), 0, true, false, false));
+    code.push(sa::S_ENDPGM);
+    let mut initial = vec![0u32; 0x400];
+    let table = 0x40 / 4;
+    initial[table + 72 / 4] = 0x800;
+    initial[table + 72 / 4 + 1] = pointer_high;
+    initial[table + 128 / 4] = records;
+    let mut user = vec![0u32; 64];
+    user[0] = 0x40;
+    RefCase {
+        name: "RegisterBuiltStride",
+        code: Box::leak(code.into_boxed_slice()),
+        initial: Box::leak(initial.into_boxed_slice()),
+        user_data: Some(Box::leak(user.into_boxed_slice())),
+        ..*case("BufferLoadFormatXGpuSelectedDescriptors")
+    }
+}
+
+/// Whether a module multiplies by the constant `value` (`OpIMul` with a
+/// 32-bit `OpConstant` operand of that value).
+fn multiplies_by_constant(spirv: &[u32], value: u32) -> bool {
+    use rspirv::spirv::Op;
+    let mut constants = std::collections::HashSet::new();
+    let mut at = 5;
+    while at < spirv.len() {
+        let (count, op) = ((spirv[at] >> 16) as usize, spirv[at] & 0xFFFF);
+        if op == Op::Constant as u32 && count == 4 && spirv[at + 3] == value {
+            constants.insert(spirv[at + 2]);
+        }
+        if op == Op::IMul as u32 && (constants.contains(&spirv[at + 3]) || constants.contains(&spirv[at + 4])) {
+            return true;
+        }
+        at += count.max(1);
+    }
+    false
+}
+
+/// A V# the program builds from a pointer (`pointer high | stride << 16`)
+/// compiles to one module whatever the pointer's upper bits and the record
+/// count are: the module reads the stride from the descriptor word in its
+/// registers instead of being compiled for it. The same program with the
+/// pointer's high word masked to its address bits first has a stride its
+/// constants fix, and is compiled for it.
+#[test]
+fn register_built_strides_share_one_module() {
+    let validator = spirv_val();
+    let compile = |high: u32, records: u32, masked: bool| compile_case(&register_built_case(high, records, masked), FEATURES, validator.as_deref()).unwrap();
+    let clean = compile(0, 64, false);
+    for (high, records) in [(0x03f5_0000u32, 64u32), (0x42bc_0000, 7), (0xffff_0000, 1), (0x8000_0000, 3), (0x0005_0000, 0), (0, 0)] {
+        assert!(compile(high, records, false) == clean, "pointer high {high:#x}, {records} records: another module");
+    }
+    assert!(!multiplies_by_constant(&clean, 16), "the stride is a constant of the module");
+    let masked = compile(0x03f5_0000, 64, true);
+    assert!(masked == compile(0, 64, true));
+    assert!(multiplies_by_constant(&masked, 16), "a stride fixed by the program's constants is not compiled in");
+    assert!(masked != clean);
+}
+
+/// Every reference case compiles to valid SPIR-V with the stride fields
+/// of all its buffers read at run time (the path of V#s whose stride the
+/// program computes), and the cases with buffers get other modules that
+/// way.
+#[test]
+fn ref_cases_compile_with_run_time_strides() {
+    let validator = spirv_val();
+    let mut failures = Vec::new();
+    let (mut with_buffers, mut changed) = (0, 0);
+    for c in all_cases() {
+        if KNOWN_UNSUPPORTED.iter().any(|(n, _)| *n == c.name) {
+            continue;
+        }
+        let buffers = std::cell::Cell::new(0);
+        let forced = compile_case_planned(c, FEATURES, validator.as_deref(), super::exec_run_minimum(), None, &|plan| {
+            buffers.set(plan.info.buffers.len());
+            plan.info.buffers.iter_mut().for_each(|b| b.runtime_stride = true);
+        });
+        match (forced, compile_case(c, FEATURES, None)) {
+            (Ok(forced), Ok(plain)) => {
+                with_buffers += (buffers.get() != 0) as usize;
+                changed += (forced.spirv != plain) as usize;
+            }
+            (Err(e), _) | (_, Err(e)) => failures.push(format!("{}: {e}", c.name)),
+        }
+    }
+    for f in &failures {
+        eprintln!("{f}");
+    }
+    assert!(failures.is_empty(), "{} reference cases failed", failures.len());
+    eprintln!("{changed} of {with_buffers} cases with buffers changed");
+    assert!(changed > 100, "only {changed} of {with_buffers} cases with buffers changed");
+}
+
+/// The size [`runtime_format_stores_through_device_addresses_compile`]
+/// stays under.
+const RUNTIME_STORE_WORDS_MAX: usize = 30_000;
 
 /// The size [`runtime_format_xyz_loads_through_device_addresses_compile`]
 /// stays under.

@@ -567,6 +567,7 @@ mod tests {
     /// initialized.
     #[test]
     fn answers_before_initialization() {
+        let _state = super::super::test_state_lock();
         let vm = ps5vm::VirtualMemory::new();
         const BASE: u64 = 0x5D5B_0000_0000;
         vm.map(BASE, 0x1000, ps5vm::MemProtect::RW).unwrap();

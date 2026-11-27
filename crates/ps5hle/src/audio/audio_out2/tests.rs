@@ -227,20 +227,21 @@ fn user_supported_attributes() {
 
     context_attributes = u32::MAX;
     port_attributes = u32::MAX;
-    assert_eq!(h.out2.user_get_supported_attributes(user, None, Some(&mut port_attributes)), AUDIO_OUT2_ERROR_INVALID_PARAM);
-    assert_eq!(
-        h.out2.user_get_supported_attributes(user, Some(&mut context_attributes), None),
-        AUDIO_OUT2_ERROR_INVALID_PARAM
-    );
-    assert!(
-        context_attributes == u32::MAX && port_attributes == u32::MAX,
-        "null capability outputs were accepted or modified"
-    );
+    // Either output may be absent; the other is still written.
+    assert_eq!(h.out2.user_get_supported_attributes(user, None, Some(&mut port_attributes)), 0);
+    assert!(context_attributes == u32::MAX && port_attributes == 0x103);
+    port_attributes = u32::MAX;
+    assert_eq!(h.out2.user_get_supported_attributes(user, Some(&mut context_attributes), None), 0);
+    assert!(context_attributes == 0 && port_attributes == u32::MAX);
+    assert_eq!(h.out2.user_get_supported_attributes(user, None, None), AUDIO_OUT2_ERROR_INVALID_PARAM);
+    // A user that does not exist is refused before the outputs are looked at.
+    context_attributes = u32::MAX;
     for invalid in [0u64, u64::MAX] {
         assert_eq!(
             h.out2.user_get_supported_attributes(invalid, Some(&mut context_attributes), Some(&mut port_attributes)),
-            AUDIO_OUT2_ERROR_INVALID_PARAM
+            AUDIO_OUT2_ERROR_INVALID_USER
         );
+        assert_eq!(h.out2.user_get_supported_attributes(invalid, None, None), AUDIO_OUT2_ERROR_INVALID_USER);
         assert!(
             context_attributes == u32::MAX && port_attributes == u32::MAX,
             "invalid user capabilities succeeded or modified outputs"
@@ -256,7 +257,7 @@ fn user_supported_attributes() {
     assert_eq!(h.out2.user_destroy(user), 0, "unused user destroy failed");
     assert_eq!(
         h.out2.user_get_supported_attributes(user, Some(&mut context_attributes), Some(&mut port_attributes)),
-        AUDIO_OUT2_ERROR_INVALID_PARAM
+        AUDIO_OUT2_ERROR_INVALID_USER
     );
     assert!(context_attributes == u32::MAX && port_attributes == u32::MAX);
     assert_eq!(h.out2.user_destroy(user), AUDIO_OUT2_ERROR_INVALID_PARAM, "destroyed user remained valid");
@@ -882,6 +883,58 @@ fn port_buffers_set_between_pushes_play_in_order() {
     h.out2.port_destroy(port);
     h.out2.context_destroy(context);
     h.finish();
+}
+
+/// A null attribute list is a parameter error for any count, zero
+/// included; a list is accepted.
+#[test]
+fn context_attributes_need_a_list() {
+    use crate::context::CpuRegister::{Rdi, Rdx, Rsi};
+    let base = 0x5C4E_0000_0000u64;
+    let vm = crate::sync::test_util::vm_arena(base);
+    let mut ctx = CpuContext::new(vm);
+    for (context, count) in [(0u64, 0u64), (1, 0), (1, 1), (1, 2)] {
+        ctx.set(Rdi, context);
+        ctx.set(Rsi, 0);
+        ctx.set(Rdx, count);
+        assert_eq!(cb_context_set_attributes(&mut ctx), AUDIO_OUT2_ERROR_INVALID_PARAM, "count {count}");
+        ctx.set(Rsi, base);
+        assert_eq!(cb_context_set_attributes(&mut ctx), 0, "count {count} with a list");
+    }
+}
+
+/// Only a pad speaker port reports a volume (127); the others read -1.
+/// The system loudness reads its minimum while nothing measures it.
+#[test]
+fn port_volume_and_system_loudness() {
+    let h = Harness::new();
+    let context = h.context(4, 0);
+    let main = h.port(context, &h.param(STEREO_FLOAT));
+    let mut pad_param = h.param(STEREO_FLOAT);
+    pad_param.port_type = 3;
+    let pad = h.port(context, &pad_param);
+    assert_eq!(h.out2.port_audio_out_type(main).map(audio_out::port_state_volume), Some(-1));
+    assert_eq!(h.out2.port_audio_out_type(pad).map(audio_out::port_state_volume), Some(127));
+    assert_eq!(h.out2.port_audio_out_type(u64::MAX), None);
+    h.out2.port_destroy(main);
+    h.out2.port_destroy(pad);
+    h.out2.context_destroy(context);
+    h.finish();
+
+    let base = 0x5C4F_0000_0000u64;
+    let vm = crate::sync::test_util::vm_arena(base);
+    let mut ctx = CpuContext::new(vm);
+    ctx.write_bytes(base, &[0xEE; SYSTEM_STATE_SIZE + 8]);
+    ctx.set(crate::context::CpuRegister::Rdi, base);
+    assert_eq!(cb_get_system_state(&mut ctx), 0);
+    assert_eq!(ctx.read_u32(base).map(f32::from_bits), Some(-70.0));
+    assert!(ctx.read_bytes(base + 4, SYSTEM_STATE_SIZE - 4).unwrap().iter().all(|&b| b == 0));
+    assert_eq!(ctx.read_bytes(base + SYSTEM_STATE_SIZE as u64, 1).unwrap(), [0xEE]);
+    // A port the library does not know still reads as a main port.
+    ctx.set(crate::context::CpuRegister::Rdi, u64::MAX);
+    ctx.set(crate::context::CpuRegister::Rsi, base + 0x100);
+    assert_eq!(cb_port_get_state(&mut ctx), 0);
+    assert_eq!(ctx.read_bytes(base + 0x100, 6).unwrap(), [1, 0, 2, 0, 0xFF, 0xFF]);
 }
 
 #[test]

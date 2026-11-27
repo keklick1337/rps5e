@@ -38,6 +38,7 @@ use crate::scheduler::Scheduler;
 use crate::slice_shadow as shadow;
 
 mod slice_rec;
+mod vram;
 pub use slice_rec::{CpuBytes, PriorWrite, SegDraw, SegItem, SegmentOut, SliceItem, SliceRecorder, SliceUnit};
 use ash::vk;
 use crate::fxhash::HashMap;
@@ -183,6 +184,11 @@ pub trait PipelineProvider: Send {
     /// submits (an allocation would otherwise wait for the GPU).
     fn staging_usage(&self) -> (u64, u64) {
         (0, 0)
+    }
+    /// Live shader modules, graphics pipelines and compute pipelines
+    /// (None: not counted).
+    fn object_counts(&self) -> Option<(usize, usize, usize)> {
+        None
     }
     /// A display buffer was presented (frame boundary).
     fn frame_presented(&mut self) {}
@@ -520,6 +526,8 @@ pub struct Backend {
     gc: crate::gc::DeviceMemory,
     gc_tick: u64,
     gc_ticks: crate::gc::CollectionTicks,
+    /// The device memory report (`RPS5E_VRAM_REPORT`).
+    vram: vram::State,
     /// Work of the open tick (see [`Backend::early_submit`]).
     early: EarlySubmit,
     /// The targets of the last `bind_targets`, with everything their
@@ -832,6 +840,41 @@ fn submit_each_mode() -> u8 {
     *V.get_or_init(|| std::env::var("RPS5E_GPU_SUBMIT_EACH").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// Mode 2 of [`submit_each_mode`]: the time of every isolated item, summed
+/// per program (a dispatch's compute program, a draw's pixel program, or
+/// the text of another note) and logged every 10 seconds, the 30 largest
+/// sums first, with the number of items and the share of the period.
+fn isolated_times(note: &str, ms: f64) {
+    struct Sums {
+        since: std::time::Instant,
+        by_program: std::collections::HashMap<String, (u64, f64)>,
+    }
+    static SUMS: std::sync::Mutex<Option<Sums>> = std::sync::Mutex::new(None);
+    let key = match (note.find("cs=0x"), note.find("ps=0x")) {
+        (Some(i), _) | (None, Some(i)) => note[i..].split(' ').next().unwrap_or(note).to_owned(),
+        _ => note.to_owned(),
+    };
+    let mut guard = SUMS.lock().unwrap_or_else(|p| p.into_inner());
+    let sums = guard.get_or_insert_with(|| Sums { since: std::time::Instant::now(), by_program: Default::default() });
+    let e = sums.by_program.entry(key).or_default();
+    e.0 += 1;
+    e.1 += ms;
+    let period = sums.since.elapsed().as_secs_f64() * 1000.0;
+    if period < 10_000.0 {
+        return;
+    }
+    let mut rows: Vec<_> = sums.by_program.drain().collect();
+    rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    let total: f64 = rows.iter().map(|r| r.1.1).sum();
+    let items: u64 = rows.iter().map(|r| r.1.0).sum();
+    let mut text = format!("ps5gpu: isolated items of {period:.0} ms: {items} items, {total:.0} ms in all, {} programs", rows.len());
+    for (key, (n, ms)) in rows.iter().take(30) {
+        text.push_str(&format!("\n  {ms:8.1} ms {:5.1}% {n:6} x {:7.3} ms  {key}", ms * 100.0 / period, ms / *n as f64));
+    }
+    log::info!("{text}");
+    sums.since = std::time::Instant::now();
+}
+
 fn submit_each() -> bool {
     submit_each_mode() != 0
 }
@@ -963,6 +1006,7 @@ impl Backend {
             gc: crate::gc::DeviceMemory::new(dev),
             gc_tick: 0,
             gc_ticks: crate::gc::CollectionTicks::default(),
+            vram: vram::State::default(),
             early: EarlySubmit::default(),
             target_memo: Default::default(),
         })
@@ -2658,9 +2702,11 @@ impl Backend {
         if submit_each_mode() >= 2 {
             self.sched.timeline.wait(tick);
             let ms = start.elapsed().as_secs_f64() * 1000.0;
+            let note = self.sched.last_note().unwrap_or_default();
             if ms > 20.0 {
-                log::warn!("ps5gpu: tick {tick} took {ms:.1} ms: {}", self.sched.last_note().unwrap_or_default());
+                log::warn!("ps5gpu: tick {tick} took {ms:.1} ms: {note}");
             }
+            isolated_times(&note, ms);
         }
     }
 
@@ -2759,6 +2805,9 @@ impl Backend {
         let t = self.sched.time_item_begin(gpu_label::PRESSURE_GC);
         self.pressure_gc_inner();
         self.sched.time_item_end(t);
+        if let Some(period) = crate::vram_report::period() {
+            self.vram_report_tick(period);
+        }
     }
 
     fn pressure_gc_inner(&mut self) {
@@ -2818,6 +2867,7 @@ impl Backend {
                 log::info!("ps5gpu: copy {src:#x} -> {dst:#x} ({size:#x} bytes) reads {written} GPU-modified image(s): written back first");
             }
         }
+        self.copy_state_log(dst, src, size);
         if !self.buffers.has_gpu_dirty(src, size) && !self.buffers.has_gpu_dirty(dst, size) {
             return false;
         }
@@ -2834,6 +2884,45 @@ impl Backend {
         }
     }
 
+    /// `RPS5E_COPY_STATE=<bytes>` (diagnostics): every command-processor
+    /// copy of at least that many bytes is logged as a `cpcopy` line with
+    /// the state of the pages of its source and destination before it runs:
+    /// pages in all, pages that are all zero in guest memory, pages whose
+    /// newest bytes are on the GPU, and the zero pages the GPU holds no
+    /// newer bytes for (the copy reads zeros there).
+    fn copy_state_log(&mut self, dst: u64, src: u64, size: u64) {
+        static MIN: OnceLock<Option<u64>> = OnceLock::new();
+        let Some(min) = *MIN.get_or_init(|| std::env::var("RPS5E_COPY_STATE").ok().and_then(|v| v.parse().ok())) else { return };
+        if size < min {
+            return;
+        }
+        let page = crate::memory::PAGE_BYTES;
+        let mut bytes = vec![0u8; page as usize];
+        let mut state = |a: u64| {
+            let (mut pages, mut zero, mut gpu, mut zero_cpu, mut first) = (0u32, 0u32, 0u32, 0u32, 0u64);
+            let mut p = a & !(page - 1);
+            while p < a + size {
+                let z = self.memory.read_backing(p, &mut bytes) && bytes.iter().all(|&b| b == 0);
+                let g = self.buffers.has_gpu_dirty(p, page);
+                pages += 1;
+                zero += z as u32;
+                gpu += g as u32;
+                if z && !g {
+                    if zero_cpu == 0 {
+                        first = p;
+                    }
+                    zero_cpu += 1;
+                }
+                p += page;
+            }
+            format!("pages {pages} zero {zero} gpu {gpu} zero-cpu {zero_cpu}@{first:#x}")
+        };
+        let (s, d) = (state(src), state(dst));
+        let mut head = [0u8; 16];
+        self.memory.read_backing(src, &mut head);
+        log::info!("ps5gpu: cpcopy tick {} {src:#x} -> {dst:#x} ({size:#x} bytes): source {s} head {head:02x?} | destination {d}", self.sched.current_tick());
+    }
+
     /// A command-processor fill: on the GPU when the range holds
     /// GPU-written pages.
     pub fn fill_memory(&mut self, dst: u64, size: u64, value: u32) -> bool {
@@ -2842,6 +2931,9 @@ impl Backend {
     }
 
     fn fill_memory_inner(&mut self, dst: u64, size: u64, value: u32) -> bool {
+        if std::env::var("RPS5E_COPY_STATE").ok().and_then(|v| v.parse::<u64>().ok()).is_some_and(|min| size >= min) {
+            log::info!("ps5gpu: cpfill tick {} {dst:#x} ({size:#x} bytes) value {value:#x} gpu-dirty {}", self.sched.current_tick(), self.buffers.has_gpu_dirty(dst, size));
+        }
         if !self.buffers.has_gpu_dirty(dst, size) {
             return false;
         }

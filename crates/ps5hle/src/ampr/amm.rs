@@ -11,14 +11,16 @@
 //! unless a MultiMap alias still maps it. Remap moves mapped pages,
 //! MultiMap aliases them, the protect commands change protection under a
 //! mask. MapAsPrt turns a range into a partially resident one whose pages
-//! AllocatePaForPrt backs from the pool; unbacked PRT pages stay unmapped
-//! (no zero page is mapped for GPU reads of them).
+//! AllocatePaForPrt backs from the pool and UnmapToPrt takes away again;
+//! unbacked PRT pages stay unmapped (no zero page is mapped for GPU reads
+//! of them).
 
 use super::command_buffer::{AmmKind, AmmMap, AMM_PAGE_SIZE};
 use crate::memory;
+use crate::memory::spans::{RefSpans, SpanIndex};
 use crate::registry::HleResult;
 use crate::sync::{ERR_INVALID_ARGUMENT, ERR_TRY_AGAIN, OK};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 /// Virtual range AMM maps into.
@@ -35,14 +37,51 @@ const PROT_AMPR_WRITE: i32 = 0x80;
 const PROT_ACP_READ: i32 = 0x100;
 const PROT_ACP_WRITE: i32 = 0x200;
 
+/// Automatic mappings and their aliases, `va -> (length, physical
+/// start)`, with the number of mappings over every byte of direct memory
+/// (what none maps any more goes back to the pool).
+#[derive(Default)]
+struct Mapped {
+    spans: SpanIndex<u64>,
+    backing: RefSpans,
+}
+
+impl Mapped {
+    fn insert(&mut self, va: u64, (len, phys): (u64, u64)) {
+        self.backing.add(phys, len);
+        if let Some((l, ph)) = self.spans.insert(va, (len, phys)) {
+            self.backing.sub(ph, l);
+        }
+    }
+
+    fn remove(&mut self, va: &u64) {
+        if let Some((l, ph)) = self.spans.remove(va) {
+            self.backing.sub(ph, l);
+        }
+    }
+
+    #[cfg(test)]
+    fn get(&self, va: &u64) -> Option<&(u64, u64)> {
+        self.spans.get(va)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &(u64, u64)> {
+        self.spans.values()
+    }
+}
+
 #[derive(Default)]
 struct Pool {
     /// Free automatic direct memory: start -> length (coalesced).
     free: BTreeMap<u64, u64>,
-    /// Automatic mappings and their aliases: va -> (length, physical start).
-    mapped: BTreeMap<u64, (u64, u64)>,
-    /// Pages of partially resident (PRT) ranges.
-    prt: BTreeSet<u64>,
+    mapped: Mapped,
+    /// Partially resident (PRT) ranges: start -> length (coalesced).
+    prt: BTreeMap<u64, u64>,
 }
 
 static POOL: Mutex<Option<Pool>> = Mutex::new(None);
@@ -50,6 +89,18 @@ static POOL: Mutex<Option<Pool>> = Mutex::new(None);
 fn with_pool<R>(f: impl FnOnce(&mut Pool) -> R) -> R {
     let mut g: MutexGuard<'_, Option<Pool>> = POOL.lock().unwrap_or_else(|p| p.into_inner());
     f(g.get_or_insert_with(Pool::default))
+}
+
+/// The automatic pool cannot back `len` bytes at `va`: EAGAIN, as the
+/// console answers a title that asked for more than it gave AMM. Logged
+/// with what the pool holds (a title treats this as fatal).
+fn pool_exhausted(what: &str, va: u64, len: u64) -> HleResult {
+    let (free, mapped, prt) =
+        with_pool(|p| (p.free.values().sum::<u64>(), p.mapped.values().map(|&(l, _)| l).sum::<u64>(), p.prt.values().sum::<u64>()));
+    log::warn!(
+        "[ampr] AMM {what} {va:#x} (+{len:#x}): the automatic pool has {free:#x} bytes free ({mapped:#x} mapped, {prt:#x} of PRT ranges)"
+    );
+    ERR_TRY_AGAIN
 }
 
 fn add_free(free: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
@@ -73,12 +124,14 @@ fn add_free(free: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
 
 fn remove_free(free: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
     let end = start + len;
-    let overlapping: Vec<(u64, u64)> = free
-        .range(..end)
-        .filter(|(&s, &l)| s + l > start)
-        .map(|(&s, &l)| (s, l))
-        .collect();
-    for (s, l) in overlapping {
+    // The ranges do not overlap: the one before `start` is the only one
+    // starting below it that can reach into the span.
+    let mut at = match free.range(..start).next_back() {
+        Some((&s, &l)) if s + l > start => s,
+        _ => start,
+    };
+    while at < end {
+        let Some((s, l)) = free.range(at..end).next().map(|(&s, &l)| (s, l)) else { break };
         free.remove(&s);
         if s < start {
             free.insert(s, start - s);
@@ -86,6 +139,7 @@ fn remove_free(free: &mut BTreeMap<u64, u64>, start: u64, len: u64) {
         if s + l > end {
             free.insert(end, s + l - end);
         }
+        at = s + l;
     }
 }
 
@@ -136,7 +190,7 @@ fn map_automatic(va: u64, size: u64, prot: i32) -> HleResult {
         p.reclaim(va, size);
         p.take(size)
     });
-    let Some(ranges) = ranges else { return ERR_TRY_AGAIN };
+    let Some(ranges) = ranges else { return pool_exhausted("map", va, size) };
     let mut mapped = 0;
     for &(phys, len) in &ranges {
         let r = map_direct(va + mapped, len, prot, phys);
@@ -148,7 +202,9 @@ fn map_automatic(va: u64, size: u64, prot: i32) -> HleResult {
                 for &(s, l) in &ranges {
                     add_free(&mut p.free, s, l);
                 }
-                p.mapped.retain(|&a, _| !(va..va + mapped).contains(&a));
+                for a in p.mapped.spans.starts_in(va, va + mapped) {
+                    p.mapped.remove(&a);
+                }
             });
             return r;
         }
@@ -168,81 +224,62 @@ impl Pool {
     /// (va, length, physical start).
     fn entries(&self, va: u64, size: u64) -> Vec<(u64, u64, u64)> {
         let end = va + size;
-        self.mapped
-            .range(..end)
-            .filter(|(&a, &(l, _))| a + l > va)
-            .map(|(&a, &(l, ph))| {
-                let first = a.max(va);
-                let last = (a + l).min(end);
-                (first, last - first, ph + (first - a))
-            })
-            .collect()
+        let mut hits = Vec::new();
+        self.mapped.spans.overlapping(va, size, &mut hits);
+        for (a, l, ph) in &mut hits {
+            let first = (*a).max(va);
+            let last = (*a + *l).min(end);
+            (*a, *l, *ph) = (first, last - first, *ph + (first - *a));
+        }
+        hits
     }
 
     /// Forget the automatic mappings of `[va, va + size)` without freeing
     /// their backing; returns them clipped as [`Pool::entries`].
     fn detach(&mut self, va: u64, size: u64) -> Vec<(u64, u64, u64)> {
         let end = va + size;
-        let clipped = self.entries(va, size);
-        let hits: Vec<(u64, u64, u64)> =
-            self.mapped.range(..end).filter(|(&a, &(l, _))| a + l > va).map(|(&a, &(l, ph))| (a, l, ph)).collect();
-        for (a, l, ph) in hits {
-            self.mapped.remove(&a);
-            let first = a.max(va);
-            let last = (a + l).min(end);
-            if a < first {
-                self.mapped.insert(a, (first - a, ph));
+        let mut hits = Vec::new();
+        self.mapped.spans.overlapping(va, size, &mut hits);
+        for (a, l, ph) in &mut hits {
+            let (start, len, phys) = (*a, *l, *ph);
+            let first = start.max(va);
+            let last = (start + len).min(end);
+            // The parts outside stay mapped: their backing stays counted
+            // while the entry is cut.
+            if start < first {
+                self.mapped.insert(start, (first - start, phys));
+            } else {
+                self.mapped.remove(&start);
             }
-            if a + l > last {
-                self.mapped.insert(last, (a + l - last, ph + (last - a)));
+            if start + len > last {
+                self.mapped.insert(last, (start + len - last, phys + (last - start)));
             }
+            (*a, *l, *ph) = (first, last - first, phys + (first - start));
         }
-        clipped
-    }
-
-    /// The parts of physical `[ph, ph + len)` no automatic mapping (or
-    /// alias) still uses.
-    fn unreferenced(&self, ph: u64, len: u64) -> Vec<(u64, u64)> {
-        let mut parts = vec![(ph, ph + len)];
-        for &(l, p) in self.mapped.values() {
-            let (s, e) = (p, p + l);
-            parts = parts
-                .into_iter()
-                .flat_map(|(a, b)| {
-                    if e <= a || s >= b {
-                        vec![(a, b)]
-                    } else {
-                        [(a, s.max(a)), (e.min(b), b)].into_iter().filter(|(x, y)| x < y).collect()
-                    }
-                })
-                .collect();
-        }
-        parts.into_iter().map(|(a, b)| (a, b - a)).collect()
+        hits
     }
 
     /// Return the automatic backing of `[va, va + size)` to the free ranges
     /// (pages an alias still maps stay taken).
     fn reclaim(&mut self, va: u64, size: u64) {
         for (_, l, ph) in self.detach(va, size) {
-            for (s, len) in self.unreferenced(ph, l) {
-                add_free(&mut self.free, s, len);
-            }
+            let (free, mapped) = (&mut self.free, &self.mapped);
+            mapped.backing.unreferenced(ph, l, |s, len| add_free(free, s, len));
         }
     }
 
     fn mark_prt(&mut self, va: u64, size: u64) {
-        self.prt.extend((va..va + size).step_by(AMM_PAGE_SIZE as usize));
-    }
-
-    fn clear_prt(&mut self, va: u64, size: u64) {
-        let pages: Vec<u64> = self.prt.range(va..va + size).copied().collect();
-        for p in pages {
-            self.prt.remove(&p);
+        if size != 0 {
+            add_free(&mut self.prt, va, size);
         }
     }
 
+    fn clear_prt(&mut self, va: u64, size: u64) {
+        remove_free(&mut self.prt, va, size);
+    }
+
     fn is_prt(&self, va: u64, size: u64) -> bool {
-        self.prt.range(va..va + size).count() as u64 == size / AMM_PAGE_SIZE
+        size == 0 || self.prt.range(..=va).next_back().is_some_and(|(&s, &l)| s + l >= va + size)
     }
 
     /// Take `size` bytes of free backing, first fit; None (and nothing
@@ -269,7 +306,7 @@ impl Pool {
 }
 
 /// `[va, va + size)` lies in the AMM virtual range.
-fn in_amm_range(va: u64, size: u64) -> bool {
+pub(super) fn in_amm_range(va: u64, size: u64) -> bool {
     va >= VA_BASE && size <= VA_SIZE && va - VA_BASE <= VA_SIZE - size
 }
 
@@ -356,8 +393,9 @@ fn modify_protect(m: &AmmMap, with_type: bool) -> HleResult {
     OK
 }
 
-/// MapAsPrt: the range loses its backing and becomes partially resident;
-/// its unbacked pages stay unmapped.
+/// MapAsPrt and UnmapToPrt: the range loses its backing (automatic pages
+/// go back to the pool) and is partially resident; its unbacked pages
+/// stay unmapped.
 fn map_as_prt(va: u64, size: u64) -> HleResult {
     if !in_amm_range(va, size) {
         log::error!("[ampr] AMM map as PRT {va:#x} (+{size:#x}): outside the AMM virtual range");
@@ -401,7 +439,7 @@ fn allocate_pa_for_prt(m: &AmmMap) -> HleResult {
             }
             continue;
         }
-        let Some(ranges) = with_pool(|p| p.take(len)) else { return ERR_TRY_AGAIN };
+        let Some(ranges) = with_pool(|p| p.take(len)) else { return pool_exhausted("allocate PA for PRT", start, len) };
         let mut mapped = 0;
         for (i, &(phys, l)) in ranges.iter().enumerate() {
             let r = memory::map_direct_typed_at(start + mapped, l, prot, phys, AMM_PAGE_SIZE, m.mtype);
@@ -439,7 +477,7 @@ pub fn execute(m: &AmmMap) -> HleResult {
         AmmKind::MultiMap => return remap(m, true),
         AmmKind::ModifyProtect => return modify_protect(m, false),
         AmmKind::ModifyMtypeProtect => return modify_protect(m, true),
-        AmmKind::MapAsPrt => return map_as_prt(m.va, m.size),
+        AmmKind::MapAsPrt | AmmKind::UnmapToPrt => return map_as_prt(m.va, m.size),
         AmmKind::AllocatePaForPrt => return allocate_pa_for_prt(m),
     };
     if r == OK {
@@ -527,6 +565,190 @@ mod tests {
         assert!(!p.is_prt(VA_BASE, 4 * PAGE));
         p.clear_prt(VA_BASE + PAGE, PAGE);
         assert!(p.is_prt(VA_BASE, PAGE) && !p.is_prt(VA_BASE, 2 * PAGE) && p.is_prt(VA_BASE + 2 * PAGE, PAGE));
+    }
+
+    /// The pool stays cheap under a title that commits and releases
+    /// pieces of a partially resident window all the time: 20 000
+    /// automatic mappings, then 50 000 commands (commit, release, and now
+    /// and then an alias) of 16 KiB to 1 MiB at pseudo-random places of a
+    /// 64 GiB window, as `allocate_pa_for_prt`, `map_as_prt` and `remap`
+    /// drive it. Every backing taken and the final state are compared with
+    /// a page-by-page model, and the replay has a time bound that work
+    /// proportional to the number of mappings per command misses by far.
+    #[test]
+    fn pool_keeps_up_with_prt_commit_streams() {
+        const PAGE: u64 = AMM_PAGE_SIZE;
+        const SPAN: u64 = 64 << 30;
+        const PAGES: usize = (SPAN / PAGE) as usize;
+        const POOL_PAGES: usize = PAGES;
+        const MAPPINGS: usize = 20_000;
+        const COMMANDS: usize = 50_000;
+
+        // Page model: backing page + 1 of every window page, and how many
+        // window pages map each backing page.
+        struct Model {
+            phys: Vec<u32>,
+            refs: Vec<u8>,
+            /// One bit per backing page: set while nothing maps it.
+            free: Vec<u64>,
+            /// No word below this one has a free page.
+            lowest_free: usize,
+        }
+        impl Model {
+            fn take(&mut self) -> u32 {
+                while self.free[self.lowest_free] == 0 {
+                    self.lowest_free += 1;
+                }
+                let bit = self.free[self.lowest_free].trailing_zeros() as usize;
+                self.free[self.lowest_free] &= !(1 << bit);
+                let page = self.lowest_free * 64 + bit;
+                self.refs[page] = 1;
+                page as u32
+            }
+            fn drop_page(&mut self, page: usize) {
+                let ph = std::mem::take(&mut self.phys[page]);
+                if ph != 0 {
+                    let ph = ph as usize - 1;
+                    self.refs[ph] -= 1;
+                    if self.refs[ph] == 0 {
+                        self.free[ph / 64] |= 1 << (ph % 64);
+                        self.lowest_free = self.lowest_free.min(ph / 64);
+                    }
+                }
+            }
+        }
+        let mut model = Model { phys: vec![0; PAGES], refs: vec![0; POOL_PAGES], free: vec![u64::MAX; POOL_PAGES / 64], lowest_free: 0 };
+        let mut p = Pool::default();
+        add_free(&mut p.free, 0, POOL_PAGES as u64 * PAGE);
+        p.mark_prt(VA_BASE, SPAN);
+        let va_of = |page: usize| VA_BASE + page as u64 * PAGE;
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Time spent in the pool (the model's bookkeeping is not counted).
+        let spent = std::cell::Cell::new(std::time::Duration::ZERO);
+        let timed = |started: std::time::Instant| spent.set(spent.get() + started.elapsed());
+        let commit = |p: &mut Pool, model: &mut Model, page: usize, pages: usize| {
+            let started = std::time::Instant::now();
+            assert!(p.is_prt(va_of(page), pages as u64 * PAGE));
+            timed(started);
+            let mut at = page;
+            while at < page + pages {
+                if model.phys[at] != 0 {
+                    at += 1;
+                    continue;
+                }
+                let mut end = at;
+                while end < page + pages && model.phys[end] == 0 {
+                    end += 1;
+                }
+                let started = std::time::Instant::now();
+                let taken = p.take((end - at) as u64 * PAGE).expect("the pool covers the window");
+                let mut q = at;
+                for &(phys, len) in &taken {
+                    p.mapped.insert(va_of(q), (len, phys));
+                    q += (len / PAGE) as usize;
+                }
+                timed(started);
+                let mut q = at;
+                for (phys, len) in taken {
+                    for i in 0..len / PAGE {
+                        let expected = model.take();
+                        assert_eq!(phys / PAGE + i, expected as u64, "first fit");
+                        model.phys[q] = expected + 1;
+                        q += 1;
+                    }
+                }
+                assert_eq!(q, end);
+                at = end;
+            }
+        };
+        let release = |p: &mut Pool, model: &mut Model, page: usize, pages: usize| {
+            let started = std::time::Instant::now();
+            p.reclaim(va_of(page), pages as u64 * PAGE);
+            p.mark_prt(va_of(page), pages as u64 * PAGE);
+            timed(started);
+            for q in page..page + pages {
+                model.drop_page(q);
+            }
+        };
+
+        let mut mappings = 0;
+        while mappings < MAPPINGS {
+            let r = next();
+            let pages = 1 + (r >> 8) as usize % 64;
+            let page = (r >> 20) as usize % (PAGES - pages);
+            mappings += (page..page + pages).filter(|&q| model.phys[q] == 0 && (q == page || model.phys[q - 1] != 0)).count();
+            commit(&mut p, &mut model, page, pages);
+        }
+        let commands: Vec<u64> = (0..COMMANDS * 2).map(|_| next()).collect();
+
+        spent.set(std::time::Duration::ZERO);
+        for pair in commands.chunks(2) {
+            let (r, r2) = (pair[0], pair[1]);
+            let pages = 1 + (r >> 8) as usize % 64;
+            let page = (r >> 20) as usize % (PAGES - pages);
+            match r & 15 {
+                0..=7 => commit(&mut p, &mut model, page, pages),
+                8..=14 => release(&mut p, &mut model, page, pages),
+                _ => {
+                    // MultiMap: the pages of the source are mapped at the
+                    // target as well, whose own backing goes first.
+                    let target = (r2 >> 20) as usize % (PAGES - pages);
+                    if target < page + pages && page < target + pages {
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    let entries = p.entries(va_of(page), pages as u64 * PAGE);
+                    p.reclaim(va_of(target), pages as u64 * PAGE);
+                    for (a, l, ph) in entries {
+                        p.mapped.insert(va_of(target) + (a - va_of(page)), (l, ph));
+                    }
+                    timed(started);
+                    for i in 0..pages {
+                        model.drop_page(target + i);
+                    }
+                    for i in 0..pages {
+                        let ph = model.phys[page + i];
+                        if ph != 0 {
+                            model.refs[ph as usize - 1] += 1;
+                            model.phys[target + i] = ph;
+                        }
+                    }
+                }
+            }
+        }
+        let elapsed = spent.get();
+
+        let mut mapped = vec![0u32; PAGES];
+        let entries = p.entries(VA_BASE, SPAN);
+        for &(a, l, ph) in &entries {
+            for i in 0..l / PAGE {
+                let page = ((a - VA_BASE) / PAGE + i) as usize;
+                assert_eq!(mapped[page], 0, "one mapping per page");
+                mapped[page] = (ph / PAGE + i + 1) as u32;
+            }
+        }
+        assert!(mapped == model.phys, "the mappings differ from the page model");
+        let mut free = vec![false; POOL_PAGES];
+        for (&s, &l) in &p.free {
+            for q in s / PAGE..(s + l) / PAGE {
+                free[q as usize] = true;
+            }
+        }
+        assert!(free.iter().zip(&model.refs).all(|(&f, &n)| f == (n == 0)), "the free ranges differ from the page model");
+        assert!(p.free.iter().zip(p.free.iter().skip(1)).all(|((&s, &l), (&n, _))| s + l < n), "free ranges are merged");
+        assert!(p.is_prt(VA_BASE, SPAN));
+
+        eprintln!("pool replay: {COMMANDS} commands over {} mappings in {elapsed:?}", entries.len());
+        if !cfg!(debug_assertions) {
+            assert!(elapsed < std::time::Duration::from_millis(1500), "{COMMANDS} commands took {elapsed:?}");
+        }
     }
 
     #[test]

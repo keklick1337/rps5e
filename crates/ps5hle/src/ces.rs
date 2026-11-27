@@ -1465,6 +1465,7 @@ mod tests {
 
     #[test]
     fn ces_mappings_and_measurement() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1488,6 +1489,7 @@ mod tests {
 
     #[test]
     fn ces_partial_output() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1521,6 +1523,7 @@ mod tests {
 
     #[test]
     fn ces_errors() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1546,6 +1549,7 @@ mod tests {
 
     #[test]
     fn ces_argument_checks() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1578,6 +1582,7 @@ mod tests {
     /// the buffer forms leave the lengths untouched.
     #[test]
     fn to_mbc_measured_cases() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1650,6 +1655,7 @@ mod tests {
 
     #[test]
     fn ces_single_byte_profiles() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1769,6 +1775,7 @@ mod tests {
 
     #[test]
     fn ces_euc_jp_and_string_conversions() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -1853,6 +1860,7 @@ mod tests {
 
     #[test]
     fn ces_cp932_string_conversions() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _serial = serial();
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);

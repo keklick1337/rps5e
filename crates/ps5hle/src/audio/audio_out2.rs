@@ -830,6 +830,11 @@ impl<B: Backend> AudioOut2<B> {
         locked(&self.state).port(port).map(|p| data_format_channels(p.data_format))
     }
 
+    /// AudioOut type of a port (main, pad speaker, ...).
+    pub fn port_audio_out_type(&self, port: u64) -> Option<i32> {
+        locked(&self.state).port(port).map(|p| port_type_to_audio_out_type(p.port_type))
+    }
+
     pub fn user_create(&self, handle: Option<&mut u64>) -> HleResult {
         let Some(handle) = handle else {
             return AUDIO_OUT2_ERROR_INVALID_PARAM;
@@ -859,15 +864,20 @@ impl<B: Backend> AudioOut2<B> {
         context_attributes: Option<&mut u32>,
         port_attributes: Option<&mut u32>,
     ) -> HleResult {
-        let (Some(context_attributes), Some(port_attributes)) = (context_attributes, port_attributes) else {
-            return AUDIO_OUT2_ERROR_INVALID_PARAM;
-        };
+        // The user is checked before the outputs; either output may be
+        // absent, both absent is a parameter error.
         if !locked(&self.state).users.contains(&handle) {
+            return AUDIO_OUT2_ERROR_INVALID_USER;
+        }
+        if context_attributes.is_none() && port_attributes.is_none() {
             return AUDIO_OUT2_ERROR_INVALID_PARAM;
         }
-        *context_attributes = 0;
-        *port_attributes =
-            (1 << PORT_ATTRIBUTE_ID_PCM) | (1 << PORT_ATTRIBUTE_ID_GAIN) | (1 << PORT_ATTRIBUTE_ID_AMBISONICS);
+        if let Some(c) = context_attributes {
+            *c = 0;
+        }
+        if let Some(p) = port_attributes {
+            *p = (1 << PORT_ATTRIBUTE_ID_PCM) | (1 << PORT_ATTRIBUTE_ID_GAIN) | (1 << PORT_ATTRIBUTE_ID_AMBISONICS);
+        }
         0
     }
 
@@ -1177,27 +1187,34 @@ fn cb_port_get_state(ctx: &mut CpuContext) -> HleResult {
         return AUDIO_OUT2_ERROR_INVALID_POINTER;
     }
     let channels = OUT2.port_channels(ctx.rdi()).unwrap_or(2);
+    let volume = audio_out::port_state_volume(OUT2.port_audio_out_type(ctx.rdi()).unwrap_or(audio_out::PORT_TYPE_MAIN));
     let mut st = [0u8; PORT_STATE_SIZE];
     st[0..2].copy_from_slice(&1u16.to_le_bytes());
     st[2] = channels as u8;
-    st[4..6].copy_from_slice(&127i16.to_le_bytes());
+    st[4..6].copy_from_slice(&volume.to_le_bytes());
     if !ctx.write_bytes(addr, &st) {
         return AUDIO_OUT2_ERROR_INVALID_POINTER;
     }
     0
 }
 
+/// sceAudioOut2ContextSetAttributes(context, attributes*, count): a null
+/// list is a parameter error whatever the count, zero included.
 fn cb_context_set_attributes(ctx: &mut CpuContext) -> HleResult {
-    if ctx.rdx() as u32 != 0 && ctx.rsi() == 0 {
-        AUDIO_OUT2_ERROR_INVALID_POINTER
+    if ctx.rsi() == 0 {
+        AUDIO_OUT2_ERROR_INVALID_PARAM
     } else {
         0
     }
 }
 
+/// sceAudioOut2GetSystemState(state): the loudness at offset 0 reads its
+/// minimum while no measurement runs; the rest of the record is zero.
 fn cb_get_system_state(ctx: &mut CpuContext) -> HleResult {
     let addr = ctx.rdi();
-    if addr == 0 || !ctx.write_bytes(addr, &[0u8; SYSTEM_STATE_SIZE]) {
+    let mut st = [0u8; SYSTEM_STATE_SIZE];
+    st[0..4].copy_from_slice(&audio_out::SYSTEM_STATE_LOUDNESS_MIN.to_le_bytes());
+    if addr == 0 || !ctx.write_bytes(addr, &st) {
         return AUDIO_OUT2_ERROR_INVALID_POINTER;
     }
     0
@@ -1424,7 +1441,7 @@ fn cb_user_get_supported_attributes(ctx: &mut CpuContext) -> HleResult {
     if r != 0 {
         return r;
     }
-    if !ctx.write_u32(c, ca) || !ctx.write_u32(p, pa) {
+    if (c != 0 && !ctx.write_u32(c, ca)) || (p != 0 && !ctx.write_u32(p, pa)) {
         return AUDIO_OUT2_ERROR_INVALID_POINTER;
     }
     0

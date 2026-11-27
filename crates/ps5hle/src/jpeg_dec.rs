@@ -446,6 +446,7 @@ mod tests {
 
     #[test]
     fn parse_header_validation_and_info() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -481,6 +482,7 @@ mod tests {
 
     #[test]
     fn query_create_delete() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);
@@ -521,6 +523,7 @@ mod tests {
 
     #[test]
     fn decode_rgba_bgra_pitch_and_errors() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let _guard = VM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         let mut ctx = setup(&vm);

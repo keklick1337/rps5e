@@ -253,6 +253,18 @@ impl LoadedModule {
     /// Write `bytes` at `addr` inside this image, whatever the protection of
     /// its segment (relocations applied after the image was protected).
     pub(crate) fn patch(&self, addr: u64, bytes: &[u8]) -> bool {
+        self.write_code(addr, bytes, true)
+    }
+
+    /// [`Self::patch`] for a program that is not finished yet (game
+    /// patches): the pages stay writable, because finishing the program
+    /// still rewrites code on them (FS to GS) before it applies the segment
+    /// protections.
+    pub(crate) fn patch_unfinished(&self, addr: u64, bytes: &[u8]) -> bool {
+        self.write_code(addr, bytes, false)
+    }
+
+    fn write_code(&self, addr: u64, bytes: &[u8], finished: bool) -> bool {
         let seg = self.segments.iter().find(|s| s.protect && !s.prot.write && addr >= s.addr && addr < s.addr + s.size);
         let Some(seg) = seg else {
             if !ps5vm::ranges::covered(addr, bytes.len() as u64) {
@@ -269,7 +281,9 @@ impl LoadedModule {
                 return false;
             }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
-            libc::mprotect(page as *mut libc::c_void, len as usize, native);
+            if finished {
+                libc::mprotect(page as *mut libc::c_void, len as usize, native);
+            }
         }
         true
     }
@@ -742,6 +756,11 @@ pub fn load_eboot(_bytes: &[u8], path: &str) -> Result<LoadedGame, EmuError> {
             log::error!("Game cheat error: {e}");
             return Err(EmuError::Load(format!("failed to apply game cheat: {e}")));
         }
+    }
+    // The title's built-in patch (what it needs to run here); a file that
+    // does not fit this build of the game is reported and left out.
+    if let Err(e) = game_patch::apply_builtin(&vm, &programs) {
+        log::warn!("Built-in game patch not applied: {e}");
     }
 
     let patched: usize = programs.iter().map(|p| finish_program(&vm, p)).sum();

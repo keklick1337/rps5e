@@ -44,7 +44,7 @@ layout(push_constant) uniform P {
     uint64_t status;    // per map slot {built count, flags of banks 0-3, 0, 0, 0}
     uint64_t full;      // a bit per map slot: built in full by this update
     uint page_bits;
-    uint page_limit;
+    uint page_low;
     uint bank;
 } pc;
 

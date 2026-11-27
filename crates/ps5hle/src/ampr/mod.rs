@@ -193,6 +193,28 @@ fn cb_get_type(ctx: &mut CpuContext) -> HleResult {
 // APR reads
 // ---------------------------------------------------------------------------
 
+/// What the library's record writer answers before it writes an APR
+/// record of `record_size` bytes: an object without command memory is
+/// EPERM, then a record that does not fit the rest of the command memory
+/// is EBUSY (the caller submits the buffer and writes the record again).
+fn apr_record_error(ctx: &CpuContext, cb: u64, record_size: u64) -> Option<HleResult> {
+    if let Some(e) = amm_object_error(ctx, cb) {
+        return Some(e);
+    }
+    let size = ctx.read_u32(cb + cbuf::OFF_SIZE)? as u64;
+    let offset = ctx.read_u32(cb + cbuf::OFF_OFFSET)? as u64;
+    (size < record_size || offset > size - record_size).then_some(ERR_BUSY)
+}
+
+/// Append a read record after the writer's own checks.
+#[allow(clippy::too_many_arguments)]
+fn push_read(ctx: &CpuContext, cb: u64, opcode: u8, file_id: u32, dst: u64, size: u64, off: u64, rs: u64) -> HleResult {
+    if let Some(e) = apr_record_error(ctx, cb, rs) {
+        return e;
+    }
+    ok_or(cbuf::append_read(ctx, cb, opcode, file_id, dst, size, off, rs), ERR_MEMORY_FAULT)
+}
+
 /// (cb, -, -, fileId, dst, size, [stack] fileOffset)
 fn cb_apr_read_file(ctx: &mut CpuContext) -> HleResult {
     let (cb, file_id, dst, size) = (ctx.rdi(), ctx.rcx() as u32, ctx.r8(), ctx.r9());
@@ -202,7 +224,7 @@ fn cb_apr_read_file(ctx: &mut CpuContext) -> HleResult {
     }
     trace("read_file", cb, file_id as u64, off);
     let rs = cbuf::read_file_size(off);
-    ok_or(cbuf::append_read(ctx, cb, cbuf::OP_READ_FILE, file_id, dst, size, off, rs), ERR_MEMORY_FAULT)
+    push_read(ctx, cb, cbuf::OP_READ_FILE, file_id, dst, size, off, rs)
 }
 
 /// (cb, -, -, size, fileOffset): same file, destination following the
@@ -217,8 +239,7 @@ fn cb_apr_read_file_gather(ctx: &mut CpuContext) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     let rs = cbuf::read_gather_size(off);
-    let ok = cbuf::append_read(ctx, cb, cbuf::OP_READ_GATHER, st.gs_file_id, st.gs_destination, size, off, rs);
-    ok_or(ok, ERR_MEMORY_FAULT)
+    push_read(ctx, cb, cbuf::OP_READ_GATHER, st.gs_file_id, st.gs_destination, size, off, rs)
 }
 
 /// (cb, -, -, dst, size): same file, file range following the previous read.
@@ -232,8 +253,7 @@ fn cb_apr_read_file_scatter(ctx: &mut CpuContext) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     let rs = cbuf::READ_SCATTER_SIZE;
-    let ok = cbuf::append_read(ctx, cb, cbuf::OP_READ_SCATTER, st.gs_file_id, dst, size, st.gs_file_offset, rs);
-    ok_or(ok, ERR_MEMORY_FAULT)
+    push_read(ctx, cb, cbuf::OP_READ_SCATTER, st.gs_file_id, dst, size, st.gs_file_offset, rs)
 }
 
 /// (cb, -, -, dst, size, fileOffset): same file as the previous read.
@@ -247,14 +267,14 @@ fn cb_apr_read_file_gather_scatter(ctx: &mut CpuContext) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     let rs = cbuf::read_gather_scatter_size(off);
-    ok_or(cbuf::append_read(ctx, cb, cbuf::OP_READ_GATHER_SCATTER, st.gs_file_id, dst, size, off, rs), ERR_MEMORY_FAULT)
+    push_read(ctx, cb, cbuf::OP_READ_GATHER_SCATTER, st.gs_file_id, dst, size, off, rs)
 }
 
 /// (cb, -, -): 4 bytes of stream space; clears the continuation.
 fn cb_apr_reset_gather_scatter_state(ctx: &mut CpuContext) -> HleResult {
     let cb = ctx.rdi();
-    if cb == 0 {
-        return ERR_INVALID_ARGUMENT;
+    if let Some(e) = apr_record_error(ctx, cb, cbuf::RESET_GATHER_SCATTER_SIZE) {
+        return e;
     }
     if append_noop(ctx, cb, cbuf::RESET_GATHER_SCATTER_SIZE) != OK {
         return ERR_MEMORY_FAULT;
@@ -327,7 +347,18 @@ fn append_write_address(ctx: &CpuContext, cb: u64, address: u64, value: u64) -> 
         return ERR_INVALID_ARGUMENT;
     }
     trace("write_address", cb, address, value);
-    ok_or(cbuf::append(ctx, cb, cbuf::FIXED32_SIZE, Some(CommandData::WriteAddress { address, value })), ERR_BUSY)
+    let size = cbuf::write_address_size(value);
+    ok_or(cbuf::append(ctx, cb, size, Some(CommandData::WriteAddress { address, value })), ERR_BUSY)
+}
+
+/// A write of a counter or timer value: the value is not modelled, 0 is
+/// stored; the record has the size of the console's.
+fn append_write_address_zero(ctx: &CpuContext, cb: u64, address: u64, size: u64) -> HleResult {
+    if cb == 0 || address == 0 || address & 7 != 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+    trace("write_address", cb, address, 0);
+    ok_or(cbuf::append(ctx, cb, size, Some(CommandData::WriteAddress { address, value: 0 })), ERR_BUSY)
 }
 
 /// (cb, address, value[, flags]): store a u64 (release) when the command executes.
@@ -335,9 +366,23 @@ fn cb_write_address(ctx: &mut CpuContext) -> HleResult {
     append_write_address(ctx, ctx.rdi(), ctx.rsi(), ctx.rdx())
 }
 
-/// (cb, address, ...): the counter/timer value is not modelled; 0 is stored.
-fn cb_write_address_zero(ctx: &mut CpuContext) -> HleResult {
-    append_write_address(ctx, ctx.rdi(), ctx.rsi(), 0)
+/// (cb, address)
+fn cb_write_address_from_time_counter(ctx: &mut CpuContext) -> HleResult {
+    append_write_address_zero(ctx, ctx.rdi(), ctx.rsi(), cbuf::WRITE_TIME_COUNTER_SIZE)
+}
+
+/// (cb, address, uint8 index)
+fn cb_write_address_from_counter(ctx: &mut CpuContext) -> HleResult {
+    append_write_address_zero(ctx, ctx.rdi(), ctx.rsi(), cbuf::write_address_from_counter_size(ctx.rdx() as u8))
+}
+
+/// (cb, address, uint8 index): the pair starts at an even counter.
+fn cb_write_address_from_counter_pair(ctx: &mut CpuContext) -> HleResult {
+    let index = ctx.rdx() as u8;
+    if index & 1 != 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+    append_write_address_zero(ctx, ctx.rdi(), ctx.rsi(), cbuf::write_address_from_counter_size(index))
 }
 
 /// (cb, address, value, uint8 compare, uint8 flush): block the queue until
@@ -349,14 +394,14 @@ fn cb_wait_on_address(ctx: &mut CpuContext) -> HleResult {
     }
     trace("wait_address", cb, address, value);
     let data = CommandData::Wait { source: address, value, compare, is_counter: false };
-    ok_or(cbuf::append(ctx, cb, cbuf::FIXED32_SIZE, Some(data)), ERR_BUSY)
+    ok_or(cbuf::append(ctx, cb, cbuf::wait_on_address_size(value), Some(data)), ERR_BUSY)
 }
 
 /// (cb, uint8 index, uint8 access, value, uint8 compare, uint8 maskOp,
 /// [stack] mask, [stack] uint8 flush): wait on a shared counter.
 fn cb_wait_on_counter(ctx: &mut CpuContext) -> HleResult {
     let (cb, index, access, value) = (ctx.rdi(), ctx.rsi() as u8, ctx.rdx() as u8, ctx.rcx());
-    let (compare, mask_op, flush) = (ctx.r8() as u8, ctx.r9() as u8, stack_arg(ctx, 1) as u8);
+    let (compare, mask_op, mask, flush) = (ctx.r8() as u8, ctx.r9() as u8, stack_arg(ctx, 0), stack_arg(ctx, 1) as u8);
     if cb == 0 || access > 7 || compare > 6 || mask_op > 1 || flush > 1 {
         return ERR_INVALID_ARGUMENT;
     }
@@ -368,7 +413,7 @@ fn cb_wait_on_counter(ctx: &mut CpuContext) -> HleResult {
     }
     trace("wait_counter", cb, index as u64, value);
     let data = CommandData::Wait { source: index as u64, value, compare, is_counter: true };
-    ok_or(cbuf::append(ctx, cb, cbuf::FIXED32_SIZE, Some(data)), ERR_BUSY)
+    ok_or(cbuf::append(ctx, cb, cbuf::wait_on_counter_size(access, value, mask_op, mask), Some(data)), ERR_BUSY)
 }
 
 /// (cb, uint8 index, uint32 value, uint8 compare, uint8 flush): wait until
@@ -383,7 +428,7 @@ fn cb_wait_on_counter_32(ctx: &mut CpuContext) -> HleResult {
     }
     trace("wait_counter", cb, index as u64, value as u64);
     let data = CommandData::Wait { source: index as u64, value: value as u64, compare, is_counter: true };
-    ok_or(cbuf::append(ctx, cb, cbuf::FIXED32_SIZE, Some(data)), ERR_BUSY)
+    ok_or(cbuf::append(ctx, cb, cbuf::wait_on_counter32_size(value), Some(data)), ERR_BUSY)
 }
 
 /// (cb, uint8 index, uint8 access, value, uint8 operation, uint32 mode):
@@ -400,12 +445,12 @@ fn cb_write_counter(ctx: &mut CpuContext) -> HleResult {
     }
     trace("write_counter", cb, index as u64, value);
     let data = CommandData::WriteCounter { index, value: value as u32 };
-    ok_or(cbuf::append(ctx, cb, cbuf::FIXED32_SIZE, Some(data)), ERR_BUSY)
+    ok_or(cbuf::append(ctx, cb, cbuf::write_counter_size(access, value, operation), Some(data)), ERR_BUSY)
 }
 
-/// (cb, ...): stream space only.
+/// (cb, uint8 index, uint32 value): stream space only.
 fn cb_write_counter_on_completion(ctx: &mut CpuContext) -> HleResult {
-    append_noop(ctx, ctx.rdi(), cbuf::FIXED32_SIZE)
+    append_noop(ctx, ctx.rdi(), cbuf::write_counter_on_completion_size(ctx.rdx() as u32))
 }
 
 // ---------------------------------------------------------------------------
@@ -503,20 +548,87 @@ fn cb_measure_kernel_event_queue(_ctx: &mut CpuContext) -> HleResult {
     cbuf::KERNEL_EVENT_SIZE as HleResult
 }
 
-/// Every wait, write-address, counter and timer command takes 32 bytes.
-fn cb_measure_fixed32(_ctx: &mut CpuContext) -> HleResult {
-    cbuf::FIXED32_SIZE as HleResult
+/// A measured record size, or the error of the measure functions.
+fn measured(valid: bool, size: u64) -> HleResult {
+    if valid {
+        size as HleResult
+    } else {
+        MEASURE_INVALID
+    }
 }
 
-/// (uint32 count)
+/// (address, value, uint8 compare, uint8 flush): compare up to 6, a NULL
+/// address is refused.
+fn cb_measure_wait_on_address(ctx: &mut CpuContext) -> HleResult {
+    let (address, value, compare, flush) = (ctx.rdi(), ctx.rsi(), ctx.rdx() as u8, ctx.rcx() as u8);
+    let valid = address != 0 && flush <= 1 && compare <= 6 && cbuf::valid_command_address(address);
+    measured(valid, cbuf::wait_on_address_size(value))
+}
+
+/// (address, value, uint8 compare, uint8 flush): the earlier form, compare
+/// up to 3.
+fn cb_measure_wait_on_address_legacy(ctx: &mut CpuContext) -> HleResult {
+    let (address, value, compare, flush) = (ctx.rdi(), ctx.rsi(), ctx.rdx() as u8, ctx.rcx() as u8);
+    measured(flush <= 1 && compare <= 3 && cbuf::valid_command_address(address), cbuf::wait_on_address_size(value))
+}
+
+/// (uint8 index, uint8 access, value, uint8 compare, uint8 maskOp, mask,
+/// [stack] uint8 flush)
+fn cb_measure_wait_on_counter(ctx: &mut CpuContext) -> HleResult {
+    let (access, value, compare) = (ctx.rsi() as u8, ctx.rdx(), ctx.rcx() as u8);
+    let (mask_op, mask, flush) = (ctx.r8() as u8, ctx.r9(), stack_arg(ctx, 0) as u8);
+    let valid = access <= 7 && compare <= 6 && (flush | mask_op) <= 1;
+    measured(valid, cbuf::wait_on_counter_size(access, value, mask_op, mask))
+}
+
+/// (uint8 index, uint32 value, uint8 compare, uint8 flush)
+fn cb_measure_wait_on_counter_32(ctx: &mut CpuContext) -> HleResult {
+    let (index, value, compare, flush) = (ctx.rdi() as u8, ctx.rsi() as u32, ctx.rdx() as u8, ctx.rcx() as u8);
+    measured(index < engine::APP_COUNTERS && compare <= 3 && flush <= 1, cbuf::wait_on_counter32_size(value))
+}
+
+/// (address, value)
+fn cb_measure_write_address(ctx: &mut CpuContext) -> HleResult {
+    let (address, value) = (ctx.rdi(), ctx.rsi());
+    measured(address != 0 && cbuf::valid_command_address(address), cbuf::write_address_size(value))
+}
+
+/// (address)
+fn cb_measure_write_address_from_time_counter(ctx: &mut CpuContext) -> HleResult {
+    let address = ctx.rdi();
+    measured(address != 0 && cbuf::valid_command_address(address), cbuf::WRITE_TIME_COUNTER_SIZE)
+}
+
+/// (address, uint8 index)
+fn cb_measure_write_address_from_counter(ctx: &mut CpuContext) -> HleResult {
+    let (address, index) = (ctx.rdi(), ctx.rsi() as u8);
+    measured(address != 0 && cbuf::valid_command_address(address), cbuf::write_address_from_counter_size(index))
+}
+
+/// (address, uint8 index): an even index.
+fn cb_measure_write_address_from_counter_pair(ctx: &mut CpuContext) -> HleResult {
+    let (address, index) = (ctx.rdi(), ctx.rsi() as u8);
+    let valid = address != 0 && index & 1 == 0 && cbuf::valid_command_address(address);
+    measured(valid, cbuf::write_address_from_counter_size(index))
+}
+
+/// (uint8 index, uint8 access, value, uint8 operation)
+fn cb_measure_write_counter(ctx: &mut CpuContext) -> HleResult {
+    let (index, access, value, operation) = (ctx.rdi() as u8, ctx.rsi() as u8, ctx.rdx(), ctx.rcx() as u8);
+    let valid = index < engine::APP_COUNTERS && access <= 7 && operation <= 4;
+    measured(valid, cbuf::write_counter_size(access, value, operation))
+}
+
+/// (uint8 index, uint32 value)
+fn cb_measure_write_counter_on_completion(ctx: &mut CpuContext) -> HleResult {
+    let (index, value) = (ctx.rdi() as u8, ctx.rsi() as u32);
+    measured(index < engine::APP_COUNTERS, cbuf::write_counter_on_completion_size(value))
+}
+
+/// (uint32 count[, data]): `count` dwords, 1..=16.
 fn cb_measure_nop(ctx: &mut CpuContext) -> HleResult {
     let n = ctx.rdi() as u32 as u64;
-    (if n == 0 { 4 } else { cbuf::align4(n * 4) }) as HleResult
-}
-
-/// (uint32 count, data)
-fn cb_measure_nop_with_data(ctx: &mut CpuContext) -> HleResult {
-    cbuf::align4((ctx.rdi() as u32 as u64 + 1) * 4) as HleResult
+    measured((1..=16).contains(&n), n * 4)
 }
 
 /// (label)
@@ -576,9 +688,11 @@ fn append_amm(ctx: &CpuContext, cb: u64, m: AmmMap) -> HleResult {
     let size = match m.kind {
         AmmKind::MapAuto => cbuf::AMM_MAP_SIZE,
         AmmKind::MapDirect => cbuf::AMM_MAP_DIRECT_SIZE,
-        AmmKind::Unmap | AmmKind::MapAsPrt => cbuf::AMM_UNMAP_SIZE,
+        AmmKind::Unmap => cbuf::AMM_UNMAP_SIZE,
+        AmmKind::MapAsPrt => cbuf::AMM_MAP_AS_PRT_SIZE,
         AmmKind::Remap | AmmKind::MultiMap => cbuf::AMM_REMAP_SIZE,
         AmmKind::ModifyProtect | AmmKind::ModifyMtypeProtect | AmmKind::AllocatePaForPrt => cbuf::AMM_PROTECT_SIZE,
+        AmmKind::UnmapToPrt => cbuf::AMM_UNMAP_TO_PRT_SIZE,
     };
     trace("amm", cb, m.va, m.size);
     ok_or(cbuf::append(ctx, cb, size, Some(CommandData::AmmMap(m))), ERR_BUSY)
@@ -680,7 +794,14 @@ fn cb_amm_modify_mtype_protect_with_gpu_mask_id(ctx: &mut CpuContext) -> HleResu
 /// memory is EPERM.
 fn push_prt(ctx: &CpuContext, cb: u64, record_size: u64, m: AmmMap) -> HleResult {
     let st = cbuf::try_get_state(ctx, cb);
-    if st.as_ref().is_some_and(|s| s.write_offset > s.size || s.size - s.write_offset < record_size) {
+    if let Some(s) = st.as_ref().filter(|s| s.write_offset > s.size || s.size - s.write_offset < record_size) {
+        if s.buffer != 0 {
+            log::warn!(
+                "[ampr] AMM command buffer {cb:#x} is full: {:#x} of {:#x} bytes used, no room for a {record_size:#x}-byte PRT record",
+                s.write_offset,
+                s.size
+            );
+        }
         return ERR_BUSY;
     }
     if st.is_none_or(|s| s.buffer == 0) {
@@ -697,6 +818,30 @@ fn cb_amm_map_as_prt(ctx: &mut CpuContext) -> HleResult {
         return ERR_INVALID_ARGUMENT;
     }
     push_prt(ctx, cb, cbuf::AMM_MAP_AS_PRT_SIZE, AmmMap { kind: AmmKind::MapAsPrt, va, size, ..Default::default() })
+}
+
+/// (cb, va, size). The library checks in this order: no command buffer
+/// (EINVAL), no command memory (EPERM), a range the kernel refuses to
+/// encode (not page aligned, empty, or outside the AMM range: EINVAL), no
+/// room for the record (EBUSY).
+fn cb_amm_unmap_to_prt(ctx: &mut CpuContext) -> HleResult {
+    let (cb, va, size) = (ctx.rdi(), ctx.rsi(), ctx.rdx());
+    if cb == 0 {
+        return ERR_INVALID_ARGUMENT;
+    }
+    let st = cbuf::try_get_state(ctx, cb);
+    if st.as_ref().is_none_or(|s| s.buffer == 0) {
+        return ERR_PERMISSION_DENIED;
+    }
+    if !cbuf::valid_map_args(va, size) || !amm::in_amm_range(va, size) {
+        return ERR_INVALID_ARGUMENT;
+    }
+    if st.is_some_and(|s| s.write_offset > s.size || s.size - s.write_offset < cbuf::AMM_UNMAP_TO_PRT_SIZE) {
+        return ERR_BUSY;
+    }
+    trace("amm_prt", cb, va, size);
+    let m = AmmMap { kind: AmmKind::UnmapToPrt, va, size, ..Default::default() };
+    ok_or(cbuf::append(ctx, cb, cbuf::AMM_UNMAP_TO_PRT_SIZE, Some(CommandData::AmmMap(m))), ERR_BUSY)
 }
 
 /// Protection bits AllocatePaForPrt sets on pages that are already backed.
@@ -942,12 +1087,12 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("cQb8Zr8Q0Y0", "sceAmprCommandBufferWaitOnCounter_04_00", cb_wait_on_counter),
     ("jK+yuYCI7MA", "sceAmprCommandBufferWriteCounter_04_00", cb_write_counter),
     ("3wn42MWTzTs", "sceAmprCommandBufferWriteCounterOnCompletion", cb_write_counter_on_completion),
-    ("bt3LHR9xjK4", "sceAmprCommandBufferWriteAddressFromTimeCounter_04_00", cb_write_address_zero),
-    ("FI2JD0jAHCs", "sceAmprCommandBufferWriteAddressFromTimeCounterOnCompletion", cb_write_address_zero),
-    ("t4ExS+SwLjs", "sceAmprCommandBufferWriteAddressFromCounter_04_00", cb_write_address_zero),
-    ("gSF5OsXdfIg", "sceAmprCommandBufferWriteAddressFromCounterOnCompletion", cb_write_address_zero),
-    ("enZm-6GjWqw", "sceAmprCommandBufferWriteAddressFromCounterPair_04_00", cb_write_address_zero),
-    ("ZLWtNUP6R5E", "sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", cb_write_address_zero),
+    ("bt3LHR9xjK4", "sceAmprCommandBufferWriteAddressFromTimeCounter_04_00", cb_write_address_from_time_counter),
+    ("FI2JD0jAHCs", "sceAmprCommandBufferWriteAddressFromTimeCounterOnCompletion", cb_write_address_from_time_counter),
+    ("t4ExS+SwLjs", "sceAmprCommandBufferWriteAddressFromCounter_04_00", cb_write_address_from_counter),
+    ("gSF5OsXdfIg", "sceAmprCommandBufferWriteAddressFromCounterOnCompletion", cb_write_address_from_counter),
+    ("enZm-6GjWqw", "sceAmprCommandBufferWriteAddressFromCounterPair_04_00", cb_write_address_from_counter_pair),
+    ("ZLWtNUP6R5E", "sceAmprCommandBufferWriteAddressFromCounterPairOnCompletion", cb_write_address_from_counter_pair),
     // markers / nops
     ("tNn5WBkta60", "sceAmprCommandBufferNop", cb_nop),
     ("pFQ9UHpO52s", "sceAmprCommandBufferNopWithData", cb_nop_with_data),
@@ -966,21 +1111,21 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("rddQYXM0CjM", "sceAmprMeasureCommandSizeResetGatherScatterState", cb_measure_dword),
     ("sSAUCCU1dv4", "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00", cb_measure_kernel_event_queue),
     ("Zi3dBUjgyXI", "sceAmprMeasureCommandSizeWriteKernelEventQueueOnCompletion", cb_measure_kernel_event_queue),
-    ("C+IEj+BsAFM", "sceAmprMeasureCommandSizeWriteAddressOnCompletion", cb_measure_fixed32),
-    ("x7SQEXfeovg", "sceAmprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion", cb_measure_fixed32),
-    ("32AcaTaBPSY", "sceAmprMeasureCommandSizeWriteAddressFromCounterOnCompletion", cb_measure_fixed32),
-    ("vxC58+DRk-U", "sceAmprMeasureCommandSizeWriteAddressFromCounterPairOnCompletion", cb_measure_fixed32),
-    ("4muPEJ-x5N8", "sceAmprMeasureCommandSizeWriteCounterOnCompletion", cb_measure_fixed32),
-    ("jIlc4p5dSD0", "sceAmprMeasureCommandSizeWaitOnAddress", cb_measure_fixed32),
-    ("0BMj1hgG+kE", "sceAmprMeasureCommandSizeWaitOnAddress_04_00", cb_measure_fixed32),
-    ("ClnsFLLLcss", "sceAmprMeasureCommandSizeWaitOnCounter_04_00", cb_measure_fixed32),
-    ("4fgtGfXDrFc", "sceAmprMeasureCommandSizeWriteAddress_04_00", cb_measure_fixed32),
-    ("gAtc79UTt5E", "sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00", cb_measure_fixed32),
-    ("JYd9g9L+TmE", "sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00", cb_measure_fixed32),
-    ("2Hw8gjMdwSY", "sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00", cb_measure_fixed32),
-    ("I-Qm+MEso5c", "sceAmprMeasureCommandSizeWriteCounter_04_00", cb_measure_fixed32),
+    ("C+IEj+BsAFM", "sceAmprMeasureCommandSizeWriteAddressOnCompletion", cb_measure_write_address),
+    ("x7SQEXfeovg", "sceAmprMeasureCommandSizeWriteAddressFromTimeCounterOnCompletion", cb_measure_write_address_from_time_counter),
+    ("32AcaTaBPSY", "sceAmprMeasureCommandSizeWriteAddressFromCounterOnCompletion", cb_measure_write_address_from_counter),
+    ("vxC58+DRk-U", "sceAmprMeasureCommandSizeWriteAddressFromCounterPairOnCompletion", cb_measure_write_address_from_counter_pair),
+    ("4muPEJ-x5N8", "sceAmprMeasureCommandSizeWriteCounterOnCompletion", cb_measure_write_counter_on_completion),
+    ("jIlc4p5dSD0", "sceAmprMeasureCommandSizeWaitOnAddress", cb_measure_wait_on_address_legacy),
+    ("0BMj1hgG+kE", "sceAmprMeasureCommandSizeWaitOnAddress_04_00", cb_measure_wait_on_address),
+    ("ClnsFLLLcss", "sceAmprMeasureCommandSizeWaitOnCounter_04_00", cb_measure_wait_on_counter),
+    ("4fgtGfXDrFc", "sceAmprMeasureCommandSizeWriteAddress_04_00", cb_measure_write_address),
+    ("gAtc79UTt5E", "sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00", cb_measure_write_address_from_time_counter),
+    ("JYd9g9L+TmE", "sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00", cb_measure_write_address_from_counter),
+    ("2Hw8gjMdwSY", "sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00", cb_measure_write_address_from_counter_pair),
+    ("I-Qm+MEso5c", "sceAmprMeasureCommandSizeWriteCounter_04_00", cb_measure_write_counter),
     ("NNIZ-FMyz3M", "sceAmprMeasureCommandSizeNop", cb_measure_nop),
-    ("Xp85BP3+BBI", "sceAmprMeasureCommandSizeNopWithData", cb_measure_nop_with_data),
+    ("Xp85BP3+BBI", "sceAmprMeasureCommandSizeNopWithData", cb_measure_nop),
     ("0RdLmAh7WVo", "sceAmprMeasureCommandSizePushMarker", cb_measure_marker),
     ("3OfeY4pzDV0", "sceAmprMeasureCommandSizePushMarkerWithColor", cb_measure_marker_with_color),
     ("VGkEj4d6-Kg", "sceAmprMeasureCommandSizeSetMarker", cb_measure_marker),
@@ -1018,6 +1163,7 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("ie-UuLGbYXo", "sceAmprAmmCommandBufferModifyMtypeProtectWithGpuMaskId", cb_amm_modify_mtype_protect_with_gpu_mask_id),
     ("ZJCgt+aPHAU", "sceAmprAmmCommandBufferMapAsPrt", cb_amm_map_as_prt),
     ("d3lKWPM6odc", "sceAmprAmmCommandBufferAllocatePaForPrt", cb_amm_allocate_pa_for_prt),
+    ("3A2X6OCHtnA", "sceAmprAmmCommandBufferUnmapToPrt", cb_amm_unmap_to_prt),
     ("8sFq5s8eHnQ", "sceAmprAmmMeasureAmmCommandSizeRemap", cb_measure_amm_remap),
     ("b50TWwRmzu8", "sceAmprAmmMeasureAmmCommandSizeRemapWithGpuMaskId", cb_measure_amm_remap),
     ("U6PxwrRchl4", "sceAmprAmmMeasureAmmCommandSizeMultiMap", cb_measure_amm_remap),
@@ -1029,7 +1175,7 @@ pub(crate) const EXPORTS: &[Export] = &[
     ("4SSJ+cn+Pvg", "sceAmprAmmMeasureAmmCommandSizeMapAsPrt", cb_measure_amm_map_as_prt),
     ("2yYv9QWB3hU", "sceAmprAmmMeasureAmmCommandSizeAllocatePaForPrt", cb_measure_amm_allocate_pa_for_prt),
     ("FrCNL9TQ8ms", "sceAmprCommandBufferWaitOnCounter", cb_wait_on_counter_32),
-    ("6jLL5BIZ88U", "sceAmprMeasureCommandSizeWaitOnCounter", cb_measure_fixed32),
+    ("6jLL5BIZ88U", "sceAmprMeasureCommandSizeWaitOnCounter", cb_measure_wait_on_counter_32),
 ];
 
 /// libkernel APR submission exports.

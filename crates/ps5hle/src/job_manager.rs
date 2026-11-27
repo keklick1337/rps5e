@@ -440,6 +440,7 @@ mod tests {
 
     #[test]
     fn initialize_writes_header_and_impl() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let (vm, mem) = ctx_with_block();
         let mut ctx = CpuContext::new(&vm);
         let this = mem + BLOCK; // handle object outside the memory block
@@ -472,6 +473,7 @@ mod tests {
 
     #[test]
     fn initialize_rejects_bad_arguments() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let (vm, mem) = ctx_with_block();
         let mut ctx = CpuContext::new(&vm);
         let this = mem + BLOCK;
@@ -513,6 +515,7 @@ mod tests {
 
     #[test]
     fn ctor_and_dtor_roundtrip() {
+        let _scratch = crate::test_bases::scratch_lock(BASE);
         let (vm, mem) = ctx_with_block();
         let mut ctx = CpuContext::new(&vm);
         let this = mem + BLOCK;

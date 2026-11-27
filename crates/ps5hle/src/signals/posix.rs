@@ -1604,7 +1604,7 @@ mod tests {
     #[test]
     fn waiting_for_signals() {
         std::thread::spawn(|| {
-            let m = Mem::new(0x5EC8_0000_0000);
+            let m = Mem::new(0x5B04_0000_0000);
             let mut ctx = CpuContext::new(m.vm);
             let errno = crate::kernel::bind_test_errno(&ctx);
             // SIGCONT: with the default action it stays pending while blocked
@@ -1653,7 +1653,7 @@ mod tests {
     #[test]
     fn setcontext_checks_the_context() {
         std::thread::spawn(|| {
-            let m = Mem::new(0x5EC9_0000_0000);
+            let m = Mem::new(0x5B05_0000_0000);
             let mut ctx = CpuContext::new(m.vm);
             let errno = crate::kernel::bind_test_errno(&ctx);
             let uc = m.base;

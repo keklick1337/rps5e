@@ -9,7 +9,7 @@
 use super::graph::ScalarValueGraph;
 use super::memory::{MemoryAccess, MemoryResourceKind};
 use super::plan::ShaderResourcePlan;
-use super::value::ValueId;
+use super::value::{ValueId, ValueKind};
 use crate::ir::branch;
 use crate::ir_types::Instruction;
 use crate::opcode::Opcode;
@@ -32,11 +32,11 @@ pub(super) fn build(
     replacements: &HashMap<ValueId, ValueId>,
     memo: &mut HashMap<ValueId, ValueId>,
 ) -> Vec<ResourceBranchBlock> {
-    // A shader write can change a predicate through an alias or a later
-    // loop iteration.
-    if plan.graph.memory.entries().iter().any(|a| matches!(a.access, MemoryAccess::Write | MemoryAccess::Atomic)) {
-        return Vec::new();
-    }
+    // A shader write can change a predicate read from memory, through an
+    // alias or in a later loop iteration: a program that writes keeps only
+    // the predicates computed from its entry registers.
+    let writes = plan.graph.memory.entries().iter().any(|a| matches!(a.access, MemoryAccess::Write | MemoryAccess::Atomic));
+    let mut register_only = HashMap::new();
     if plan.graph.program.instructions.iter().any(|i| matches!(i.opcode, Opcode::SSetpcB64 | Opcode::SSwappcB64)) {
         return Vec::new();
     }
@@ -67,7 +67,7 @@ pub(super) fn build(
                 successors = vec![plan.graph.cfg.block_by_start_pc[&target], block_index + 1];
                 if let Some(&original) = plan.graph.branch_conditions.get(&last.pc) {
                     let candidate = rewrite(&mut plan.graph, original, replacements, memo);
-                    if plan.validate_runtime_value(candidate) {
+                    if plan.validate_runtime_value(candidate) && (!writes || reads_no_memory(&plan.graph, candidate, &mut register_only)) {
                         condition = Some(candidate);
                     }
                 }
@@ -97,6 +97,46 @@ pub(super) fn build(
     } else {
         Vec::new()
     }
+}
+
+/// `value` is computed from constants, user data and the shader base
+/// alone: no guest memory word, lane value or control-flow join enters it,
+/// so nothing the program does changes it after entry.
+fn reads_no_memory(graph: &ScalarValueGraph, value: ValueId, memo: &mut HashMap<ValueId, bool>) -> bool {
+    // Every node reached, then one pass: a node of another kind anywhere
+    // below the value disqualifies it.
+    if let Some(&known) = memo.get(&value) {
+        return known;
+    }
+    let mut seen = HashSet::new();
+    let mut pending = vec![value];
+    let mut pure = true;
+    while let Some(v) = pending.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        match memo.get(&v) {
+            Some(true) => continue,
+            Some(false) => {
+                pure = false;
+                break;
+            }
+            None => {}
+        }
+        match graph.kind(v) {
+            ValueKind::Constant | ValueKind::UserData | ValueKind::ShaderBase => {}
+            ValueKind::Operation | ValueKind::Select => pending.extend_from_slice(graph.operands(v)),
+            _ => {
+                pure = false;
+                break;
+            }
+        }
+    }
+    if pure {
+        memo.extend(seen.into_iter().map(|v| (v, true)));
+    }
+    memo.insert(value, pure);
+    pure
 }
 
 fn rewrite(graph: &mut ScalarValueGraph, value: ValueId, replacements: &HashMap<ValueId, ValueId>, memo: &mut HashMap<ValueId, ValueId>) -> ValueId {

@@ -82,10 +82,11 @@ fn buffer_management() {
         assert_eq!(call(ctx, stack, cb_nop, &[cb, 17]), EINVAL);
         assert_eq!(call(ctx, stack, cb_nop, &[cb, 3]), OK);
         assert_eq!(call(ctx, stack, cb_measure_nop, &[3]), 12);
-        assert_eq!(call(ctx, stack, cb_measure_nop, &[0]), 4);
+        assert_eq!(call(ctx, stack, cb_measure_nop, &[0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_nop, &[16]), 64);
+        assert_eq!(call(ctx, stack, cb_measure_nop, &[17]), MEASURE_INVALID);
         assert_eq!(call(ctx, stack, cb_nop_with_data, &[cb, 16, 0]), EINVAL);
         assert_eq!(call(ctx, stack, cb_nop_with_data, &[cb, 2, 0]), OK);
-        assert_eq!(call(ctx, stack, cb_measure_nop_with_data, &[2, 0]), 12);
         ctx.write_bytes(base + 0x7000, b"label\0");
         assert_eq!(call(ctx, stack, cb_measure_marker, &[base + 0x7000]), 12);
         assert_eq!(call(ctx, stack, cb_measure_marker_with_color, &[base + 0x7000, 1]), 16);
@@ -176,6 +177,54 @@ fn read_records_and_gather_scatter() {
         assert_eq!(call(ctx, stack, cb_nop, &[cb, 1]), ERR_MEMORY_FAULT);
         assert_eq!(call(ctx, stack, cb_write_address, &[cb, dst, 1]), ERR_BUSY);
         assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0x400);
+        assert_eq!(call(ctx, stack, cb_destructor, &[cb]), OK);
+    });
+}
+
+/// The read writers answer a full command buffer with EBUSY (the caller
+/// submits and writes the record again) and an object without command
+/// memory with EPERM; argument errors come first.
+#[test]
+fn read_records_report_full_and_detached_buffers() {
+    with_vm(11, |ctx, base| {
+        let (cb, buf, stack, dst) = (base, base + 0x100, base + 0x8000, base + 0x4000);
+        let read = |ctx: &mut CpuContext| call(ctx, stack, cb_apr_read_file, &[cb, 0, 0, 7, dst, 0x10, 0x20]);
+        let writers = |ctx: &mut CpuContext| {
+            [
+                call(ctx, stack, cb_apr_read_file_gather, &[cb, 0, 0, 0x8, 0]),
+                call(ctx, stack, cb_apr_read_file_scatter, &[cb, 0, 0, dst + 0x100, 0x4]),
+                call(ctx, stack, cb_apr_read_file_gather_scatter, &[cb, 0, 0, dst + 0x200, 0x4, 0]),
+                call(ctx, stack, cb_apr_reset_gather_scatter_state, &[cb, 0, 0]),
+            ]
+        };
+        assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
+
+        // No command memory: EPERM, after the argument checks.
+        assert_eq!(read(ctx), ERR_PERMISSION_DENIED);
+        assert_eq!(call(ctx, stack, cb_apr_read_file, &[cb, 0, 0, 7, dst, 0, 0]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_apr_read_file, &[0, 0, 0, 7, dst, 0x10, 0x20]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_apr_reset_gather_scatter_state, &[cb, 0, 0]), ERR_PERMISSION_DENIED);
+        assert_eq!(call(ctx, stack, cb_apr_reset_gather_scatter_state, &[0, 0, 0]), EINVAL);
+
+        // 0x14 bytes of command memory hold one read and nothing after it.
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x14]), OK);
+        assert_eq!(read(ctx), OK);
+        assert_eq!(read(ctx), ERR_BUSY);
+        assert_eq!(writers(ctx), [ERR_BUSY; 4]);
+        assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0x14);
+        assert_eq!(call(ctx, stack, cb_get_num_commands, &[cb]), 1);
+        // The refused reset left the continuation alone.
+        assert_eq!(call(ctx, stack, cb_get_type, &[cb]) as u32, cbuf::TYPE_GATHER_SCATTER_VALID);
+
+        // Detached: EPERM again.
+        assert_eq!(call(ctx, stack, cb_clear_buffer, &[cb]), buf as i64);
+        assert_eq!(read(ctx), ERR_PERMISSION_DENIED);
+        assert_eq!(call(ctx, stack, cb_apr_reset_gather_scatter_state, &[cb, 0, 0]), ERR_PERMISSION_DENIED);
+
+        // A buffer smaller than the record is full from the start.
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x10]), OK);
+        assert_eq!(read(ctx), ERR_BUSY);
+        assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0);
         assert_eq!(call(ctx, stack, cb_destructor, &[cb]), OK);
     });
 }
@@ -412,7 +461,7 @@ fn submission_ordering_counters_and_events() {
         assert_eq!(call(ctx, s, cb_write_address, &[h, o.var(7), 1]), OK);
         assert_eq!(submit_apr(ctx, 0, 0, 0), OK);
         assert_eq!(wait_apr(ctx, 0), OK);
-        assert_eq!(result(ctx, 0), (crate::sync::ERR_NOT_FOUND as i32, 0x20));
+        assert_eq!(result(ctx, 0), (crate::sync::ERR_NOT_FOUND as i32, 0x08));
         assert_eq!((load(ctx, o.var(6)), load(ctx, o.var(7))), (1, 0));
         // Submission argument checks.
         assert_eq!(call(ctx, s, cb_apr_submit, &[0, 0]), -1);
@@ -468,13 +517,13 @@ fn wait_and_write_argument_checks() {
         assert_eq!(call(ctx, stack, w, &[cb, base + 4, 0, 0, 0]), EINVAL);
         assert_eq!(call(ctx, stack, w, &[cb, base + 8, 0, 7, 0]), EINVAL);
         assert_eq!(call(ctx, stack, cb_write_address, &[cb, base + 4, 0]), EINVAL);
-        assert_eq!(call(ctx, stack, cb_write_address_zero, &[cb, 0, 0]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_write_address_from_time_counter, &[cb, 0]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_write_address_from_counter_pair, &[cb, base + 8, 3]), EINVAL, "odd pair index");
         assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0);
         assert_eq!(call(ctx, stack, w, &[cb, base + 8, 5, 6, 1]), OK);
-        assert_eq!(call(ctx, stack, cb_write_address_zero, &[cb, base + 8, 0, 0]), OK);
+        assert_eq!(call(ctx, stack, cb_write_address_from_time_counter, &[cb, base + 8]), OK);
         assert_eq!(call(ctx, stack, cb_write_counter_on_completion, &[cb, 0, 0, 0, 0]), OK);
-        assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 3 * cbuf::FIXED32_SIZE as i64);
-        assert_eq!(call(ctx, stack, cb_measure_fixed32, &[]), 0x20);
+        assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0x0C + 0x08 + 0x04);
         let st = cbuf::try_get_state(ctx, cb).unwrap();
         assert_eq!(
             st.commands.iter().map(|c| c.data).collect::<Vec<_>>(),
@@ -489,7 +538,7 @@ fn wait_and_write_argument_checks() {
         assert_eq!(call(ctx, stack, cb_amm_map_direct_with_gpu_mask_id, &[cb, 0x4000, 0x8000, 0x4000, 0, 0x33, 2]), OK);
         assert_eq!(call(ctx, stack, cb_amm_unmap, &[cb, 0x4000, 0x4000]), OK);
         let st = cbuf::try_get_state(ctx, cb).unwrap();
-        assert_eq!(st.write_offset, 3 * 0x20 + 0x30 + 0x20);
+        assert_eq!(st.write_offset, 0x18 + cbuf::AMM_MAP_DIRECT_SIZE + cbuf::AMM_UNMAP_SIZE);
         assert_eq!(
             st.commands[2].data,
             CommandData::AmmMap(AmmMap {
@@ -598,7 +647,7 @@ fn amm_remap_and_multimap_records() {
         assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
         assert_eq!(call(ctx, stack, cb_amm_remap, &[0, PAGE, 2 * PAGE, PAGE, 3]), EINVAL);
         assert_eq!(call(ctx, stack, cb_amm_remap, &[cb, PAGE, 2 * PAGE, PAGE, 3]), ERR_PERMISSION_DENIED);
-        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x50]), OK);
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x20]), OK);
         assert_eq!(call(ctx, stack, cb_amm_remap, &[cb, PAGE, 0x2000, PAGE, 3]), EINVAL, "unaligned source");
         assert_eq!(call(ctx, stack, cb_amm_remap, &[cb, PAGE, 2 * PAGE, PAGE, 0x400]), EINVAL, "invalid protection");
         assert_eq!(call(ctx, stack, cb_amm_multi_map, &[cb, 0, 2 * PAGE, PAGE, 3]), EINVAL);
@@ -615,7 +664,7 @@ fn amm_remap_and_multimap_records() {
                 CommandData::AmmMap(expect(AmmKind::MultiMap, 3, 0, 4 * PAGE)),
             ]
         );
-        assert_eq!(call(ctx, stack, cb_measure_amm_remap, &[PAGE, 2 * PAGE, PAGE, 3]), 0x28);
+        assert_eq!(call(ctx, stack, cb_measure_amm_remap, &[PAGE, 2 * PAGE, PAGE, 3]), 0x10);
         assert_eq!(call(ctx, stack, cb_measure_amm_remap, &[PAGE, 2 * PAGE, PAGE + 1, 3]), EINVAL);
     });
 }
@@ -649,9 +698,9 @@ fn amm_protect_records() {
             ]
         );
         assert_eq!(st.write_offset, 4 * cbuf::AMM_PROTECT_SIZE);
-        assert_eq!(call(ctx, stack, cb_measure_amm_modify_protect, &[PAGE, PAGE, 1, 2]), 0x28);
+        assert_eq!(call(ctx, stack, cb_measure_amm_modify_protect, &[PAGE, PAGE, 1, 2]), 0x10);
         assert_eq!(call(ctx, stack, cb_measure_amm_modify_protect, &[PAGE, PAGE, 1, 0x1000]), EINVAL);
-        assert_eq!(call(ctx, stack, cb_measure_amm_modify_mtype_protect, &[PAGE, PAGE, 99, 1, 2]), 0x28);
+        assert_eq!(call(ctx, stack, cb_measure_amm_modify_mtype_protect, &[PAGE, PAGE, 99, 1, 2]), 0x10);
         assert_eq!(call(ctx, stack, cb_measure_amm_modify_mtype_protect, &[PAGE, PAGE, 99, 0x400, 2]), EINVAL);
     });
 }
@@ -667,7 +716,7 @@ fn amm_prt_records() {
         assert_eq!(call(ctx, stack, cb_amm_map_as_prt, &[cb, PAGE, PAGE]), ERR_BUSY, "no command memory: no room");
         assert_eq!(call(ctx, stack, cb_amm_allocate_pa_for_prt, &[0, PAGE, PAGE, 0, 0x400]), EINVAL, "protection first");
         assert_eq!(call(ctx, stack, cb_amm_allocate_pa_for_prt, &[0, PAGE, PAGE, 0, 3]), EINVAL);
-        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x48]), OK);
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x1C]), OK);
         assert_eq!(call(ctx, stack, cb_amm_map_as_prt, &[cb, PAGE, PAGE + 4]), EINVAL);
         assert_eq!(call(ctx, stack, cb_amm_map_as_prt, &[cb, PAGE, PAGE]), OK);
         assert_eq!(call(ctx, stack, cb_amm_allocate_pa_for_prt, &[cb, PAGE, PAGE, 3, 0x33]), OK);
@@ -689,10 +738,67 @@ fn amm_prt_records() {
             ]
         );
         assert_eq!(st.write_offset, cbuf::AMM_MAP_AS_PRT_SIZE + cbuf::AMM_PROTECT_SIZE);
-        assert_eq!(call(ctx, stack, cb_measure_amm_map_as_prt, &[PAGE, PAGE]), 0x20);
+        assert_eq!(call(ctx, stack, cb_measure_amm_map_as_prt, &[PAGE, PAGE]), 0x0C);
         assert_eq!(call(ctx, stack, cb_measure_amm_map_as_prt, &[0, PAGE]), EINVAL);
-        assert_eq!(call(ctx, stack, cb_measure_amm_allocate_pa_for_prt, &[PAGE, PAGE, 0, 3]), 0x28);
+        assert_eq!(call(ctx, stack, cb_measure_amm_allocate_pa_for_prt, &[PAGE, PAGE, 0, 3]), 0x10);
         assert_eq!(call(ctx, stack, cb_measure_amm_allocate_pa_for_prt, &[PAGE, PAGE, 0, 4]), EINVAL);
+    });
+}
+
+/// UnmapToPrt: no command buffer is EINVAL, no command memory EPERM, a
+/// range the kernel does not encode (unaligned, empty, outside the AMM
+/// range) EINVAL, then a full buffer EBUSY; the record is three dwords.
+#[test]
+fn amm_unmap_to_prt_record() {
+    with_vm(10, |ctx, base| {
+        let (cb, buf, stack) = (base, base + 0x100, base + 0x8000);
+        let va = amm::VA_BASE + 0x40_0000;
+        assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[0, va, PAGE]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va, PAGE]), ERR_PERMISSION_DENIED, "no command memory");
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va + 1, 0]), ERR_PERMISSION_DENIED, "before the range check");
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x14]), OK);
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va + PAGE / 2, PAGE]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va, 0]), EINVAL);
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, amm::VA_BASE - PAGE, PAGE]), EINVAL, "below the AMM range");
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va, PAGE * 4]), OK);
+        let st = cbuf::try_get_state(ctx, cb).unwrap();
+        assert_eq!(st.write_offset, 12);
+        assert_eq!(
+            st.commands.iter().map(|c| c.data).collect::<Vec<_>>(),
+            vec![CommandData::AmmMap(AmmMap { kind: AmmKind::UnmapToPrt, va, size: PAGE * 4, ..Default::default() })]
+        );
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va, PAGE]), ERR_BUSY, "8 bytes left");
+        assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va, PAGE + 4]), EINVAL, "the range before the room");
+    });
+}
+
+/// Command memory of 16 bytes per PRT command (plus the MapAsPrt that
+/// sets the range up) holds that many AllocatePaForPrt / UnmapToPrt
+/// records: no mapper command is larger than four dwords.
+#[test]
+fn amm_prt_commands_fit_sixteen_bytes_each() {
+    with_vm(12, |ctx, base| {
+        const COMMANDS: u64 = 64;
+        let (cb, buf, stack) = (base, base + 0x100, base + 0x8000);
+        let va = amm::VA_BASE + 0x40_0000;
+        assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, COMMANDS * 16 + 0x10]), OK);
+        assert_eq!(call(ctx, stack, cb_amm_map_as_prt, &[cb, va, COMMANDS * PAGE]), OK);
+        for i in 0..COMMANDS {
+            let r = if i % 4 == 3 {
+                call(ctx, stack, cb_amm_unmap_to_prt, &[cb, va + (i - 1) * PAGE, PAGE])
+            } else {
+                call(ctx, stack, cb_amm_allocate_pa_for_prt, &[cb, va + i * PAGE, PAGE, 0xC, 0xF2])
+            };
+            assert_eq!(r, OK, "command {i}");
+        }
+        let used = call(ctx, stack, cb_get_current_offset, &[cb]) as u64;
+        assert!(used <= COMMANDS * 16 + 0x10, "{used:#x}");
+        assert_eq!(used, 12 + COMMANDS / 4 * (3 * 16 + 12));
+        let st = cbuf::try_get_state(ctx, cb).unwrap();
+        assert_eq!(st.commands.len() as u64, COMMANDS + 1);
+        assert!(st.commands.iter().all(|c| c.record_offset < used));
     });
 }
 
@@ -712,6 +818,217 @@ fn wait_on_counter_32_records() {
         assert_eq!(call(ctx, stack, cb_wait_on_counter_32, &[cb, 127, 0x1_0000_0005, 3, 1]), OK);
         let st = cbuf::try_get_state(ctx, cb).unwrap();
         assert_eq!(st.commands[0].data, CommandData::Wait { source: 127, value: 5, compare: 3, is_counter: true });
-        assert_eq!(st.write_offset, cbuf::FIXED32_SIZE);
+        assert_eq!(st.write_offset, 0x04, "a reference below 0x100 is in the header dword");
+        assert_eq!(call(ctx, stack, cb_wait_on_counter_32, &[cb, 127, 0x100, 3, 1]), OK);
+        assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), 0x04 + 0x08);
     });
+}
+
+/// Record sizes of the commands the library encodes itself, as its
+/// measure functions give them: the writers append what the measures
+/// report.
+#[test]
+fn completion_wait_and_counter_record_sizes() {
+    with_vm(13, |ctx, base| {
+        let (cb, buf, stack, a) = (base, base + 0x100, base + 0x8000, base + 0x7000);
+        assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x1000]), OK);
+        let mut used = 0;
+        let mut grows = |ctx: &mut CpuContext, r: HleResult, size: i64, what: &str| {
+            assert_eq!(r, OK, "{what}");
+            used += size;
+            assert_eq!(call(ctx, stack, cb_get_current_offset, &[cb]), used, "{what}");
+        };
+
+        // WriteAddress: the value in the header, one or two more dwords.
+        for (value, size) in [(0, 8), (3, 8), (4, 0x0C), (0x3_FFFF_FFFF, 0x0C), (0x4_0000_0000, 0x10)] {
+            assert_eq!(call(ctx, stack, cb_measure_write_address, &[a, value]), size, "{value:#x}");
+            let r = call(ctx, stack, cb_write_address, &[cb, a, value]);
+            grows(ctx, r, size, "WriteAddress");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_write_address, &[0, 1]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_write_address, &[a + 4, 1]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_write_address, &[cbuf::APR_MAX_APP_ADDRESS, 1]), MEASURE_INVALID);
+
+        // WaitOnAddress: nothing for 0, one dword below 2^32, else two.
+        for (value, size) in [(0, 8), (1, 0x0C), (0xFFFF_FFFF, 0x0C), (0x1_0000_0000, 0x10)] {
+            assert_eq!(call(ctx, stack, cb_measure_wait_on_address, &[a, value, 6, 1]), size, "{value:#x}");
+            let r = call(ctx, stack, cb_wait_on_address, &[cb, a, value, 0, 0]);
+            grows(ctx, r, size, "WaitOnAddress");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_address, &[0, 0, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_address, &[a, 0, 7, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_address, &[a, 0, 0, 2]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_address_legacy, &[a, 0, 4, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_address_legacy, &[0, 0, 3, 0]), 8);
+
+        // WaitOnCounter (64-bit form): (index, access, value, compare, maskOp, mask, flush).
+        for (access, value, mask_op, mask, size) in [
+            (1, 0xFF, 0, 0, 4),
+            (1, 0x100, 0, 0, 8),
+            (0, 0xFF, 0, 0, 8),
+            (1, 0xFFFF_FFFF, 0, 0, 8),
+            (0, 0x1_0000_0000, 0, 0, 0x0C),
+            (1, 0xFF, 1, 0xFFFF, 8),
+            (1, 0xFF, 1, 0x1_0000, 0x0C),
+            (1, 0xFF, 1, 0x1_0000_0000, 0x14),
+            (1, 0x1_0000, 1, 0xFF, 0x0C),
+            (1, 0x1_0000, 1, 0x1_0000_0000, 0x14),
+            (0, 0x1_0000_0000, 1, 0, 0x14),
+        ] {
+            let r = call(ctx, stack, cb_measure_wait_on_counter, &[2, access, value, 0, mask_op, mask, 0]);
+            assert_eq!(r, size, "access {access} value {value:#x} maskOp {mask_op} mask {mask:#x}");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_counter, &[2, 8, 0, 0, 0, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_counter, &[2, 1, 0, 7, 0, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_counter, &[2, 1, 0, 0, 0, 0, 2]), MEASURE_INVALID);
+        for (value, size) in [(0xFF, 4), (0x100, 8)] {
+            let r = call(ctx, stack, cb_wait_on_counter, &[cb, 2, 1, value, 0, 0, 0, 0]);
+            grows(ctx, r, size, "WaitOnCounter");
+            assert_eq!(call(ctx, stack, cb_measure_wait_on_counter_32, &[2, value, 3, 1]), size);
+        }
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_counter_32, &[128, 0, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_wait_on_counter_32, &[2, 0, 4, 0]), MEASURE_INVALID);
+
+        // WriteCounter: (index, access, value, operation); the value is cut to the accessed width.
+        for (access, value, operation, size) in [
+            (1, 0xFFF, 0, 4),
+            (1, 0x1000, 0, 8),
+            (1, 0x1_0000_0FFF, 0, 4),
+            (1, 1, 1, 8),
+            (0, 1, 0, 8),
+            (0, 0x1_0000_0000, 0, 0x0C),
+            (2, 0x1_0000_0000, 0, 8),
+            (4, 0x1FF, 0, 8),
+        ] {
+            let r = call(ctx, stack, cb_measure_write_counter, &[5, access, value, operation]);
+            assert_eq!(r, size, "access {access} value {value:#x} operation {operation}");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_write_counter, &[128, 1, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_write_counter, &[5, 8, 0, 0]), MEASURE_INVALID);
+        assert_eq!(call(ctx, stack, cb_measure_write_counter, &[5, 1, 0, 5]), MEASURE_INVALID);
+        for (value, size) in [(0xFFF, 4), (0x1000, 8)] {
+            let r = call(ctx, stack, cb_write_counter, &[cb, 5, 1, value, 0, 0]);
+            grows(ctx, r, size, "WriteCounter");
+            assert_eq!(call(ctx, stack, cb_measure_write_counter_on_completion, &[5, value]), size);
+            let r = call(ctx, stack, cb_write_counter_on_completion, &[cb, 5, value]);
+            grows(ctx, r, size, "WriteCounterOnCompletion");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_write_counter_on_completion, &[128, 0]), MEASURE_INVALID);
+
+        // Writes of counter and timer values.
+        assert_eq!(call(ctx, stack, cb_measure_write_address_from_time_counter, &[a]), 8);
+        assert_eq!(call(ctx, stack, cb_measure_write_address_from_time_counter, &[0]), MEASURE_INVALID);
+        let r = call(ctx, stack, cb_write_address_from_time_counter, &[cb, a]);
+        grows(ctx, r, 8, "WriteAddressFromTimeCounter");
+        for (index, size) in [(2, 8), (4, 0x0C)] {
+            assert_eq!(call(ctx, stack, cb_measure_write_address_from_counter, &[a, index]), size);
+            assert_eq!(call(ctx, stack, cb_measure_write_address_from_counter_pair, &[a, index]), size);
+            let r = call(ctx, stack, cb_write_address_from_counter, &[cb, a, index]);
+            grows(ctx, r, size, "WriteAddressFromCounter");
+            let r = call(ctx, stack, cb_write_address_from_counter_pair, &[cb, a, index]);
+            grows(ctx, r, size, "WriteAddressFromCounterPair");
+        }
+        assert_eq!(call(ctx, stack, cb_measure_write_address_from_counter_pair, &[a, 5]), MEASURE_INVALID);
+
+        // The kernel event record is five dwords.
+        assert_eq!(call(ctx, stack, cb_measure_kernel_event_queue, &[]), 0x14);
+        let r = call(ctx, stack, cb_write_kernel_event_queue, &[cb, 1, 42, 7]);
+        grows(ctx, r, 0x14, "WriteKernelEventQueue");
+    });
+}
+
+/// The mapper's commands are a header dword and at most three more: Map
+/// and Unmap are three dwords, the others four.
+#[test]
+fn amm_map_record_sizes() {
+    with_vm(14, |ctx, base| {
+        let (cb, buf, stack) = (base, base + 0x100, base + 0x8000);
+        assert_eq!(call(ctx, stack, cb_constructor, &[cb]), OK);
+        assert_eq!(call(ctx, stack, cb_set_buffer, &[cb, buf, 0x400]), OK);
+        let offset = |ctx: &mut CpuContext| call(ctx, stack, cb_get_current_offset, &[cb]);
+        assert_eq!(call(ctx, stack, cb_amm_map, &[cb, PAGE, PAGE, 0, 3]), OK);
+        assert_eq!(offset(ctx), 0x0C);
+        assert_eq!(call(ctx, stack, cb_amm_map_with_gpu_mask_id, &[cb, PAGE, PAGE, 0, 3, 1]), OK);
+        assert_eq!(offset(ctx), 0x18);
+        assert_eq!(call(ctx, stack, cb_amm_map_direct, &[cb, PAGE, PAGE, PAGE, 0, 3]), OK);
+        assert_eq!(offset(ctx), 0x28);
+        assert_eq!(call(ctx, stack, cb_amm_unmap, &[cb, PAGE, PAGE]), OK);
+        assert_eq!(offset(ctx), 0x34);
+        assert_eq!(call(ctx, stack, cb_amm_remap, &[cb, PAGE, 2 * PAGE, PAGE, 3]), OK);
+        assert_eq!(offset(ctx), 0x44);
+        assert_eq!(call(ctx, stack, cb_measure_amm_map, &[PAGE, PAGE, 0, 3]), 0x0C);
+        assert_eq!(call(ctx, stack, cb_measure_amm_map_direct, &[PAGE, PAGE, PAGE, 0, 3]), 0x10);
+        assert_eq!(call(ctx, stack, cb_measure_amm_unmap, &[PAGE, PAGE]), 0x0C);
+        for size in [cbuf::AMM_MAP_SIZE, cbuf::AMM_MAP_DIRECT_SIZE, cbuf::AMM_UNMAP_SIZE, cbuf::AMM_REMAP_SIZE, cbuf::AMM_PROTECT_SIZE] {
+            assert!(size <= cbuf::AMM_COMMAND_SIZE_MAX);
+        }
+    });
+}
+
+/// A title's batch of `n - 1` operations in command memory of
+/// `n * 16 + 0x100` bytes for the mapper and `n * 24 + 0x100` bytes for
+/// the reads. An operation is a page commit or release with a read, or a
+/// synchronisation point (WriteCounter in the mapper's buffer,
+/// WaitOnCounter in the reader's); the submission adds a
+/// WriteCounter, a WaitOnCounter and a WriteAddress. Every record has to
+/// fit: the title stops on the first one that does not.
+#[test]
+fn a_title_batch_fits_its_command_memory() {
+    const BASE: u64 = 0x5C64_0000_0000;
+    const N: u64 = 0x1000;
+    let _guard = crate::test_bases::scratch_lock(BASE);
+    let vm = ps5vm::VirtualMemory::new();
+    let (amm_bytes, apr_bytes) = (N * 16 + 0x100, N * 24 + 0x100);
+    let len = (0x1_0000 + amm_bytes + apr_bytes + 0xFFFF) & !0xFFFF;
+    vm.map(BASE, len, ps5vm::MemProtect::RW).unwrap();
+    let mut ctx = CpuContext::new(&vm);
+    let ctx = &mut ctx;
+    let (amm_cb, apr_cb, stack, flag) = (BASE, BASE + 0x40, BASE + 0x8000, BASE + 0x9000);
+    let (apr_buf, amm_buf) = (BASE + 0x1_0000, BASE + 0x1_0000 + apr_bytes);
+    assert_eq!(call(ctx, stack, cb_constructor, &[amm_cb]), OK);
+    assert_eq!(call(ctx, stack, cb_constructor, &[apr_cb]), OK);
+    assert_eq!(call(ctx, stack, cb_apr_constructor, &[apr_cb, 0, 0]), OK);
+    assert_eq!(call(ctx, stack, cb_set_buffer, &[amm_cb, amm_buf, amm_bytes]), OK);
+    assert_eq!(call(ctx, stack, cb_set_buffer, &[apr_cb, apr_buf, apr_bytes]), OK);
+    let va = amm::VA_BASE + 0x40_0000;
+    assert_eq!(call(ctx, stack, cb_amm_map_as_prt, &[amm_cb, va, 0x1000 * PAGE]), OK);
+    // The counter value of a synchronisation point keeps growing over the
+    // title's run: start above every short encoding.
+    let mut sequence = 0x10_0000u64;
+    for i in 0..N - 1 {
+        match i % 3 {
+            0 => {
+                let r = call(ctx, stack, cb_amm_allocate_pa_for_prt, &[amm_cb, va + i * PAGE, PAGE, 0xC, 0xF2]);
+                assert_eq!(r, OK, "commit {i}");
+            }
+            1 => {
+                assert_eq!(call(ctx, stack, cb_amm_unmap_to_prt, &[amm_cb, va + (i - 1) * PAGE, PAGE]), OK, "release {i}");
+            }
+            _ => {
+                sequence += 1;
+                assert_eq!(call(ctx, stack, cb_write_counter, &[amm_cb, 3, 1, sequence, 0, 0]), OK, "sync {i}");
+                assert_eq!(call(ctx, stack, cb_wait_on_counter, &[apr_cb, 3, 1, sequence, 1, 0, 0, 0]), OK, "sync {i}");
+            }
+        }
+        if i % 3 != 2 {
+            // A read beyond 4 GiB of its file: the largest read record.
+            let r = call(ctx, stack, cb_apr_read_file, &[apr_cb, 0, 0, 7, BASE + 0xA000, 0x10, 0x1_0000_0000 + i]);
+            assert_eq!(r, OK, "read {i}");
+        }
+    }
+    sequence += 1;
+    assert_eq!(call(ctx, stack, cb_write_counter, &[amm_cb, 3, 1, sequence, 0, 0]), OK);
+    assert_eq!(call(ctx, stack, cb_wait_on_counter, &[apr_cb, 3, 1, sequence, 1, 0, 0, 0]), OK);
+    assert_eq!(call(ctx, stack, cb_write_address, &[apr_cb, flag, 2, 0]), OK);
+    assert!(call(ctx, stack, cb_get_current_offset, &[amm_cb]) as u64 <= N * 16);
+    assert!(call(ctx, stack, cb_get_current_offset, &[apr_cb]) as u64 <= apr_bytes);
+    // Reset rewinds both for the next batch.
+    assert_eq!(call(ctx, stack, cb_reset, &[amm_cb]), OK);
+    assert_eq!(call(ctx, stack, cb_reset, &[apr_cb]), OK);
+    assert_eq!(call(ctx, stack, cb_get_current_offset, &[amm_cb]), 0);
+    assert_eq!(call(ctx, stack, cb_get_current_offset, &[apr_cb]), 0);
+    assert_eq!(call(ctx, stack, cb_destructor, &[amm_cb]), OK);
+    assert_eq!(call(ctx, stack, cb_destructor, &[apr_cb]), OK);
+    let _ = vm.unmap(BASE, len);
 }

@@ -70,6 +70,9 @@ struct Tracker<'p> {
     /// programs hold hundreds of thousands of values; one walk per dword
     /// took minutes on them.
     runtime_read: HashMap<ValueId, bool>,
+    /// Per block, the scalar registers written on every path to its start
+    /// (bit per register); made when first asked for.
+    assigned_at_entry: Option<Vec<u128>>,
 }
 
 pub(super) fn track(plan: &mut ShaderResourcePlan) -> Result<TrackResult, ResourcePlanError> {
@@ -102,6 +105,7 @@ pub(super) fn track(plan: &mut ShaderResourcePlan) -> Result<TrackResult, Resour
         uses,
         reads_by_memory,
         runtime_read: HashMap::new(),
+        assigned_at_entry: None,
     }
     .run()
 }
@@ -243,6 +247,11 @@ impl Tracker<'_> {
             return self.plan.graph.constant(0);
         }
         loop {
+            // A sampler carried around a loop reaches its use through phis
+            // of one value: the OR is behind them.
+            if let Some(invariant) = self.graph().resolve_invariant_phi(value) {
+                value = invariant;
+            }
             let node = self.graph().node(value);
             if !node.is_operation(ScalarOp::Or32) {
                 return value;
@@ -768,7 +777,7 @@ impl Tracker<'_> {
                 self.info.uses_device_addresses = true;
                 return Ok(());
             }
-            let source = self.get_handle_source(
+            let source = match self.get_handle_source(
                 access.handle,
                 ValueKind::BufferHandle,
                 4,
@@ -777,13 +786,34 @@ impl Tracker<'_> {
                 false,
                 Some(memory.opcode),
                 memory.access,
-            )?;
+            ) {
+                Ok(source) => source,
+                // A V# the host cannot evaluate for the draw (its words
+                // differ with the path taken, or come from lane data) is
+                // whole in the program's registers when the access runs,
+                // provided every path to it wrote them: a load or store
+                // takes it from there, through device addresses. An atomic
+                // or typed access has no such lowering.
+                Err(_)
+                    if memory.kind == MemoryResourceKind::Buffer
+                        && matches!(memory.access, MemoryAccess::Read | MemoryAccess::Write)
+                        && !memory.opcode.name().starts_with("TBuffer")
+                        && handle_node.as_ref().is_some_and(|h| h.kind == ValueKind::BufferHandle && h.operands.len() == 4)
+                        && self.descriptor_registers_assigned(pc) =>
+                {
+                    self.plan.graph.memory.get_mut(index).buffer_descriptor = Some(GuestBufferDescriptor::runtime());
+                    self.info.uses_device_addresses = true;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             let resource = self.add_buffer(source, &memory, pc);
             if resource == NO_INDEX {
                 // Past the binding budget the access reads its V# from its
-                // SGPRs, through the device-address table; that path has no
-                // typed or formatted store lowering.
-                if memory.opcode.name().starts_with("TBuffer") || (memory.formatted && memory.access != MemoryAccess::Read) {
+                // SGPRs, through the device-address table: a formatted
+                // access takes its format from the V# there. A typed access
+                // (the format in the instruction) has no such lowering.
+                if memory.opcode.name().starts_with("TBuffer") {
                     return Err(self.failure(pc, "buffer resource limit exceeded"));
                 }
                 self.plan.graph.memory.get_mut(index).device_descriptor = true;
@@ -848,6 +878,29 @@ impl Tracker<'_> {
             self.add_sampled_pair(image, sampler, pc)?;
         }
         self.add_memory_patch(index, image, sampler, memory.needs_sampler, pc)
+    }
+
+    /// The four V# registers of the buffer instruction at `pc` were written
+    /// by an instruction (or hold user data) on every path to it.
+    fn descriptor_registers_assigned(&mut self, pc: u32) -> bool {
+        let graph = &self.plan.graph;
+        let Some(instruction) = graph.program.instructions.iter().find(|i| i.pc == pc) else { return false };
+        let first = match &instruction.control {
+            Some(Control::BufferMemory(b)) if b.scalar_resource + 4 <= 128 => b.scalar_resource,
+            _ => return false,
+        };
+        let Some(block) = graph.cfg.blocks.iter().position(|b| pc >= b.start_pc && pc < b.end_pc) else { return false };
+        let start = graph.cfg.blocks[block].start_pc;
+        if self.assigned_at_entry.is_none() {
+            self.assigned_at_entry = Some(assigned_registers(&self.plan.graph));
+        }
+        let graph = &self.plan.graph;
+        let wave64 = graph.wave_size != 32;
+        let mut assigned = self.assigned_at_entry.as_ref().unwrap()[block];
+        for i in graph.program.instructions.iter().filter(|i| i.pc >= start && i.pc < pc) {
+            assigned |= written_registers(i, wave64);
+        }
+        (first..first + 4).all(|r| assigned & (1u128 << r) != 0)
     }
 
     fn link_image_aliases(&mut self) {
@@ -1286,7 +1339,8 @@ impl Tracker<'_> {
     /// A T# whose eight dwords are contiguous scalar reads of one V# (the
     /// table) at `entry + key * 32` (a shift by 5 or a multiply by 32) with a
     /// runtime key: a bindless image table. The key stays an ordinary value;
-    /// the eight reads become planning-only. When the key is itself a
+    /// the eight reads become planning-only unless something else reads
+    /// their words. When the key is itself a
     /// scalar-buffer read at `selector * stride + offset` of another V# (the
     /// material table), the material V# lets materialisation enumerate the
     /// keys the draw can reach.
@@ -1323,9 +1377,14 @@ impl Tracker<'_> {
             memory_indices.push(memory_index);
         }
         let (key, entry_offset) = self.match_table_offset(heap_offset?)?;
-        if self.graph().node(key).ty != ValueType::U32 || !reads.iter().all(|&r| self.uses_only(r, &[handle])) {
+        if self.graph().node(key).ty != ValueType::U32 {
             return None;
         }
+        // Words that also reach another value stay loads of the program:
+        // a register of the T# can be read again before it is rewritten
+        // (in a wave32 program as the upper half of a 64-bit mask
+        // operation whose lower half a compare wrote).
+        let suppress = reads.iter().all(|&r| self.uses_only(r, &[handle]));
         let (heap_index, heap_source) = self.make_runtime_source(heap_handle?, ValueKind::BufferHandle, 4, pc)?;
         let entry_offset = entry_offset.wrapping_add(immediate);
         let mut selector = IndirectImageSelector::new(heap_index, heap_index, 0, 0);
@@ -1355,7 +1414,7 @@ impl Tracker<'_> {
             key,
             heap_source: heap_index,
             key_is_address_offset: false,
-            suppress_memory_reads: true,
+            suppress_memory_reads: suppress,
             memory: memory_indices,
             reads,
         })
@@ -1557,6 +1616,67 @@ impl Tracker<'_> {
         }
         true
     }
+}
+
+/// The scalar registers `instruction` writes whatever its operands hold
+/// (bit per register). A relative move writes a register chosen at run
+/// time: none is certain.
+fn written_registers(instruction: &Instruction, wave64: bool) -> u128 {
+    if matches!(instruction.opcode, Opcode::SMovreldB32 | Opcode::SMovreldB64 | Opcode::SMovrelsd2B32) {
+        return 0;
+    }
+    let mut mask = 0u128;
+    let mut note = |first: u32| {
+        for register in first..(first + 16).min(128) {
+            if crate::cfg::calls::writes(instruction, register, wave64) {
+                mask |= 1u128 << register;
+            }
+        }
+    };
+    for d in instruction.destinations.iter().filter(|d| d.kind == OperandKind::ScalarRegister) {
+        note(d.value);
+    }
+    if let Some(d) = instruction.control.as_ref().and_then(Control::scalar_destination) {
+        note(d);
+    }
+    mask
+}
+
+/// Per block, the scalar registers written on every path from the entry to
+/// its start: user data at the entry, then a forward must-analysis over the
+/// graph (a block no path reaches keeps every register).
+fn assigned_registers(graph: &super::graph::ScalarValueGraph) -> Vec<u128> {
+    let flow = &graph.cfg;
+    let wave64 = graph.wave_size != 32;
+    let mut written = vec![0u128; flow.blocks.len()];
+    for i in &graph.program.instructions {
+        if let Some(block) = flow.block_of(i.pc) {
+            written[block] |= written_registers(i, wave64);
+        }
+    }
+    let mut user = 0u128;
+    for register in graph.user_data_base..(graph.user_data_base + graph.user_data_count).min(128) {
+        user |= 1u128 << register;
+    }
+    let mut entry = vec![u128::MAX; flow.blocks.len()];
+    if entry.is_empty() {
+        return entry;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in 0..flow.blocks.len() {
+            let mut value = if block == 0 { user } else { u128::MAX };
+            for &p in &flow.predecessors[block] {
+                value &= entry[p] | written[p];
+            }
+            if value != entry[block] {
+                entry[block] = value;
+                changed = true;
+            }
+        }
+    }
+    entry
 }
 
 fn reads_scalar(instruction: &Instruction, register: u32) -> bool {

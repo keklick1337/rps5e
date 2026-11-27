@@ -267,6 +267,62 @@ pub fn covered(addr: u64, len: u64) -> bool {
     false
 }
 
+/// Copy `out.len()` bytes from host address `addr` with the kernel
+/// checking every page: false (with `out` partly written) when a page is
+/// not readable, where a plain copy would fault. For readers that race the
+/// guest unmapping the range (the registry said it was mapped a moment
+/// ago).
+pub fn read_tolerant(addr: u64, out: &mut [u8]) -> bool {
+    transfer(addr, out.as_mut_ptr(), out.len(), false)
+}
+
+/// As [`read_tolerant`], storing `data` at host address `addr`: false (some
+/// bytes may be stored) when a page is not writable.
+pub fn write_tolerant(addr: u64, data: &[u8]) -> bool {
+    transfer(addr, data.as_ptr() as *mut u8, data.len(), true)
+}
+
+#[cfg(unix)]
+fn transfer(guest: u64, host: *mut u8, len: usize, store: bool) -> bool {
+    let mut done = 0usize;
+    while done < len {
+        let local = libc::iovec { iov_base: host.wrapping_add(done) as *mut libc::c_void, iov_len: len - done };
+        let remote = libc::iovec { iov_base: (guest as usize + done) as *mut libc::c_void, iov_len: len - done };
+        // SAFETY: `host` is a live buffer of `len` bytes; the kernel
+        // validates the other range and this process touches none of it.
+        let got = unsafe {
+            if store {
+                libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0)
+            } else {
+                libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0)
+            }
+        };
+        if got <= 0 {
+            return false;
+        }
+        done += got as usize;
+    }
+    true
+}
+
+#[cfg(windows)]
+fn transfer(guest: u64, host: *mut u8, len: usize, store: bool) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut got = 0usize;
+    // SAFETY: `host` is a live buffer of `len` bytes; the system validates
+    // the other range.
+    let ok = unsafe {
+        let h = GetCurrentProcess();
+        if store {
+            WriteProcessMemory(h, guest as *const _, host as *const _, len, &mut got)
+        } else {
+            ReadProcessMemory(h, guest as *const _, host as *mut _, len, &mut got)
+        }
+    };
+    ok != 0 && got == len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +410,20 @@ mod tests {
         assert!(accessible(0x50_2010, 8, true));
         untrack(0x50_0000, 0x5000);
         assert!(!accessible(0x50_2010, 8, false));
+    }
+
+    /// A tolerant copy reads and stores mapped memory and reports a page
+    /// that is not there instead of faulting.
+    #[test]
+    fn tolerant_copies_report_missing_pages() {
+        let mut src = vec![7u8; 0x3000];
+        let mut out = vec![0u8; 0x3000];
+        assert!(read_tolerant(src.as_ptr() as u64, &mut out));
+        assert_eq!(out, src);
+        assert!(write_tolerant(src.as_mut_ptr() as u64, &[9; 16]));
+        assert_eq!(&src[..17], &[[9u8; 16].as_slice(), &[7]].concat()[..]);
+        // The first page of the address space is never mapped.
+        assert!(!read_tolerant(0x1000, &mut out));
+        assert!(!write_tolerant(0x1000, &[1; 8]));
     }
 }

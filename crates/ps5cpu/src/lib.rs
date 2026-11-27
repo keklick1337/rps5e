@@ -18,6 +18,7 @@ pub mod code_patch;
 pub mod ctx;
 pub mod exec;
 pub mod host_cpu;
+mod host_ill;
 pub mod isa_scan;
 #[cfg(any(windows, test))]
 pub mod redzone;

@@ -462,6 +462,11 @@ impl PrewarmList {
         false
     }
 
+    /// Whether the list holds the compute pipeline `c`.
+    pub fn holds_compute(&self, c: &ComputeRecord) -> bool {
+        self.compute_seen.contains(c)
+    }
+
     /// Enter a graphics record unless known. True when new.
     fn insert_graphics(&mut self, g: GraphicsRecord) -> bool {
         let new = self.graphics_seen.insert(g.clone());

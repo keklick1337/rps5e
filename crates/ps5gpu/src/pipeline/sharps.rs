@@ -1040,11 +1040,50 @@ pub fn fmask_shape(unified: u32) -> Option<(u32, u32)> {
     })
 }
 
-/// The FMASK value of an expanded (fully decompressed) surface as the
-/// texture unit returns it: 4 bits per sample, sample `i` in fragment
-/// `i mod fragments`.
+/// The first FMASK dword of an expanded (fully decompressed) surface as
+/// the texture unit returns it: 4 bits per sample, samples 0..8. Sample
+/// `i` reads fragment `i` while the surface has a fragment for it and 8
+/// (no fragment known) past that. A format of fewer than eight samples
+/// repeats its nibble pattern over the whole dword, except the 2-sample
+/// 2-fragment one.
 pub fn fmask_identity(samples: u32, fragments: u32) -> u32 {
-    (0..samples.min(8)).fold(0, |v, i| v | ((i % fragments.max(1)) << (4 * i)))
+    let fragments = fragments.max(1);
+    let mut v = (0..samples.min(8)).fold(0, |v, i| v | ((if i < fragments { i } else { 8 }) << (4 * i)));
+    if samples < 8 && (samples, fragments) != (2, 2) {
+        v |= v << (samples * 4);
+        v |= v << ((samples * 8) & 31);
+    }
+    v
+}
+
+#[cfg(test)]
+mod fmask_tests {
+    use super::{fmask_identity, fmask_shape};
+
+    /// The dword every FMASK format reads from an expanded surface
+    /// (samples 0..8 of the 16-sample formats).
+    #[test]
+    fn expanded_fmask_dwords() {
+        let rows: [(u32, u32); 13] = [
+            (156, 0x8080_8080),
+            (157, 0x8880_8880),
+            (158, 0x8888_8880),
+            (159, 0x0000_0010),
+            (160, 0x8810_8810),
+            (161, 0x3210_3210),
+            (162, 0x8888_8880),
+            (163, 0x8888_8810),
+            (164, 0x8888_8810),
+            (165, 0x8888_3210),
+            (166, 0x7654_3210),
+            (167, 0x8888_3210),
+            (168, 0x7654_3210),
+        ];
+        for (format, dword) in rows {
+            let (samples, fragments) = fmask_shape(format).unwrap();
+            assert_eq!(fmask_identity(samples, fragments), dword, "format {format} ({samples} samples, {fragments} fragments)");
+        }
+    }
 }
 
 fn creation_error(key: &ImageKey, e: vk::Result) -> String {

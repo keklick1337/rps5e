@@ -194,29 +194,30 @@ mod f32_result_clamp {
     }
 }
 
-/// v_med3_f32 ties between signed zeros: the median is picked against the
-/// numeric maximum of the three (+0 and -0 compare equal), as measured on
-/// RDNA2; any NaN input takes the min3 path.
+/// v_med3_f32 ties between signed zeros: the median is the ordered one
+/// with -0 below +0 (two -0 among three zeros, or a -0 that is the middle
+/// value, give -0), as measured on RDNA2; any NaN input takes the min3
+/// path.
 mod f32_med3_signed_zero {
     use super::*;
     include!("vectors/valu_f32_min_max_nan.rs");
 
-    const CASES: [[u32; 4]; 22] = [
+    const CASES: [[u32; 4]; 23] = [
         [0x40000000, 0x40400000, 0x7fa00001, 0x40000000],
         [0x40000000, 0x40400000, 0x7fc00000, 0x40000000],
         [0x7fa00001, 0x40000000, 0x40400000, 0x40000000],
         [0x40400000, 0x7fc01234, 0x40000000, 0x40000000],
         [0x80000000, 0x00000000, 0x3f800000, 0x00000000],
         [0x00000000, 0x80000000, 0xbf800000, 0x80000000],
-        [0x80000000, 0x80000000, 0x00000000, 0x00000000],
+        [0x80000000, 0x80000000, 0x00000000, 0x80000000],
         [0x00000000, 0x00000000, 0x80000000, 0x00000000],
-        [0x80000000, 0x00000000, 0x80000000, 0x00000000],
+        [0x80000000, 0x00000000, 0x80000000, 0x80000000],
         [0x00000000, 0x80000000, 0x80000000, 0x80000000],
-        [0xbf800000, 0x80000000, 0x00000000, 0x00000000],
+        [0xbf800000, 0x80000000, 0x00000000, 0x80000000],
         [0xbf800000, 0x00000000, 0x80000000, 0x80000000],
-        [0x80000000, 0xbf800000, 0x00000000, 0x00000000],
+        [0x80000000, 0xbf800000, 0x00000000, 0x80000000],
         [0x00000000, 0xbf800000, 0x80000000, 0x80000000],
-        [0x80000000, 0x00000000, 0xbf800000, 0x00000000],
+        [0x80000000, 0x00000000, 0xbf800000, 0x80000000],
         [0x7fc01234, 0x80000000, 0x00000000, 0x80000000],
         [0x3f800000, 0x40400000, 0x40000000, 0x40000000],
         [0xc0400000, 0xbf800000, 0xc0000000, 0xc0000000],
@@ -224,10 +225,9 @@ mod f32_med3_signed_zero {
         [0x00000001, 0x7f800000, 0x7fc01234, 0x00000001],
         [0x80000001, 0x80000001, 0x00000000, 0x80000001],
         [0x7fa00001, 0xffc05678, 0x40000000, 0x40000000],
+        // Three NaNs: the first source, as min3 returns it.
+        [0x7fc01234, 0x7fa00001, 0xffc05678, 0x7fc01234],
     ];
-    // Not ported: med3(0x7fc01234, 0x7fa00001, 0xffc05678) = 0xffc05678 of
-    // the reference contradicts the measured table above, where three NaNs
-    // return the first one.
 
     #[test]
     fn ties() {
@@ -247,5 +247,33 @@ mod f32_med3_signed_zero {
             }
         }
         assert_clean("f32 med3 signed zero", &fails);
+    }
+
+    /// v_med3_f16 orders its zeros the same way: the instruction of the
+    /// table's program becomes its f16 form (VOP3 opcode 0x357) and reads
+    /// the low halves.
+    #[test]
+    fn f16_ties() {
+        const F16_CASES: [[u32; 4]; 6] = [
+            [0x8000, 0x0000, 0x8000, 0x8000],
+            [0x8000, 0x8000, 0x0000, 0x8000],
+            [0x0000, 0x0000, 0x8000, 0x0000],
+            [0xbc00, 0x8000, 0x0000, 0x8000],
+            [0x8000, 0x0000, 0x3c00, 0x0000],
+            [0x3c00, 0x4200, 0x4000, 0x4000],
+        ];
+        let mut code = CODE.to_vec();
+        let at = code.iter().position(|&w| w == 0xd557_000e).expect("v_med3_f32 v14 in the program");
+        code[at] = 0xd757_000e;
+        let input: Vec<u32> = F16_CASES.iter().flat_map(|c| [c[0], c[1], c[2], 0]).collect();
+        let out = dispatch(&code, 32, F16_CASES.len() as u32, &input, F16_CASES.len() * RESULTS as usize, true).expect("dispatch");
+        let mut fails = Vec::new();
+        for (lane, c) in F16_CASES.iter().enumerate() {
+            let a = out[lane * RESULTS as usize + 4] & 0xFFFF;
+            if a != c[3] {
+                fails.push(format!("v_med3_f16({:#06x}, {:#06x}, {:#06x}) is {a:#06x}, expected {:#06x}", c[0], c[1], c[2], c[3]));
+            }
+        }
+        assert_clean("f16 med3 signed zero", &fails);
     }
 }

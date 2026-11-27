@@ -511,8 +511,22 @@ impl GuestGpuMemory {
 
     /// Cut the backing views of the spans `[start, end)` removes, as
     /// [`Self::remove_spans`] cuts the spans.
+    /// Start of the first span overlapping `[start, end)`. The spans do
+    /// not overlap each other, so of those starting below `start` only the
+    /// last can reach into the range.
+    fn first_span(map: &BTreeMap<u64, Span>, start: u64, end: u64) -> Option<u64> {
+        if start >= end {
+            return None;
+        }
+        match map.range(..start).next_back() {
+            Some((&s, sp)) if sp.end > start => Some(s),
+            _ => map.range(start..end).next().map(|(&s, _)| s),
+        }
+    }
+
     fn unindex(views: &mut views::BackingViews, map: &BTreeMap<u64, Span>, start: u64, end: u64) {
-        for (&s, sp) in map.range(..end).filter(|(&s, sp)| s < end && sp.end > start) {
+        let Some(first) = Self::first_span(map, start, end) else { return };
+        for (&s, sp) in map.range(first..end) {
             if let Some(b) = sp.backing {
                 views.cut(s, sp.end, b, start, end);
             }
@@ -520,8 +534,7 @@ impl GuestGpuMemory {
     }
 
     fn remove_spans(map: &mut BTreeMap<u64, Span>, start: u64, end: u64) {
-        let keys: Vec<u64> = map.range(..end).filter(|(&s, sp)| s < end && sp.end > start).map(|(&s, _)| s).collect();
-        for s in keys {
+        while let Some(s) = Self::first_span(map, start, end) {
             let sp = map.remove(&s).unwrap();
             if s < start {
                 map.insert(s, Span { end: start, backing: sp.backing });
@@ -700,10 +713,7 @@ impl GuestGpuMemory {
         if addr == 0 || size == 0 || addr >= SPACE_BYTES {
             return;
         }
-        let overlaps = {
-            let m = self.spans();
-            m.range(..addr + size).any(|(&s, sp)| s < addr + size && sp.end > addr)
-        };
+        let overlaps = Self::first_span(&self.spans(), addr, addr + size).is_some();
         if !overlaps {
             return;
         }
@@ -828,9 +838,29 @@ impl GuestGpuMemory {
             crate::capture::note_read(self, addr, out.len() as u64);
             return true;
         }
-        if !self.pages.is_registered(addr, out.len() as u64) && ps5vm::ranges::accessible(addr, out.len() as u64, false) {
-            // SAFETY: tracked, readable guest memory that is never protected by us.
-            unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len()) };
+        // Several mappings with backing of their own (a game that maps its
+        // memory in small pieces): each through the alias, which stays
+        // mapped whatever the guest does to its view.
+        let pieces = self.span_pieces(addr, out.len() as u64);
+        if pieces.len() > 1 {
+            let ptrs: Vec<_> = pieces.iter().map_while(|&(a, n)| self.backing_ptr_raw(a, n).map(|p| (p, a, n))).collect();
+            if ptrs.len() == pieces.len() {
+                for (p, a, n) in ptrs {
+                    // SAFETY: the alias maps the memfd range backing this guest range.
+                    unsafe { std::ptr::copy_nonoverlapping(p, out[(a - addr) as usize..].as_mut_ptr(), n as usize) };
+                }
+                crate::capture::note_read(self, addr, out.len() as u64);
+                return true;
+            }
+        }
+        // Tracked, readable guest memory that is never protected by us. The
+        // guest can unmap it between the check and the copy (a game returns
+        // pages of a partially resident range while its textures are still
+        // bound), so the kernel copies and reports a page that went away.
+        if !self.pages.is_registered(addr, out.len() as u64)
+            && ps5vm::ranges::accessible(addr, out.len() as u64, false)
+            && ps5vm::ranges::read_tolerant(addr, out)
+        {
             crate::capture::note_read(self, addr, out.len() as u64);
             return true;
         }
@@ -1066,9 +1096,13 @@ impl GuestGpuMemory {
             crate::capture::note_write(self, addr, data.len() as u64);
             return true;
         }
-        if !self.pages.is_registered(addr, data.len() as u64) && ps5vm::ranges::accessible(addr, data.len() as u64, true) {
-            // SAFETY: tracked, writable guest memory that is never protected by us.
-            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len()) };
+        // Tracked, writable guest memory that is never protected by us; the
+        // kernel stores, as the guest can unmap it meanwhile (see
+        // `read_piece`).
+        if !self.pages.is_registered(addr, data.len() as u64)
+            && ps5vm::ranges::accessible(addr, data.len() as u64, true)
+            && ps5vm::ranges::write_tolerant(addr, data)
+        {
             crate::capture::note_write(self, addr, data.len() as u64);
             return true;
         }

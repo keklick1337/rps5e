@@ -16,10 +16,11 @@
 //! +0x20 u64 s/g state
 //! ```
 //!
-//! Every command reserves its measured size in the guest buffer (zero
-//! filled; read records carry their opcode in byte 0 and the kernel event
-//! record its type, queue, ident and payload) and advances the visible
-//! offset and count. The decoded commands are kept on the host, keyed by
+//! Every command reserves the size the console's writer gives its record
+//! (zero filled; read records carry their opcode in byte 0) and advances
+//! the visible offset and count: a title sizes its command memory by those
+//! record sizes (16 bytes per mapper command, 24 per read) and stops when
+//! a record does not fit. The decoded commands are kept on the host, keyed by
 //! the command buffer object, together with an alias from the command
 //! memory address to its object: AMM submissions name the command memory,
 //! APR submissions the object.
@@ -51,29 +52,42 @@ pub const READ_SCATTER_SIZE: u64 = 0x0C;
 pub const READ_GATHER_SCATTER_SIZE: u64 = 0x10;
 pub const READ_GATHER_SCATTER_SIZE_EXT: u64 = 0x14;
 pub const RESET_GATHER_SCATTER_SIZE: u64 = 0x04;
-pub const KERNEL_EVENT_SIZE: u64 = 0x20;
-/// Wait, write-address, counter and timer commands.
-pub const FIXED32_SIZE: u64 = 0x20;
+pub const KERNEL_EVENT_SIZE: u64 = 0x14;
+/// WriteAddressFromTimeCounter record.
+pub const WRITE_TIME_COUNTER_SIZE: u64 = 0x08;
 pub const APR_MAP_BEGIN_SIZE: u64 = 0x0C;
 pub const APR_MAP_DIRECT_BEGIN_SIZE: u64 = 0x10;
 pub const APR_MAP_END_SIZE: u64 = 0x04;
-pub const AMM_MAP_SIZE: u64 = 0x20;
-pub const AMM_MAP_DIRECT_SIZE: u64 = 0x30;
-pub const AMM_UNMAP_SIZE: u64 = 0x20;
-/// Remap/MultiMap record: header, address, source, size, protection.
-pub const AMM_REMAP_SIZE: u64 = 0x28;
-/// ModifyProtect/ModifyMtypeProtect/AllocatePaForPrt record: header,
-/// address, size, type, protection, mask.
-pub const AMM_PROTECT_SIZE: u64 = 0x28;
-/// MapAsPrt record (the unmap layout).
-pub const AMM_MAP_AS_PRT_SIZE: u64 = AMM_UNMAP_SIZE;
+/// Largest mapper command: a header dword (opcode in bits 0..6, the
+/// number of dwords that follow in bits 8..11, at most three) and its
+/// element dwords.
+pub const AMM_COMMAND_SIZE_MAX: u64 = 0x10;
+/// Map record: the header carries protection and memory type, two dwords
+/// the page number and the page count.
+pub const AMM_MAP_SIZE: u64 = 0x0C;
+/// MapDirect record: a Map record and the direct memory offset.
+pub const AMM_MAP_DIRECT_SIZE: u64 = AMM_COMMAND_SIZE_MAX;
+/// Unmap record: header, page number, page count.
+pub const AMM_UNMAP_SIZE: u64 = 0x0C;
+/// Remap/MultiMap record: header (protection), address, source, size.
+pub const AMM_REMAP_SIZE: u64 = AMM_COMMAND_SIZE_MAX;
+/// ModifyProtect/ModifyMtypeProtect/AllocatePaForPrt record: one
+/// ModifyMtypeProtect mapper command (header with protection and memory
+/// type, page number, page count, mask). A title that sizes its command
+/// memory at 16 bytes per PRT command relies on this record not being
+/// larger.
+pub const AMM_PROTECT_SIZE: u64 = AMM_COMMAND_SIZE_MAX;
+/// MapAsPrt record: a Map mapper command without type or protection
+/// (header, page number, page count).
+pub const AMM_MAP_AS_PRT_SIZE: u64 = 0x0C;
+/// UnmapToPrt record: three dwords (header 0x228, page number, page count).
+pub const AMM_UNMAP_TO_PRT_SIZE: u64 = 0x0C;
 pub const AMM_PAGE_SIZE: u64 = 0x4000;
 
 pub const OP_READ_FILE: u8 = 0x17;
 pub const OP_READ_GATHER: u8 = 0x18;
 pub const OP_READ_SCATTER: u8 = 0x19;
 pub const OP_READ_GATHER_SCATTER: u8 = 0x1A;
-pub const RECORD_KERNEL_EVENT: u32 = 2;
 
 pub const APR_MAX_READ_LENGTH: u64 = 0x0000_0001_0000_0000;
 pub const APR_MAX_FILE_OFFSET: u64 = 0x0000_0100_0000_0000;
@@ -105,6 +119,105 @@ pub fn read_gather_scatter_size(file_offset: u64) -> u64 {
     } else {
         READ_GATHER_SCATTER_SIZE
     }
+}
+
+/// WaitOnAddress record: header and address, then the reference value in
+/// as many dwords as it needs (none for 0).
+pub fn wait_on_address_size(value: u64) -> u64 {
+    match value {
+        0 => 0x08,
+        v if v >> 32 == 0 => 0x0C,
+        _ => 0x10,
+    }
+}
+
+/// WaitOnCounter record (64-bit form): a 32-bit counter compared without a
+/// mask against a value below 0x100 is one dword; wider values and a mask
+/// add dwords.
+pub fn wait_on_counter_size(access: u8, value: u64, mask_op: u8, mask: u64) -> u64 {
+    let masked = mask_op != 0;
+    if access == 1 && value <= 0xFF && !masked {
+        return 0x04;
+    }
+    if value < 0x1_0000 {
+        return match (masked, mask) {
+            (false, _) => 0x08,
+            (true, m) if m < 0x1_0000 => 0x08,
+            (true, m) if m >> 32 == 0 => 0x0C,
+            (true, _) => 0x14,
+        };
+    }
+    if value >> 32 != 0 || (masked && mask >> 32 != 0) {
+        return if masked { 0x14 } else { 0x0C };
+    }
+    if masked {
+        0x0C
+    } else {
+        0x08
+    }
+}
+
+/// WaitOnCounter record (32-bit reference form).
+pub fn wait_on_counter32_size(value: u32) -> u64 {
+    if value > 0xFF {
+        0x08
+    } else {
+        0x04
+    }
+}
+
+/// WriteAddress record: header and address; a value above 3 takes one
+/// more dword, one of 2^34 or more two.
+pub fn write_address_size(value: u64) -> u64 {
+    match value {
+        v if v >> 34 != 0 => 0x10,
+        v if v > 3 => 0x0C,
+        _ => 0x08,
+    }
+}
+
+/// WriteAddressFromCounter / FromCounterPair record.
+pub fn write_address_from_counter_size(index: u8) -> u64 {
+    if index > 3 {
+        0x0C
+    } else {
+        0x08
+    }
+}
+
+/// WriteCounter record. The value is cut to the accessed width first
+/// (access 0: 64 bits, 1: 32, 2..3: 16, 4..7: 8); a plain store
+/// (operation 0) of a value up to 0xFFF into a 32-bit counter is one
+/// dword, anything else two, or three for a value above 32 bits.
+pub fn write_counter_size(access: u8, value: u64, operation: u8) -> u64 {
+    let value = match access {
+        0 => value,
+        1 => value & 0xFFFF_FFFF,
+        2..=3 => value & 0xFFFF,
+        _ => value & 0xFF,
+    };
+    if value <= 0xFFF && access == 1 && operation == 0 {
+        0x04
+    } else if value >> 32 != 0 {
+        0x0C
+    } else {
+        0x08
+    }
+}
+
+/// WriteCounterOnCompletion record (32-bit value).
+pub fn write_counter_on_completion_size(value: u32) -> u64 {
+    if value > 0xFFF {
+        0x08
+    } else {
+        0x04
+    }
+}
+
+/// Addresses the wait and write-address commands take: 8-byte aligned and
+/// not above the last application quadword.
+pub fn valid_command_address(address: u64) -> bool {
+    address & 7 == 0 && address <= APR_MAX_APP_ADDRESS - 8
 }
 
 pub fn align4(v: u64) -> u64 {
@@ -157,6 +270,9 @@ pub enum AmmKind {
     MapAsPrt,
     /// Back the unbacked pages of a PRT range from the automatic pool.
     AllocatePaForPrt,
+    /// Take the backing of a PRT range away again: its pages go back to
+    /// the automatic pool and the range stays partially resident.
+    UnmapToPrt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -409,21 +525,9 @@ pub fn append_read(
     ok && update_type_flags(ctx, cb, TYPE_GATHER_SCATTER_VALID, 0)
 }
 
-/// Kernel event record `{u32 2, u32 0, u64 equeue, i32 ident, u32 0, u64 data}`.
+/// Kernel event record (five dwords).
 pub fn append_kernel_event(ctx: &CpuContext, cb: u64, equeue: u64, ident: i32, data: u64) -> bool {
-    append_with(
-        ctx,
-        cb,
-        KERNEL_EVENT_SIZE,
-        Some(CommandData::KernelEvent { equeue, ident, data }),
-        |r| {
-            r[0..4].copy_from_slice(&RECORD_KERNEL_EVENT.to_le_bytes());
-            r[8..16].copy_from_slice(&equeue.to_le_bytes());
-            r[16..20].copy_from_slice(&ident.to_le_bytes());
-            r[24..32].copy_from_slice(&data.to_le_bytes());
-        },
-        |_| true,
-    )
+    append(ctx, cb, KERNEL_EVENT_SIZE, Some(CommandData::KernelEvent { equeue, ident, data }))
 }
 
 /// Clear the gather/scatter continuation of a known object.

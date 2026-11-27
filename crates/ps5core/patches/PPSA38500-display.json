@@ -1,0 +1,16 @@
+{
+  "name": "Grand Theft Auto VI",
+  "id": "PPSA38500",
+  "version": "*",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Output follows the display",
+      "description": "The game picks 3840x2160 or 1920x1080 from the output status, which tells a title without resolution detection a 2160p display whatever is connected. The two conditional moves selecting 2160p are removed, so it renders its own 1080p mode. Applied when the emulated display is smaller than 2160p.",
+      "enabled": true,
+      "memory": [
+        {"offset": "0x417C0F2", "off": "837DA002B8000F000041BE80070000B97008000041BA38040000440F44F0440F44D1", "on": "837DA002B8000F000041BE80070000B97008000041BA380400009090909090909090"}
+      ]
+    }
+  ]
+}

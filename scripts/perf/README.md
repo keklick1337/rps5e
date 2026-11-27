@@ -38,6 +38,8 @@ scripts/perf/uprof.py run [record and report options] -- <command>  # into local
 - Mappings come from the kernel's MMAP2 records plus `/proc/<pid>/maps` snapshots taken every 0.25 s; empty snapshots of an exited process are dropped. Symbols come from each ELF's `.symtab`/`.dynsym`, demangled with `c++filt`, hashes removed. `annotate` uses `addr2line -i`; the release profile keeps debug info.
 - `diff` compares self samples per symbol of two recordings of the same work (for example the slice threads at K=1 and K=4), largest growth first.
 
+- Attach mode with `UPROF_THREADS=<regex>` samples only the threads whose name matches: a process with many threads needs more ring memory than an unprivileged user may lock (`perf_event_mlock_kb`), and the recorder then fails with `Operation not permitted`.
+
 ## Workloads that run without a game
 
 - `RPS5E_SLICE_BENCH=1 cargo test -p ps5gpu --release -- --ignored slice_record_bench --nocapture`: K slice threads record synthetic UE4-shaped draws (`RPS5E_SLICE_BENCH_K`, `_MATERIALS`, `_PROGRAMS`, `_CONST`, `_WRITES`, `_AB`, `_SUMMARY`; see the file).

@@ -62,7 +62,12 @@ struct Job {
     /// Work-group id x in the SGPR after the user data.
     group_id: bool,
     scratch_dwords: Option<u32>,
+    /// Words written at the start of regions once their base addresses are
+    /// known (descriptors the program reads from memory): `(region, words)`.
+    fixups: Option<Fixups>,
 }
+
+type Fixups = Box<dyn Fn(&[u64]) -> Vec<(usize, Vec<u32>)>>;
 
 impl Job {
     fn new(name: impl Into<String>, code: &[u32], wave: u32, threads: u32, regions: Vec<Vec<u32>>, outputs: &[usize], user: impl Fn(&[u64]) -> Vec<u32> + 'static) -> Job {
@@ -79,7 +84,13 @@ impl Job {
             lds_dwords: 0,
             group_id: false,
             scratch_dwords: None,
+            fixups: None,
         }
+    }
+
+    fn fixups(mut self, f: impl Fn(&[u64]) -> Vec<(usize, Vec<u32>)> + 'static) -> Job {
+        self.fixups = Some(Box::new(f));
+        self
     }
 
     fn float_mode(mut self, m: FloatMode) -> Job {
@@ -116,6 +127,9 @@ impl Job {
         for (r, &b) in self.regions.iter().zip(&bases) {
             memory.write_words(b, r);
         }
+        for (k, words) in self.fixups.iter().flat_map(|f| f(&bases)) {
+            memory.write_words(bases[k], &words);
+        }
         memory.write_words(run.code_address, &run.code);
         for group in 0..self.groups {
             let mut lds = vec![0u8; if self.lds_dwords > 0 { self.lds_dwords as usize * 4 } else { 65536 }];
@@ -145,7 +159,11 @@ impl Job {
     /// view (before any dispatch: pages near those the GPU wrote may be
     /// write-protected). Returns the code address and the region bases.
     fn place(&self, g: &mut Guest) -> (u64, Vec<u64>) {
-        (g.program(&self.code), self.regions.iter().map(|r| g.alloc(&asm::bytes(r))).collect())
+        let bases: Vec<u64> = self.regions.iter().map(|r| g.alloc(&asm::bytes(r))).collect();
+        for (k, words) in self.fixups.iter().flat_map(|f| f(&bases)) {
+            assert!(g.mem.write_backing(bases[k], &asm::bytes(&words)), "fixup of region {k}");
+        }
+        (g.program(&self.code), bases)
     }
 
     /// Guest view bytes [`Self::place`] takes.
@@ -435,6 +453,281 @@ fn memory_jobs() -> Vec<Job> {
 #[ignore]
 fn exec_ref_memory_on_device() {
     run_jobs(memory_jobs());
+}
+
+/// Register values a formatted store encodes: floats around every
+/// conversion's edges and integers around every field width's.
+const STORE_VALUES: [u32; 32] = [
+    0x0000_0000, 0x3f80_0000, 0xbf80_0000, 0x3f00_0000, 0x3e80_0001, 0x3bc0_c0c1, 0x477f_f000, 0x501502f9, 0xbe99_999a, 0x7fc0_0000, 0x7f80_0000, 0xff80_0000, 0x0000_0001, 0x42f6_e979,
+    0x3f7f_ffff, 0x3f80_0001, 0x0000_00ff, 0x0000_0100, 0x0000_ffff, 0x0001_2345, 0xffff_ffff, 0xffff_ff80, 0xffff_ff7f, 0x7fff_ffff, 0x8000_0000, 0x0000_007f, 0x0000_8000, 0xffff_8000,
+    0x3300_0000, 0x4000_0000, 0xc2c8_0000, 0x0000_03ff,
+];
+
+/// s[0:3] input (4 words per lane), s[4:7] the whole output, s[8:9] the
+/// address of a table of V#s, s10 the work-group id: every lane stores its
+/// input (`components` of it) as element `lane` of the table's V# `group`,
+/// read at run time. The group also stores its id behind its elements
+/// through the output's own V#, which makes the whole output a buffer the
+/// stage writes (the host then has it at the addresses the run-time V#s
+/// name).
+fn runtime_formatted_store(components: u32) -> Vec<u32> {
+    use ps5shader::testing::asm as sa;
+    // v_lshlrev_b32 v1, 4, v0; buffer_load_dword v[4+c], v1, s[0:3] offen.
+    let mut code = vec![0x3402_0084];
+    for c in 0..4u32 {
+        code.extend([0xe030_1000 | (c * 4), 0x8000_0401 | (c << 8)]);
+    }
+    code.push(0xbf8c_3f70);
+    // v2 = s10; v3 = v2 << 10; buffer_store_dword v2, v3, s[4:7], 512 offen.
+    code.push(sa::vop1(sa::OP_V_MOV_B32, 2, 10));
+    code.push(0x3406_048a);
+    code.extend(sa::mubuf(sa::OP_BUFFER_STORE_DWORD, 2, 3, 1, sa::inline_u32(0), STORE_SLOT_BYTES / 2, false, true, false));
+    // s_lshl_b32 s11, s10, 4; s_load_dwordx4 s[12:15], s[8:9], s11.
+    code.push(0x8f0b_840a);
+    code.extend(sa::smem(0x02, 12, 4, 0, 11));
+    code.push(0xbf8c_c07f);
+    // buffer_store_format_x.. v[4:], v0, s[12:15], 0 idxen.
+    code.extend(sa::mubuf(4 + components - 1, 4, 0, 3, sa::inline_u32(0), 0, true, false, false));
+    code.push(0xbf81_0000);
+    code
+}
+
+/// Bytes of the output per format: 32 elements of 16 bytes, the group's id
+/// behind them.
+const STORE_SLOT_BYTES: u32 = 1024;
+
+/// A formatted store through a descriptor the program reads at run time,
+/// for every unified format (one work-group each): X and XYZW stores of
+/// aligned elements, a buffer of 20 records (lanes past them store
+/// nothing), and elements of sub-dword components at stride 6 from a base
+/// one byte off dword alignment.
+fn runtime_format_store_jobs() -> Vec<Job> {
+    const SLOT: u64 = STORE_SLOT_BYTES as u64;
+    let words = 128 * SLOT as usize / 4;
+    let input: Vec<u32> = (0..32usize).flat_map(|t| (0..4usize).map(move |c| STORE_VALUES[(t * (2 * c + 1) + 5 * c) % 32])).collect();
+    let mut jobs = Vec::new();
+    for (name, components, records, tight) in [("x", 1u32, 32u32, false), ("xyzw", 4, 32, false), ("xyzw 20 records", 4, 20, false), ("xyzw tight", 4, 32, true), ("xy tight", 2, 32, true)] {
+        let job = Job::new(format!("runtime formatted store {name}"), &runtime_formatted_store(components), 32, 32, vec![input.clone(), vec![0xdede_dede; words], vec![0; 128 * 4]], &[1], move |b| {
+            let mut u = [raw(b[0], 512), raw(b[1], words as u32 * 4)].concat();
+            u.extend([b[2] as u32, (b[2] >> 32) as u32]);
+            u
+        })
+        .groups(128)
+        .fixups(move |b| {
+            let table = (0..128u32)
+                .flat_map(|f| {
+                    // Elements of components below a dword, six bytes at
+                    // most: unaligned, their bytes next to each other.
+                    let small = ps5shader::interp::buffer::FormatInfo::new(f).is_some_and(|i| (0..i.count).all(|c| i.component_span(c).1 < 4 && i.component_span(c).0 + i.component_span(c).1 <= 6));
+                    let (shift, stride) = if tight && small { (1, 6) } else { (0, 16) };
+                    desc(b[1] + f as u64 * SLOT + shift, stride, records, (STRIDED & !(0x7f << 12)) | (f << 12))
+                })
+                .collect();
+            vec![(2, table)]
+        });
+        jobs.push(job);
+    }
+    jobs
+}
+
+/// Formatted stores whose format is known only at run time match the
+/// interpreter for every format.
+#[test]
+#[ignore]
+fn exec_ref_runtime_format_stores_on_device() {
+    run_jobs(runtime_format_store_jobs());
+}
+
+/// s[0:1] the address of a table: +0 a source pointer, +8 a destination
+/// pointer, +16 and +20 their record counts. The program builds both V#s
+/// in registers as a compiler does for a buffer made of a pointer and a
+/// count: the stride OR-ed into the pointer's high word (16 for the
+/// source, 12 for the destination) and a constant word 3. Every lane
+/// copies dwords 2, 3 and 1 of source record `lane` to destination record
+/// `lane`. `masked`: the program clears the pointers' upper halves first,
+/// so the strides are its constants. `split_store`: three dword stores at
+/// offsets 0, 4 and 8 instead of one of three dwords. A multi-dword access
+/// advances from the address of its first dword, so in a swizzled buffer
+/// (records interleaved four bytes apart) the three-dword stores of
+/// neighbouring lanes overlap and the result is whichever lane stored
+/// last; the dword stores each go through the swizzle and are disjoint.
+fn register_built_copy(masked: bool, split_store: bool) -> Vec<u32> {
+    use ps5shader::testing::asm as sa;
+    const WORD3: u32 = 0x0001_6204;
+    let mut code = Vec::new();
+    code.extend(sa::smem(0x01, 16, 0, 0, sa::NULL));
+    code.extend(sa::smem(0x00, 18, 0, 16, sa::NULL));
+    code.extend([sa::s_mov_b32(19, sa::LITERAL), WORD3]);
+    code.extend(sa::smem(0x01, 20, 0, 8, sa::NULL));
+    code.extend(sa::smem(0x00, 22, 0, 20, sa::NULL));
+    code.extend([sa::s_mov_b32(23, sa::LITERAL), WORD3]);
+    code.push(0xbf8c_c07f);
+    if masked {
+        // s_and_b32 s17 / s21, 0xffff
+        code.extend([sa::sop2(0x0E, 17, 17, sa::LITERAL), 0xffff, sa::sop2(0x0E, 21, 21, sa::LITERAL), 0xffff]);
+    }
+    // s_bitset1_b32 s17, 20; s_or_b32 s21, s21, 0x000c0000
+    code.push(0xbe91_1d94);
+    code.extend([sa::sop2(0x10, 21, 21, sa::LITERAL), 0x000c_0000]);
+    // buffer_load_dwordx2 v[1:2], v0, s[16:19], 8 idxen; buffer_load_dword v3, v0, s[16:19], 4 idxen
+    code.extend(sa::mubuf(0x0D, 1, 0, 4, sa::inline_u32(0), 8, true, false, false));
+    code.extend(sa::mubuf(sa::OP_BUFFER_LOAD_DWORD, 3, 0, 4, sa::inline_u32(0), 4, true, false, false));
+    code.push(0xbf8c_3f70);
+    if split_store {
+        // buffer_store_dword v1 / v2 / v3, v0, s[20:23], 0 / 4 / 8 idxen
+        for k in 0..3 {
+            code.extend(sa::mubuf(sa::OP_BUFFER_STORE_DWORD, 1 + k, 0, 5, sa::inline_u32(0), 4 * k, true, false, false));
+        }
+    } else {
+        // buffer_store_dwordx3 v[1:3], v0, s[20:23], 0 idxen
+        code.extend(sa::mubuf(0x1F, 1, 0, 5, sa::inline_u32(0), 0, true, false, false));
+    }
+    code.push(sa::S_ENDPGM);
+    code
+}
+
+/// One run of [`register_built_copy`]: the upper halves of the two
+/// pointers' high words (what the program ORs its strides into) and the
+/// record counts.
+#[derive(Clone, Copy)]
+struct RegisterBuilt {
+    source_high: u32,
+    destination_high: u32,
+    source_records: u32,
+    destination_records: u32,
+    masked: bool,
+    /// Three dword stores (see [`register_built_copy`]); always for a
+    /// swizzled destination.
+    split_store: bool,
+}
+
+const REGISTER_BUILT_SOURCE_WORDS: usize = 9216;
+const REGISTER_BUILT_DESTINATION_WORDS: usize = 2048;
+
+impl RegisterBuilt {
+    fn source_word(i: usize) -> u32 {
+        0x5100_0000 | i as u32
+    }
+
+    fn job(self) -> Job {
+        let RegisterBuilt { source_high, destination_high, source_records, destination_records, masked, split_store } = self;
+        let source: Vec<u32> = (0..REGISTER_BUILT_SOURCE_WORDS).map(Self::source_word).collect();
+        Job::new(
+            format!("register-built strides {source_high:#x}/{destination_high:#x} records {source_records}/{destination_records} masked={masked} split={split_store}"),
+            &register_built_copy(masked, split_store),
+            32,
+            32,
+            vec![vec![0; 8], source, vec![POISON; REGISTER_BUILT_DESTINATION_WORDS]],
+            &[2],
+            |b| vec![b[0] as u32, (b[0] >> 32) as u32],
+        )
+        .fixups(move |b| {
+            let high = |base: u64, upper: u32| ((base >> 32) as u32 & 0xffff) | upper << 16;
+            vec![(0, vec![b[1] as u32, high(b[1], source_high), b[2] as u32, high(b[2], destination_high), source_records, destination_records])]
+        })
+    }
+
+    /// The dword index of dword `dword` (byte offset `offset` plus `extra`
+    /// bytes of a multi-dword access) of record `lane` in a V# whose word 1
+    /// has `high` in its upper half and `constant` OR-ed in: `lane * stride
+    /// + offset + extra`, or with SWIZZLE_ENABLE (bit 15 of `high`) and
+    /// INDEX_STRIDE 0 `((lane >> 3) * stride + offset) * 8 + (lane & 7) * 4
+    /// + extra`.
+    fn dword_at(high: u32, constant: u32, lane: usize, offset: usize, extra: usize) -> usize {
+        let stride = ((high & 0x3fff) | constant) as usize;
+        let byte = if high & 0x8000 != 0 { ((lane >> 3) * stride + offset) * 8 + (lane & 7) * 4 + extra } else { lane * stride + offset + extra };
+        byte / 4
+    }
+
+    /// The destination when both strides are dword multiples: record
+    /// `lane` of stride `12 | high` holds dwords 2, 3 and 1 of source
+    /// record `lane` of stride `16 | high` (zeros past the source's
+    /// records), for the lanes inside the destination's records. A masked
+    /// program has the strides 16 and 12 and no swizzle.
+    fn expected(self) -> Option<Vec<u32>> {
+        let upper = |high: u32| if self.masked { 0 } else { high };
+        let (sh, dh) = (upper(self.source_high), upper(self.destination_high));
+        if (sh | dh) & 3 != 0 || (dh & 0x8000 != 0 && !self.split_store) {
+            return None;
+        }
+        let mut out = vec![POISON; REGISTER_BUILT_DESTINATION_WORDS];
+        for lane in 0..32usize {
+            if lane as u32 >= self.destination_records {
+                continue;
+            }
+            // v1, v2 = the two dwords loaded at offset 8; v3 = the dword at 4.
+            let loaded = [Self::dword_at(sh, 16, lane, 8, 0), Self::dword_at(sh, 16, lane, 8, 4), Self::dword_at(sh, 16, lane, 4, 0)];
+            for (k, source) in loaded.into_iter().enumerate() {
+                let at = if self.split_store { Self::dword_at(dh, 12, lane, 4 * k, 0) } else { Self::dword_at(dh, 12, lane, 0, 4 * k) };
+                out[at] = if (lane as u32) < self.source_records { Self::source_word(source) } else { 0 };
+            }
+        }
+        Some(out)
+    }
+}
+
+/// Clean pointers, pointers whose upper halves hold other data (larger
+/// strides, the cache-swizzle and swizzle-enable bits), records that end
+/// before the lanes do, no records at all; and the masked program, whose
+/// strides do not depend on the pointers. A swizzled destination is
+/// written with dword stores (the three-dword stores of its lanes would
+/// overlap); the plain destinations with both forms.
+fn register_built_runs() -> Vec<RegisterBuilt> {
+    let mut runs = Vec::new();
+    for masked in [false, true] {
+        for (source_high, destination_high, source_records, destination_records) in [
+            (0u32, 0u32, 32u32, 32u32),
+            (0, 0, 20, 10),
+            (0, 0, 9, 32),
+            (0, 0, 0, 32),
+            (0, 0, 32, 0),
+            (0x20, 0x10, 32, 32),
+            (0x3f4, 0x64, 32, 32),
+            (0x3f4, 0x64, 17, 30),
+            (0x4000, 0x4020, 32, 32),
+            (0x8000, 0, 32, 32),
+            (0, 0x8000, 32, 32),
+            (0x8020, 0x8010, 24, 28),
+        ] {
+            let swizzled = !masked && destination_high & 0x8000 != 0;
+            for split_store in [false, true] {
+                if split_store || !swizzled {
+                    runs.push(RegisterBuilt { source_high, destination_high, source_records, destination_records, masked, split_store });
+                }
+            }
+        }
+    }
+    runs
+}
+
+/// The interpreter (the reference of the device test below) addresses the
+/// records of a register-built V# by the stride its word 1 holds: the
+/// pointer's upper bits OR the program's constant.
+#[test]
+fn register_built_strides_in_the_interpreter() {
+    let mut modelled = 0;
+    for run in register_built_runs() {
+        let job = run.job();
+        let got = job.interpret().unwrap_or_else(|e| panic!("{}: {e}", job.name));
+        if let Some(want) = run.expected() {
+            modelled += 1;
+            let bad: Vec<String> = got[0].iter().zip(&want).enumerate().filter(|(_, (a, e))| a != e).map(|(i, (a, e))| format!("word {i}: {a:#010x}, expected {e:#010x}")).take(8).collect();
+            assert!(bad.is_empty(), "{}:\n{}", job.name, bad.join("\n"));
+        } else {
+            assert!(got[0].iter().any(|&w| w != POISON), "{}: nothing stored", job.name);
+        }
+    }
+    assert_eq!(modelled, register_built_runs().len());
+}
+
+/// V#s a program builds in registers from a pointer and a count (their
+/// stride fields decoded by the module at run time) match the interpreter
+/// for clean pointers and for pointers whose upper bits change the stride
+/// and the swizzle; the masked program (strides compiled in) matches too.
+#[test]
+#[ignore]
+fn exec_ref_register_built_strides_on_device() {
+    run_jobs(register_built_runs().into_iter().map(RegisterBuilt::job).collect());
 }
 
 fn valu_jobs(f16_flushed: bool) -> Vec<Job> {

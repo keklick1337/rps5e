@@ -43,12 +43,6 @@ const GUEST_EXEC_CEILING: u64 = 0x0000_0009_0000_0000;
 /// Synthetic boundary reported for PCs outside any guest image (host code).
 const HOST_UNWIND_BOUNDARY: u64 = 0x10_0000;
 
-/// TCB scratch slots for the sanitizer replace tables.
-const TLS_MALLOC_REPLACE_OFFSET: u64 = 0x200;
-const TLS_NEW_REPLACE_OFFSET: u64 = 0x300;
-const MALLOC_REPLACE_SIZE: usize = 0x70;
-const NEW_REPLACE_SIZE: usize = 0x68;
-
 /// Key of the process exit handler the loader passes to the entry point.
 pub const EXIT_HANDLER_NID: &str = "rps5e#ProgramExitHandler";
 
@@ -889,27 +883,11 @@ pub fn thread_dtors_callback() -> u64 {
     *THREAD_DTORS.lock().unwrap()
 }
 
-/// Zeroed replace table in the TCB scratch area, with its size in word 0.
-fn sanitizer_replace(ctx: &mut CpuContext, offset: u64, size: usize) -> HleResult {
-    let tcb = ps5cpu::exec::current_thread_pointer();
-    if tcb == 0 {
-        return 0;
-    }
-    let addr = tcb + offset;
-    let mut table = vec![0u8; size];
-    table[0..8].copy_from_slice(&(size as u64).to_le_bytes());
-    if !ctx.write_bytes(addr, &table) {
-        return EFAULT;
-    }
-    addr as i64
-}
-
-fn cb_get_sanitizer_malloc_replace_external(ctx: &mut CpuContext) -> HleResult {
-    sanitizer_replace(ctx, TLS_MALLOC_REPLACE_OFFSET, MALLOC_REPLACE_SIZE)
-}
-
-fn cb_get_sanitizer_new_replace_external(ctx: &mut CpuContext) -> HleResult {
-    sanitizer_replace(ctx, TLS_NEW_REPLACE_OFFSET, NEW_REPLACE_SIZE)
+/// sceKernelGetSanitizerMallocReplaceExternal / NewReplaceExternal: the
+/// allocator replace tables of a sanitizer build. No sanitizer is active,
+/// so there is no table: NULL, and the C library keeps its own allocator.
+fn cb_get_sanitizer_replace_external(_ctx: &mut CpuContext) -> HleResult {
+    0
 }
 
 fn cb_is_address_sanitizer_enabled(_ctx: &mut CpuContext) -> HleResult {
@@ -939,8 +917,8 @@ pub fn register(reg: &mut HleRegistry) {
     reg.register_fn("rNhWz+lvOMU", "_sceKernelSetThreadDtors", "libKernel", cb_set_thread_dtors);
     reg.register_fn("pB-yGZ2nQ9o", "_sceKernelSetThreadAtexitCount", "libKernel", cb_set_thread_atexit_count);
     reg.register_fn("WhCc1w3EhSI", "_sceKernelSetThreadAtexitReport", "libKernel", cb_set_thread_atexit_report);
-    reg.register_fn("py6L8jiVAN8", "sceKernelGetSanitizerMallocReplaceExternal", "libKernel", cb_get_sanitizer_malloc_replace_external);
-    reg.register_fn("bnZxYgAFeA0", "sceKernelGetSanitizerNewReplaceExternal", "libKernel", cb_get_sanitizer_new_replace_external);
+    reg.register_fn("py6L8jiVAN8", "sceKernelGetSanitizerMallocReplaceExternal", "libKernel", cb_get_sanitizer_replace_external);
+    reg.register_fn("bnZxYgAFeA0", "sceKernelGetSanitizerNewReplaceExternal", "libKernel", cb_get_sanitizer_replace_external);
     reg.register_fn("jh+8XiK4LeE", "sceKernelIsAddressSanitizerEnabled", "libKernel", cb_is_address_sanitizer_enabled);
     reg.register_fn(EXIT_HANDLER_NID, "ProgramExitHandler", "libKernel", cb_program_exit_handler);
 }
@@ -1149,8 +1127,23 @@ mod tests {
         cb(&mut ctx)
     }
 
+    /// No sanitizer runs, so neither allocator replace table exists.
+    #[test]
+    fn sanitizer_replace_tables_are_absent() {
+        let vm = ps5vm::VirtualMemory::new();
+        let mut ctx = CpuContext::new(&vm);
+        assert_eq!(cb_get_sanitizer_replace_external(&mut ctx), 0);
+        let mut reg = HleRegistry::new();
+        register(&mut reg);
+        for nid in ["py6L8jiVAN8", "bnZxYgAFeA0"] {
+            let export = reg.lookup(nid).unwrap_or_else(|| panic!("{nid} is not registered"));
+            assert_eq!((export.callback)(&mut ctx), 0, "{nid}");
+        }
+    }
+
     #[test]
     fn module_info_checks_size_before_handle() {
+        let _scratch = crate::test_bases::scratch_lock(VM_BASE);
         let _g = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let vm = guest();
         let mut img = image(None);
@@ -1185,6 +1178,7 @@ mod tests {
     /// outside every module (null, stack, heap) -1; Decrement never fails.
     #[test]
     fn rtld_thread_atexit_references() {
+        let _scratch = crate::test_bases::scratch_lock(VM_BASE);
         let _g = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let vm = guest();
         let mut img = image(None);
@@ -1208,6 +1202,7 @@ mod tests {
 
     #[test]
     fn module_list_contracts() {
+        let _scratch = crate::test_bases::scratch_lock(VM_BASE);
         let _g = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let vm = guest();
         let mut img = image(None);
@@ -1336,6 +1331,7 @@ mod tests {
     /// name; failures leave a message for dlerror, which is read once.
     #[test]
     fn dlopen_main_program_and_dlerror() {
+        let _scratch = crate::test_bases::scratch_lock(VM_BASE);
         let _g = REGISTRY_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let vm = ps5vm::VirtualMemory::new();
         let mut img = image(None);

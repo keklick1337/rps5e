@@ -14,7 +14,7 @@ layout(push_constant) uniform P {
     uint64_t dst;
     uint count;
     uint page_bits;
-    uint page_limit;
+    uint page_low;
 } pc;
 
 void main() {

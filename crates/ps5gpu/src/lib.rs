@@ -64,6 +64,7 @@ pub mod input;
 pub mod osd;
 pub mod perf;
 pub mod tiling;
+pub mod vram_report;
 pub mod tiling_layout;
 mod tiling_equations;
 mod vulkan;

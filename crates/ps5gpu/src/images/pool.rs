@@ -102,6 +102,11 @@ impl ImagePool {
         self.entries.values().map(|v| v.len()).sum()
     }
 
+    /// Device memory of the retired images kept.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -119,6 +124,11 @@ pub struct Scratch {
 impl Scratch {
     pub fn new(usage: vk::BufferUsageFlags) -> Scratch {
         Scratch { buffer: None, usage }
+    }
+
+    /// Bytes of the buffer held (0: none yet).
+    pub fn bytes(&self) -> u64 {
+        self.buffer.as_ref().map_or(0, |b| b.size)
     }
 
     /// The buffer, at least `size` bytes large.

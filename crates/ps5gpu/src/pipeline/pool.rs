@@ -162,7 +162,9 @@ pub struct CompilePool<T: Send + 'static> {
 }
 
 impl<T: Send + 'static> CompilePool<T> {
-    /// A pool of `threads` workers (named `rps5e-compile-N`); background
+    /// A pool of `threads` workers (named `rps5e-comp-N`: the kernel keeps
+    /// 15 characters of a thread name, and its log must tell worker 1 from
+    /// worker 10); background
     /// jobs leave at least one worker (two from four workers up) free.
     pub fn new(threads: usize) -> CompilePool<T> {
         Self::with_share(threads, threads)
@@ -197,7 +199,7 @@ impl<T: Send + 'static> CompilePool<T> {
         let mut spawned = Vec::new();
         for i in 0..threads {
             let s = shared.clone();
-            match std::thread::Builder::new().name(format!("rps5e-compile-{i}")).spawn(move || Self::run(s)) {
+            match std::thread::Builder::new().name(format!("rps5e-comp-{i}")).spawn(move || Self::run(s)) {
                 Ok(h) => spawned.push(h),
                 Err(_) => log::warn!("ps5gpu: compile worker {i} not started"),
             }
